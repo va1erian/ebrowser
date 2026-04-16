@@ -1,0 +1,46 @@
+# Use an official Rust image as a parent image
+FROM rust:1.85-slim-bookworm
+
+# Install system dependencies for Servo
+# Based on Servo's requirements for Linux
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    nasm \
+    pkg-config \
+    clang \
+    llvm-dev \
+    m4 \
+    gperf \
+    libx11-dev \
+    libvulkan-dev \
+    libgl1-mesa-dri \
+    libgles2-mesa-dev \
+    libegl1-mesa-dev \
+    xorg-dev \
+    libdbus-1-dev \
+    libfreetype6-dev \
+    libglib2.0-dev \
+    libharfbuzz-dev \
+    liblzma-dev \
+    libudev-dev \
+    libunwind-dev \
+    libxkbcommon-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    curl \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory
+WORKDIR /usr/src/ebrowser
+
+# Copy the current directory contents into the container at /usr/src/ebrowser
+COPY . .
+
+# Build the application
+RUN cargo build --release
+
+# Set the entrypoint (optional, for running the built artifact)
+# CMD ["./target/release/ebrowser"]
