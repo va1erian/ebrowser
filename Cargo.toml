@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.34.1", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.34.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 servo = { version = "0.1" }
 egui = "0.34.1"
 egui_glow = "0.34.1"
