@@ -1541,12 +1541,14 @@ dependencies = [
 name = "ebrowser"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dpi",
  "eframe",
  "egui",
  "egui_glow",
  "env_logger",
  "euclid",
+ "keyboard-types",
  "log",
  "raw-window-handle",
  "servo",
