@@ -20,7 +20,7 @@ impl WebViewDelegate for EbrowserDelegate {
     fn request_navigation(
         &self,
         _webview: WebView,
-        navigation_request: servo::embedder_traits::NavigationRequest,
+        navigation_request: servo::NavigationRequest,
     ) {
         let url = navigation_request.url.clone();
         let _ = self.navigation_sender.send(url);
@@ -166,7 +166,7 @@ impl ServoWebView {
             response_val = response_val.interact(egui::Sense::click_and_drag());
             let pointer_state = ui.input(|i| i.pointer.clone());
 
-            use servo::embedder_traits::{
+            use servo::{
                 InputEvent, MouseButtonEvent, MouseButtonAction, MouseButton, MouseMoveEvent,
                 WheelEvent, WheelDelta, WheelMode, WebViewPoint,
             };
