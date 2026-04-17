@@ -234,5 +234,6 @@ impl ServoWebView {
             self.servo.spin_event_loop();
             let urls: Vec<Url> = self.navigation_receiver.try_iter().collect();
             (ui.allocate_exact_size(available_size, egui::Sense::hover()).1, urls)
+        }
     }
 }
