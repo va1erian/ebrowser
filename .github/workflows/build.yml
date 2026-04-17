@@ -1,0 +1,90 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm pkg-config clang llvm-dev m4 gperf libx11-dev libvulkan-dev libgl1-mesa-dri libgles2-mesa-dev libegl1-mesa-dev xorg-dev libdbus-1-dev libfreetype6-dev libglib2.0-dev libharfbuzz-dev liblzma-dev libudev-dev libunwind-dev libxkbcommon-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev python3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebrowser-linux
+          path: target/release/ebrowser
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM
+        run: choco install nasm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+        env:
+          # Servo might need some env vars on Windows
+          RUST_BACKTRACE: 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ebrowser-windows
+          Copy-Item "target/release/ebrowser.exe" -Destination "ebrowser-windows/"
+          Get-ChildItem "target/release/*.dll" | Copy-Item -Destination "ebrowser-windows/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "ebrowser-windows/*" -DestinationPath "ebrowser-windows.zip"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebrowser-windows
+          path: ebrowser-windows.zip
+
+  create-release:
+    name: Create Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ebrowser-linux
+          path: ./artifacts/linux
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ebrowser-windows
+          path: ./artifacts/windows
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./artifacts/linux/ebrowser
+            ./artifacts/windows/ebrowser-windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
