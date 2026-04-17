@@ -203,7 +203,7 @@ impl ServoWebView {
                             point.clone(),
                         )));
                     }
-                    if response_val.drag_released_by(egui_btn) {
+                    if response_val.drag_stopped() {
                         self.web_view.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Up,
                             servo_btn.clone(),
@@ -213,7 +213,7 @@ impl ServoWebView {
                 }
 
                 // Scroll/Wheel
-                let scroll_delta = ui.input(|i| i.scroll_delta);
+                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
                 if scroll_delta != egui::Vec2::ZERO {
                     self.web_view.notify_input_event(InputEvent::Wheel(WheelEvent::new(
                         WheelDelta {
@@ -233,7 +233,6 @@ impl ServoWebView {
         } else {
             self.servo.spin_event_loop();
             let urls: Vec<Url> = self.navigation_receiver.try_iter().collect();
-            (ui.allocate_exact_size(available_size, egui::Sense::hover()), urls)
-        }
+            (ui.allocate_exact_size(available_size, egui::Sense::hover()).1, urls)
     }
 }
