@@ -1,5 +1,5 @@
 [package]
-name = "ebrowser"
+name = "esmail"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,7 @@ name = "es_webview"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ebrowser"
+name = "esmail"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,14 +17,22 @@ servo = { version = "0.1" }
 egui = "0.34.1"
 egui_glow = "0.34.1"
 tokio = { version = "1", features = ["full"] }
+tokio-native-tls = "0.3"
+anyhow = "1.0"
+futures = "0.3"
+async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+mailparse = "0.15"
+keyring = "3.2"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
 url = "2.5"
 log = "0.4"
 env_logger = "0.11"
 dpi = "0.1"
 raw-window-handle = "0.6"
 euclid = "0.22"
-base64 = "0.22"
 keyboard-types = "0.8"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"     # Optimize for size
