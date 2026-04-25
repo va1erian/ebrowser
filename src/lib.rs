@@ -76,11 +76,12 @@ impl WebViewDelegate for Delegate {
             self.events
                 .borrow_mut()
                 .push(ESWebViewEvent::LinkClicked(request.url.to_string()));
+            drop(request);
         } else {
             *done = true;
+            // Allow initial navigation
+            request.allow();
         }
-        // Allow navigation in all cases (the request is consumed on allow/deny/drop).
-        request.allow();
     }
 }
 
@@ -228,55 +229,45 @@ impl ESWebView {
         // ── Input forwarding to Servo ─────────────────────────────────────────
 
         // Mouse move
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            if widget_rect.contains(pos) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
+            if widget_rect.contains(pos) || resp.dragged() {
                 let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
                 self.web_view
                     .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
             }
         }
 
-        // Click = Down + Up
-        if resp.clicked() {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
-                self.web_view
-                    .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Down,
-                        MouseButton::Left,
-                        dp,
-                    )));
-                self.web_view
-                    .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Up,
-                        MouseButton::Left,
-                        dp,
-                    )));
-            }
-        }
+        let mut primary_down = false;
+        let mut primary_up = false;
+        let mut interact_pos = None;
+        ui.input(|i| {
+            primary_down = i.pointer.button_pressed(egui::PointerButton::Primary);
+            primary_up = i.pointer.button_released(egui::PointerButton::Primary);
+            interact_pos = i.pointer.interact_pos().or(i.pointer.hover_pos());
+        });
 
-        // Drag start / end
-        if resp.drag_started() {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+        if let Some(pos) = interact_pos {
+            // We only send clicks to servo if the mouse is over the webview
+            if widget_rect.contains(pos) || resp.dragged() {
                 let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
-                self.web_view
-                    .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Down,
-                        MouseButton::Left,
-                        dp,
-                    )));
-            }
-        }
-
-        if resp.drag_stopped() {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
-                self.web_view
-                    .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                        MouseButtonAction::Up,
-                        MouseButton::Left,
-                        dp,
-                    )));
+                
+                if primary_down {
+                    self.web_view
+                        .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                            MouseButtonAction::Down,
+                            MouseButton::Left,
+                            dp,
+                        )));
+                }
+                
+                if primary_up {
+                    self.web_view
+                        .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                            MouseButtonAction::Up,
+                            MouseButton::Left,
+                            dp,
+                        )));
+                }
             }
         }
 
