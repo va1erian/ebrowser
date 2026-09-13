@@ -1,11 +1,15 @@
 mod imap;
 mod db;
 mod screenshot;
+mod config;
+mod secrets;
 
 use egui_servo_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
+use config::{AccountConfig, Config};
 use egui_servo_webview::dpi::PhysicalSize;
+use secrecy::SecretString;
 use tokio::sync::mpsc;
 
 struct EsMailApp {
@@ -21,7 +25,11 @@ struct EsMailApp {
     imap_rx: mpsc::Receiver<ImapEvent>,
     db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
-    
+
+    /// Saved accounts (host/port/username; no passwords — those are in the OS
+    /// keyring, see `secrets`). Persisted to `config.toml`.
+    config: Config,
+
     // UI state
     host: String,
     port: String,
@@ -95,11 +103,25 @@ impl EsMailApp {
             },
         };
         
-        let (host_str, port_str, username_str) = load_config().unwrap_or_else(|| {
-            ("imap.gmail.com".to_string(), "993".to_string(), "".to_string())
-        });
-        
-        let password_str = "".to_string();
+        let mut config = Config::load();
+        if config.migrate_legacy() {
+            if let Err(e) = config.save() {
+                log::warn!("could not persist migrated config: {e}");
+            }
+        }
+
+        // Prefill the login form from the first saved account, if any; its
+        // password (if the OS keyring has one) comes along too, so a
+        // returning user does not have to retype it.
+        let (host_str, port_str, username_str, password_str) = match config.accounts.first() {
+            Some(account) => {
+                let password = secrets::get_password(&account.id, "imap")
+                    .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
+                    .unwrap_or_default();
+                (account.imap_host.clone(), account.imap_port.to_string(), account.username.clone(), password)
+            }
+            None => ("imap.gmail.com".to_string(), "993".to_string(), String::new(), String::new()),
+        };
         let initial_status = "Ready".to_string();
 
         // One engine per window; the view borrows it to start up. A second view
@@ -117,6 +139,7 @@ impl EsMailApp {
             imap_rx: imap_evt_rx,
             db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
+            config,
             host: host_str,
             port: port_str,
             username: username_str,
@@ -141,7 +164,7 @@ impl EsMailApp {
                 ImapEvent::Connected => {
                     self.status = "Connected!".to_string();
                     self.is_connected = true;
-                    save_config(&self.host, &self.port, &self.username);
+                    self.persist_current_account();
                     let _ = self.imap_tx.try_send(ImapCommand::FetchMailboxes);
                     let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: 1 });
                 }
@@ -193,6 +216,36 @@ impl EsMailApp {
                     self.status = format!("DB Error: {}", e);
                 }
             }
+        }
+    }
+
+    /// Fill the login form from a saved account and pull its password back
+    /// out of the OS keyring, if there is one.
+    fn select_account(&mut self, account: &AccountConfig) {
+        self.host = account.imap_host.clone();
+        self.port = account.imap_port.to_string();
+        self.username = account.username.clone();
+        self.password = secrets::get_password(&account.id, "imap")
+            .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
+            .unwrap_or_default();
+    }
+
+    /// Persist the account currently in the login form: upsert it into
+    /// `config.toml` and its password into the OS keyring. Called once a
+    /// connection actually succeeds, not on every keystroke or click.
+    fn persist_current_account(&mut self) {
+        let account = AccountConfig::new(
+            self.username.clone(),
+            self.host.clone(),
+            self.port.parse().unwrap_or(993),
+            self.username.clone(),
+        );
+        if let Err(e) = secrets::set_password(&account.id, "imap", &SecretString::from(self.password.clone())) {
+            log::warn!("could not save password to the OS keyring: {e}");
+        }
+        self.config.upsert_account(account);
+        if let Err(e) = self.config.save() {
+            log::warn!("could not persist account config: {e}");
         }
     }
 }
@@ -273,14 +326,37 @@ impl eframe::App for EsMailApp {
                     ui.group(|ui| {
                         ui.set_width(300.0);
                         ui.heading("Login");
+
+                        if !self.config.accounts.is_empty() {
+                            ui.label("Saved accounts:");
+                            let mut to_remove = None;
+                            for account in self.config.accounts.clone() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(&account.display_name).clicked() {
+                                        self.select_account(&account);
+                                    }
+                                    if ui.small_button("x").on_hover_text("Forget this account").clicked() {
+                                        to_remove = Some(account.id.clone());
+                                    }
+                                });
+                            }
+                            if let Some(id) = to_remove {
+                                secrets::delete_password(&id, "imap");
+                                self.config.remove_account(&id);
+                                if let Err(e) = self.config.save() {
+                                    log::warn!("could not persist account removal: {e}");
+                                }
+                            }
+                            ui.separator();
+                        }
+
                         ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("IMAP Host"));
                         ui.add(egui::TextEdit::singleline(&mut self.port).hint_text("Port"));
                         ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Username"));
                         ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Password"));
-                        
+
                         if ui.button("Connect").clicked() {
                             self.status = "Connecting...".to_string();
-                            save_config(&self.host, &self.port, &self.username);
                             let cmd = ImapCommand::Connect {
                                 host: self.host.clone(),
                                 port: self.port.parse().unwrap_or(993),
@@ -421,25 +497,6 @@ async fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| Ok(Box::new(EsMailApp::new(cc)))),
     )
-}
-
-fn get_config_path() -> String {
-    std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string()) + "/esmail_config.txt"
-}
-
-fn load_config() -> Option<(String, String, String)> {
-    if let Ok(content) = std::fs::read_to_string(get_config_path()) {
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.len() >= 3 {
-            return Some((lines[0].trim().to_string(), lines[1].trim().to_string(), lines[2].trim().to_string()));
-        }
-    }
-    None
-}
-
-fn save_config(host: &str, port: &str, username: &str) {
-    let content = format!("{}\n{}\n{}", host, port, username);
-    let _ = std::fs::write(get_config_path(), content);
 }
 
 /// A page that exercises the parts of the webview we care about for mail:

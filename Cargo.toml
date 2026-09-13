@@ -38,6 +38,8 @@ mailparse = "0.15"
 rusqlite = { version = "0.37", features = ["bundled"] }
 keyring = "3.2"
 secrecy = "0.10"
+directories = "5"
+toml = "0.8"
 
 # Misc
 anyhow = "1.0"

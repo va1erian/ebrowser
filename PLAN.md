@@ -371,13 +371,25 @@ mail client is the demo.
 
 ## Track B — the mail client
 
-### B1. Account model and secret storage
+### B1. Account model and secret storage — **DONE**
 Replace the 3-line text file with a serde `Config` (TOML) in the platform config
 dir (`directories` crate), holding multiple accounts: display name, IMAP
 host/port/TLS mode, SMTP host/port/TLS mode, username, auth type. Passwords move
 into the already-declared-but-unused `keyring`, keyed by
 `(account_id, "imap"|"smtp")`, held as `SecretString` end to end. Add an
 accounts dialog; migrate any existing `esmail_config.txt` on first run.
+
+**One divergence from the wording above:** "an accounts dialog" turned out to
+be more than this phase needs — the login screen already had nowhere to put a
+modal, and a separate window is real UI work with nothing else in the plan
+depending on it yet. Landed instead as a saved-accounts list inline on the
+login screen (pick one to prefill + pull its password from the keyring; a
+small "x" to forget it) plus the `Config`/`secrets` modules a real dialog would
+sit on top of later. `auth_type` also isn't in `AccountConfig` yet — password
+auth is the only kind that exists, so a field with one legal value would be
+dead weight; add it when B7/OAuth needs to distinguish. `smtp_host`/`smtp_tls`
+are in the struct (defaulted) since B7 needs the field to exist, but nothing
+reads them yet.
 
 ### B2. Session layer rework
 Split `ImapActor` into a small pool: one long-lived control session per account
@@ -481,7 +493,7 @@ and Outlook therefore need app passwords.
 | ~~**0**~~ | ~~Manifest fix; clear 4 deprecations; commit `db.rs`~~ **DONE** | everything |
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
-| **3** | **B1, B2 — start here** | B3, B7 |
+| **3** | ~~B1~~ **DONE**, **B2 — start here** | B3, B7 |
 | 4 | B3, B4 | B8 |
 | 5 | B5, B6 | — |
 | 6 | B7 | — |

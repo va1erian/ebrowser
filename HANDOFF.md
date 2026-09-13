@@ -4,8 +4,8 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is B1, then B2** ([PLAN.md](PLAN.md) §B1, §B2). Everything in
-phases 0-2 is done and committed.
+**Your next task is B2** ([PLAN.md](PLAN.md) §B2). Everything in phases 0-2 is
+done and committed, and B1 (phase 3) is done too.
 
 ---
 
@@ -234,9 +234,10 @@ the `glow` renderer. That is §A6.
 | `5825a0c` | Preview mode |
 | `9143154` | Size derived from the painted rect; 13 unit tests; log filtering |
 | `237fc42` | Mark phases 0-1 done in the plan; add HANDOFF.md |
-| *(this branch)* | **A3, A4** — `NavigationPolicy` / `WebViewHandler` (real resource interception via `load_web_resource`; every `notify_*` hook now emits a `WebViewEvent`), full navigation API (`reload`, `go_back`/`go_forward`, `url`/`page_title`/`status_text`/`favicon`/`load_status`), `WebViewSource::HtmlWithBase` for relative links |
+| `3e908f7` | **A3, A4** — `NavigationPolicy` / `WebViewHandler` (real resource interception via `load_web_resource`; every `notify_*` hook now emits a `WebViewEvent`), full navigation API (`reload`, `go_back`/`go_forward`, `url`/`page_title`/`status_text`/`favicon`/`load_status`), `WebViewSource::HtmlWithBase` for relative links |
+| *(this branch)* | **B1** — `config.rs`/`secrets.rs`: TOML `Config` in the platform config dir, passwords in the OS keyring, legacy `esmail_config.txt` migration, inline saved-accounts list on the login screen |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` 16 passing, app
+State: `cargo check --workspace` clean, `cargo test --workspace` 25 passing, app
 builds, runs, screenshots and exits cleanly.
 
 ---
