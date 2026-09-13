@@ -219,21 +219,55 @@ pub trait WebViewHandler {
 }
 ```
 
-`intercept` is what lets the mail client serve `cid:` parts from memory and
-refuse remote hosts until the user clicks "load images". **Verify against the
-pinned `servo` revision** which `WebViewDelegate` hooks can actually supply a
-response body; if interception is not exposed at this version, fall back to
-rewriting URLs during sanitisation (B5) and record the limitation in the README.
+**Confirmed available in `servo 0.1.0` — no fallback needed.** The open question
+from the first draft is settled: `WebViewDelegate` has a first-class
+interception hook, exercised by servo's own `test_web_resource_load`.
 
-Emit a proper event enum: `LoadStarted`, `LoadFinished`, `TitleChanged`,
-`UrlChanged`, `FaviconChanged`, `LinkClicked`, `NavigationBlocked`, `LoadError`,
-`CursorChanged`.
+```rust
+// webview_delegate.rs:1016 — fires for every resource load in the view
+fn load_web_resource(&self, _webview: WebView, _load: WebResourceLoad) {}
+
+// WebResourceRequest gives: method, headers, url, is_for_main_frame, is_redirect
+impl WebResourceLoad {
+    fn request(&self) -> &WebResourceRequest;
+    fn intercept(self, response: WebResourceResponse) -> InterceptedWebResourceLoad;
+}
+impl InterceptedWebResourceLoad {
+    fn send_body_data(&mut self, data: Vec<u8>);  // serve bytes from memory
+    fn finish(self);
+    fn cancel(self);                              // network error == blocked
+}
+```
+
+That is exactly what B5 needs: block a remote image by intercepting and
+`cancel()`ing it, serve a `cid:` part by intercepting and `send_body_data()`ing
+the attachment bytes. Both are the intended mechanism, not a workaround.
+
+**The safety-critical detail: both hooks fail OPEN.** `NavigationRequest`'s
+`Drop` impl sends *allow*, and an unhandled `WebResourceLoad` sends
+`DoNotIntercept`. Dropping either permits the thing you meant to block. Any
+view showing untrusted mail must handle every load explicitly — the type
+system will not remind you. (This already bit us: see the A2 commit, where
+`drop(request)` was silently allowing link navigations.)
+
+Emit a proper event enum. Every one of these is backed by a real hook —
+`notify_url_changed`, `notify_page_title_changed`, `notify_status_text_changed`,
+`notify_load_status_changed`, `notify_favicon_changed` (no payload; re-read via
+`WebView::favicon()`), `notify_history_changed`, `notify_traversal_complete`.
 
 ### A4. Navigation API
-`go_back` / `go_forward` / `can_go_back` / `can_go_forward` / `reload` / `stop` /
-`load(source)` / `title()` / `url()`. `WebViewSource::Html` gains an optional
-base URL — today it always base64s into a `data:` URL
-([src/lib.rs:367](src/lib.rs:367)), which makes every relative link dead.
+All confirmed present on `servo::WebView`: `load`, `reload`, `can_go_back`,
+`go_back(amount)`, `can_go_forward`, `go_forward(amount)` (the `can_*` are cheap
+index checks on the in-memory back/forward list), plus getters for `url()`,
+`page_title()`, `status_text()`, `favicon()` and `load_status()`.
+
+**`stop()` does not exist in `servo 0.1.0`.** There is no way to cancel an
+in-flight load once it has started — the only control points are up front, via
+`request_navigation` and `load_web_resource`. Drop it from the planned API
+rather than faking it, and say so in the README.
+
+`WebViewSource::Html` gains an optional base URL — it currently always base64s
+into a `data:` URL, which makes every relative link dead.
 
 ### A5. Input completeness
 Handle `egui::Event::Text` for character input; add right/middle buttons and
@@ -321,6 +355,13 @@ CSS URLs to a blocked placeholder → wrap in a base document setting charset, a
 readable default font, and `max-width` so wide marketing mail does not force
 horizontal scroll.
 
+Blocking happens in `load_web_resource` (A3), not via injected CSS: Servo's
+`UserContentManager` can add user stylesheets and scripts but has **no CSP
+API**, and CSS cannot stop a network fetch — hiding an `<img>` still loads it.
+A real `Content-Security-Policy` header can be attached to the intercepted
+main-document response if we want belt-and-braces, but interception alone is
+sufficient and more precise.
+
 Add a per-message "Load remote images" bar that re-renders unblocked, plus a
 per-sender allowlist. External link clicks keep opening in the system browser via
 `LinkClicked`, now backed by a real `NavigationPolicy::Deny` so the view never
@@ -382,9 +423,11 @@ late: they improve the widget, but nothing in Track B waits on them.
 
 ## Risks
 
-- **Servo API churn.** `servo 0.1` is a moving pre-release; A3 and A6 depend on
-  hooks that may not exist or may change shape. Pin an exact revision, and design
-  A3's interception so B5's sanitiser-rewrite fallback is sufficient alone.
+- **Servo API churn.** `servo 0.1` is a moving pre-release. The hooks A3 needs
+  are confirmed to exist *today* (verified against the vendored 0.1.0 source),
+  but they are young and unstable — `stop()` is already missing, and
+  `notify_favicon_changed` carries no payload. Pin an exact version and expect
+  the delegate signatures to move under us.
 - **Build cost dominates the loop.** Servo is a cold multi-hour build and already
   needs a long apt install in
   [.github/workflows/ci.yml](.github/workflows/ci.yml). The workspace split only
