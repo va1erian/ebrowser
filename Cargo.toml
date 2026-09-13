@@ -33,6 +33,7 @@ raw-window-handle = "0.6"
 euclid = "0.22"
 keyboard-types = "0.8"
 base64 = "0.22"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 opt-level = "z"     # Optimize for size
@@ -40,3 +41,5 @@ lto = true          # Link Time Optimization (further reduces size, increases bu
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # No unwinding on panic
 strip = true        # Automatically strip symbols from the binary
+
+[workspace]

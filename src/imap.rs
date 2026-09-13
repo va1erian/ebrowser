@@ -26,6 +26,7 @@ pub enum ImapCommand {
     FetchMailboxes,
     FetchHeaders { mailbox: String, page: u32 },
     FetchBody { mailbox: String, uid: u32 },
+    BulkDownload { mailbox: String },
 }
 
 pub enum ImapEvent {
@@ -34,6 +35,8 @@ pub enum ImapEvent {
     Mailboxes(Vec<String>),
     Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32 },
     Body { uid: u32, html: String },
+    DownloadProgress { current: u32, total: u32 },
+    MailData { mailbox: String, header: MailHeader, body: String },
 }
 
 pub struct ImapActor {
@@ -106,6 +109,13 @@ impl ImapActor {
                             Err(e) => {
                                 let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                             }
+                        }
+                    }
+                }
+                ImapCommand::BulkDownload { mailbox } => {
+                    if let Some(ref mut session) = self.session {
+                        if let Err(e) = Self::bulk_download(session, &mailbox, &self.event_tx).await {
+                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                         }
                     }
                 }
@@ -243,5 +253,104 @@ impl ImapActor {
         }
         
         Err(anyhow!("Message not found or no body"))
+    }
+
+    async fn bulk_download(
+        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        mailbox_name: &str,
+        event_tx: &mpsc::Sender<ImapEvent>,
+    ) -> anyhow::Result<()> {
+        let mailbox = session.examine(mailbox_name).await?;
+        let total = mailbox.exists;
+        if total == 0 {
+            return Ok(());
+        }
+
+        let _ = event_tx.send(ImapEvent::DownloadProgress { current: 0, total }).await;
+
+        // Fetch all UIDs and Envelopes first to get metadata
+        let query = format!("1:{}", total);
+        let fetches = session.fetch(query, "(UID ENVELOPE)").await?;
+        let messages = fetches.collect::<Vec<_>>().await;
+
+        for (i, msg) in messages.into_iter().enumerate() {
+            let msg = msg?;
+            let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
+            let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
+
+            let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
+            
+            let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
+                addrs.and_then(|f| f.first()).map(|addr| {
+                    let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
+                    let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
+                    let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
+                    match name {
+                        Some(n) => format!("{} <{}@{}>", n, mailbox, host),
+                        None => format!("{}@{}", mailbox, host),
+                    }
+                }).unwrap_or_default()
+            };
+            
+            let from = format_address(envelope.from.as_deref());
+            let to = format_address(envelope.to.as_deref());
+            let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
+
+            let header = MailHeader { uid, subject, from, to, date };
+
+            // Now fetch body for this UID
+            let body_query = format!("{}", uid);
+            let mut body_fetches = session.uid_fetch(body_query, "RFC822").await?;
+            let mut body = String::new();
+            if let Some(body_msg) = body_fetches.next().await {
+                let body_msg = body_msg?;
+                if let Some(bytes) = body_msg.body() {
+                    let parsed = parse_mail(bytes)?;
+                    
+                    fn find_html(part: &mailparse::ParsedMail) -> Option<String> {
+                        if part.ctype.mimetype == "text/html" {
+                            return part.get_body().ok();
+                        }
+                        for subpart in &part.subparts {
+                            if let Some(html) = find_html(subpart) {
+                                return Some(html);
+                            }
+                        }
+                        None
+                    }
+
+                    fn find_text(part: &mailparse::ParsedMail) -> Option<String> {
+                        if part.ctype.mimetype == "text/plain" {
+                            return part.get_body().ok();
+                        }
+                        for subpart in &part.subparts {
+                            if let Some(text) = find_text(subpart) {
+                                return Some(text);
+                            }
+                        }
+                        None
+                    }
+
+                    if let Some(html) = find_html(&parsed) {
+                        body = html;
+                    } else if let Some(text) = find_text(&parsed) {
+                        body = format!("<pre>{}</pre>", text);
+                    }
+                }
+            }
+
+            let _ = event_tx.send(ImapEvent::MailData {
+                mailbox: mailbox_name.to_string(),
+                header,
+                body,
+            }).await;
+
+            let _ = event_tx.send(ImapEvent::DownloadProgress {
+                current: (i + 1) as u32,
+                total,
+            }).await;
+        }
+
+        Ok(())
     }
 }

@@ -31,7 +31,7 @@ use servo::DeviceIndependentPixel;
 // keyboard_types is re-exported by servo. We import it separately to
 // construct KeyboardEvent values – use fully-qualified paths to avoid
 // conflicts with the servo::Key re-export.
-use keyboard_types::{Code, KeyState, Location, Modifiers};
+use keyboard_types::{KeyState, Location, Modifiers};
 
 
 // ─── Public API types ────────────────────────────────────────────────────────
@@ -98,6 +98,7 @@ pub struct ESWebView {
     offscreen_ctx: Rc<OffscreenRenderingContext>,
     events: Rc<RefCell<Vec<ESWebViewEvent>>>,
     last_phys_size: PhysicalSize<u32>,
+    last_mouse_pos: Option<egui::Pos2>,
 }
 
 impl ESWebView {
@@ -153,6 +154,7 @@ impl ESWebView {
             offscreen_ctx,
             events,
             last_phys_size: initial_size,
+            last_mouse_pos: None,
         }
     }
 
@@ -228,15 +230,6 @@ impl ESWebView {
 
         // ── Input forwarding to Servo ─────────────────────────────────────────
 
-        // Mouse move
-        if let Some(pos) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
-            if widget_rect.contains(pos) || resp.dragged() {
-                let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
-                self.web_view
-                    .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
-            }
-        }
-
         let mut primary_down = false;
         let mut primary_up = false;
         let mut interact_pos = None;
@@ -252,6 +245,7 @@ impl ESWebView {
                 let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
                 
                 if primary_down {
+                    self.web_view.focus();
                     self.web_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Down,
@@ -269,6 +263,20 @@ impl ESWebView {
                         )));
                 }
             }
+        }
+
+        // Mouse move - send AFTER button events so Down is seen before the first drag-move
+        if let Some(pos) = interact_pos {
+            if widget_rect.contains(pos) || resp.dragged() || primary_up {
+                if self.last_mouse_pos != Some(pos) {
+                    let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
+                    self.web_view
+                        .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
+                    self.last_mouse_pos = Some(pos);
+                }
+            }
+        } else {
+            self.last_mouse_pos = None;
         }
 
         // ── Mouse wheel / touchpad scroll ─────────────────────────────────────
@@ -347,7 +355,7 @@ impl ESWebView {
                         let kb_event = KeyboardEvent::new(keyboard_types::KeyboardEvent {
                             state,
                             key: egui_key_to_keyboard_types(&key),
-                            code: Code::Unidentified,
+                            code: egui_key_to_code(&key),
                             location: Location::Standard,
                             modifiers: egui_modifiers_to_keyboard_types(&modifiers),
                             repeat,
@@ -471,11 +479,70 @@ fn egui_key_to_keyboard_types(key: &egui::Key) -> keyboard_types::Key {
     }
 }
 
+fn egui_key_to_code(key: &egui::Key) -> keyboard_types::Code {
+    use keyboard_types::Code;
+    match key {
+        egui::Key::A => Code::KeyA,
+        egui::Key::B => Code::KeyB,
+        egui::Key::C => Code::KeyC,
+        egui::Key::D => Code::KeyD,
+        egui::Key::E => Code::KeyE,
+        egui::Key::F => Code::KeyF,
+        egui::Key::G => Code::KeyG,
+        egui::Key::H => Code::KeyH,
+        egui::Key::I => Code::KeyI,
+        egui::Key::J => Code::KeyJ,
+        egui::Key::K => Code::KeyK,
+        egui::Key::L => Code::KeyL,
+        egui::Key::M => Code::KeyM,
+        egui::Key::N => Code::KeyN,
+        egui::Key::O => Code::KeyO,
+        egui::Key::P => Code::KeyP,
+        egui::Key::Q => Code::KeyQ,
+        egui::Key::R => Code::KeyR,
+        egui::Key::S => Code::KeyS,
+        egui::Key::T => Code::KeyT,
+        egui::Key::U => Code::KeyU,
+        egui::Key::V => Code::KeyV,
+        egui::Key::W => Code::KeyW,
+        egui::Key::X => Code::KeyX,
+        egui::Key::Y => Code::KeyY,
+        egui::Key::Z => Code::KeyZ,
+        egui::Key::Num0 => Code::Digit0,
+        egui::Key::Num1 => Code::Digit1,
+        egui::Key::Num2 => Code::Digit2,
+        egui::Key::Num3 => Code::Digit3,
+        egui::Key::Num4 => Code::Digit4,
+        egui::Key::Num5 => Code::Digit5,
+        egui::Key::Num6 => Code::Digit6,
+        egui::Key::Num7 => Code::Digit7,
+        egui::Key::Num8 => Code::Digit8,
+        egui::Key::Num9 => Code::Digit9,
+        egui::Key::Enter => Code::Enter,
+        egui::Key::Escape => Code::Escape,
+        egui::Key::Backspace => Code::Backspace,
+        egui::Key::Tab => Code::Tab,
+        egui::Key::Space => Code::Space,
+        egui::Key::Delete => Code::Delete,
+        egui::Key::ArrowDown => Code::ArrowDown,
+        egui::Key::ArrowUp => Code::ArrowUp,
+        egui::Key::ArrowLeft => Code::ArrowLeft,
+        egui::Key::ArrowRight => Code::ArrowRight,
+        egui::Key::Home => Code::Home,
+        egui::Key::End => Code::End,
+        egui::Key::PageUp => Code::PageUp,
+        egui::Key::PageDown => Code::PageDown,
+        _ => Code::Unidentified,
+    }
+}
+
 fn egui_modifiers_to_keyboard_types(m: &egui::Modifiers) -> Modifiers {
     let mut out = Modifiers::empty();
     if m.shift { out |= Modifiers::SHIFT; }
     if m.ctrl  { out |= Modifiers::CONTROL; }
     if m.alt   { out |= Modifiers::ALT; }
-    if m.command { out |= Modifiers::META; }
+    if m.mac_cmd { out |= Modifiers::META; }
+    // Note: on Windows, command == ctrl, so we don't add META for command.
+    // On Mac, command == mac_cmd, so we add META via mac_cmd.
     out
 }

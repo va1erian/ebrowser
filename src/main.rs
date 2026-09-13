@@ -1,12 +1,17 @@
 mod imap;
+mod db;
 
 use es_webview::{ESWebView, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
+use db::{DbActor, DbCommand, DbEvent};
 use tokio::sync::mpsc;
+
 struct EsMailApp {
     web_view: ESWebView,
     imap_tx: mpsc::Sender<ImapCommand>,
     imap_rx: mpsc::Receiver<ImapEvent>,
+    db_tx: mpsc::Sender<DbCommand>,
+    db_rx: mpsc::Receiver<DbEvent>,
     
     // UI state
     host: String,
@@ -23,27 +28,46 @@ struct EsMailApp {
     selected_uid: Option<u32>,
     current_page: u32,
     total_pages: u32,
+
+    // Search and Progress
+    search_query: String,
+    search_results: Option<Vec<MailHeader>>,
+    download_progress: Option<(u32, u32)>,
 }
 
 impl EsMailApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let _ = env_logger::try_init();
         
-        let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        let (evt_tx, evt_rx) = mpsc::channel(32);
+        let (imap_cmd_tx, imap_cmd_rx) = mpsc::channel(32);
+        let (imap_evt_tx, imap_evt_rx) = mpsc::channel(32);
         
+        let (db_cmd_tx, db_cmd_rx) = mpsc::channel(32);
+        let (db_evt_tx, db_evt_rx) = mpsc::channel(32);
+
         let egui_ctx = cc.egui_ctx.clone();
         
-        // Wrap the event sender so it triggers a repaint
+        // Wrap IMAP events
         let (tx, mut rx) = mpsc::channel(32);
+        let ctx_clone = egui_ctx.clone();
         tokio::spawn(async move {
             while let Some(evt) = rx.recv().await {
-                let _ = evt_tx.send(evt).await;
-                egui_ctx.request_repaint();
+                let _ = imap_evt_tx.send(evt).await;
+                ctx_clone.request_repaint();
             }
         });
+        ImapActor::spawn(imap_cmd_rx, tx);
 
-        ImapActor::spawn(cmd_rx, tx);
+        // Wrap DB events
+        let (tx_db, mut rx_db) = mpsc::channel(32);
+        let ctx_clone_db = egui_ctx.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = rx_db.recv().await {
+                let _ = db_evt_tx.send(evt).await;
+                ctx_clone_db.request_repaint();
+            }
+        });
+        DbActor::spawn(db_cmd_rx, tx_db);
 
         let source = WebViewSource::Html("<h1>Welcome to esMail</h1><p>Connect to your IMAP account to start reading.</p>".to_string());
         
@@ -52,13 +76,14 @@ impl EsMailApp {
         });
         
         let password_str = "".to_string();
-        
         let initial_status = "Ready".to_string();
 
         Self {
             web_view: ESWebView::new(cc, source),
-            imap_tx: cmd_tx,
-            imap_rx: evt_rx,
+            imap_tx: imap_cmd_tx,
+            imap_rx: imap_evt_rx,
+            db_tx: db_cmd_tx,
+            db_rx: db_evt_rx,
             host: host_str,
             port: port_str,
             username: username_str,
@@ -71,6 +96,9 @@ impl EsMailApp {
             selected_uid: None,
             current_page: 1,
             total_pages: 1,
+            search_query: String::new(),
+            search_results: None,
+            download_progress: None,
         }
     }
 
@@ -99,9 +127,37 @@ impl EsMailApp {
                     }
                 }
                 ImapEvent::Body { uid, html } => {
-                    if self.selected_uid == Some(uid) {
+                    if self.selected_uid == Some(uid) && self.search_results.is_none() {
                         self.web_view.load(WebViewSource::Html(html));
                     }
+                }
+                ImapEvent::DownloadProgress { current, total } => {
+                    self.download_progress = Some((current, total));
+                    if current == total {
+                        self.download_progress = None;
+                        self.status = "Download complete".to_string();
+                    }
+                }
+                ImapEvent::MailData { mailbox, header, body } => {
+                    let _ = self.db_tx.try_send(DbCommand::IndexMail { mailbox, header, body });
+                }
+            }
+        }
+    }
+
+    fn handle_db_events(&mut self) {
+        while let Ok(evt) = self.db_rx.try_recv() {
+            match evt {
+                DbEvent::SearchResult { headers } => {
+                    self.search_results = Some(headers);
+                }
+                DbEvent::MailFetched { header, body } => {
+                    if self.selected_uid == Some(header.uid) {
+                        self.web_view.load(WebViewSource::Html(body));
+                    }
+                }
+                DbEvent::Error(e) => {
+                    self.status = format!("DB Error: {}", e);
                 }
             }
         }
@@ -111,23 +167,54 @@ impl EsMailApp {
 impl eframe::App for EsMailApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_imap_events();
+        self.handle_db_events();
+
+        if self.is_connected {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Download All (This Mailbox)").clicked() {
+                        let _ = self.imap_tx.try_send(ImapCommand::BulkDownload { mailbox: self.selected_mailbox.clone() });
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Logout").clicked() {
+                        self.is_connected = false;
+                        self.headers.clear();
+                        self.selected_uid = None;
+                        self.status = "Logged out".to_string();
+                        self.web_view.load(WebViewSource::Html("<h1>Logged out</h1>".to_string()));
+                        ui.close_menu();
+                    }
+                });
+            });
+        }
 
         egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("esMail");
                 ui.separator();
-                ui.label(&self.status);
+                
                 if self.is_connected {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Logout").clicked() {
-                            self.is_connected = false;
-                            self.headers.clear();
-                            self.selected_uid = None;
-                            self.status = "Logged out".to_string();
-                            self.web_view.load(WebViewSource::Html("<h1>Logged out</h1>".to_string()));
+                    ui.label("Search:");
+                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Enter keywords..."));
+                    if search_resp.changed() || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        if self.search_query.is_empty() {
+                            self.search_results = None;
+                        } else {
+                            let _ = self.db_tx.try_send(DbCommand::Search { 
+                                query: self.search_query.clone(), 
+                                mailbox: Some(self.selected_mailbox.clone()) 
+                            });
                         }
-                    });
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.search_query.clear();
+                        self.search_results = None;
+                    }
+                    ui.separator();
                 }
+
+                ui.label(&self.status);
             });
         });
 
@@ -174,43 +261,68 @@ impl eframe::App for EsMailApp {
                 });
                 
                 ui.separator();
-                
+                let title = if self.search_results.is_some() { "Search Results" } else { "Inbox" };
                 ui.horizontal(|ui| {
-                    ui.heading("Inbox");
-                    if ui.button("Refresh").clicked() {
-                        let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                    ui.heading(title);
+                    if self.search_results.is_none() {
+                        if ui.button("Refresh").clicked() {
+                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                        }
                     }
                 });
                 
-                egui::Panel::bottom("pagination_panel").show_inside(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("<").clicked() && self.current_page > 1 {
-                            self.current_page -= 1;
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
-                        }
-                        ui.label(format!("Page {} of {}", self.current_page, self.total_pages));
-                        if ui.button(">").clicked() && self.current_page < self.total_pages {
-                            self.current_page += 1;
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
-                        }
+                if self.search_results.is_none() {
+                    egui::Panel::bottom("pagination_panel").show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("<").clicked() && self.current_page > 1 {
+                                self.current_page -= 1;
+                                let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                            }
+                            ui.label(format!("Page {} of {}", self.current_page, self.total_pages));
+                            if ui.button(">").clicked() && self.current_page < self.total_pages {
+                                self.current_page += 1;
+                                let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                            }
+                        });
                     });
-                });
+                }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        for header in &self.headers {
+                        let list = self.search_results.as_ref().unwrap_or(&self.headers);
+                        for header in list {
                             let is_selected = self.selected_uid == Some(header.uid);
                             let text = format!("{}\n{}", header.from, header.subject);
                             let resp = ui.add(egui::Button::selectable(is_selected, text));
                             if resp.clicked() {
-                            self.selected_uid = Some(header.uid);
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchBody { mailbox: self.selected_mailbox.clone(), uid: header.uid });
-                            self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
+                                self.selected_uid = Some(header.uid);
+                                if self.search_results.is_some() {
+                                    let _ = self.db_tx.try_send(DbCommand::FetchMail { 
+                                        mailbox: self.selected_mailbox.clone(), 
+                                        uid: header.uid 
+                                    });
+                                } else {
+                                    let _ = self.imap_tx.try_send(ImapCommand::FetchBody { 
+                                        mailbox: self.selected_mailbox.clone(), 
+                                        uid: header.uid 
+                                    });
+                                }
+                                self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
+                            }
                         }
-                    }
                     });
                 });
             });
+
+            if let Some((current, total)) = self.download_progress {
+                egui::TopBottomPanel::bottom("progress_status").show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Indexing {}... ", self.selected_mailbox));
+                        ui.add(egui::ProgressBar::new(current as f32 / total as f32)
+                            .text(format!("{}/{}", current, total)));
+                    });
+                });
+            }
 
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 if let Some(uid) = self.selected_uid {
