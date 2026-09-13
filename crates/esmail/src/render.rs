@@ -24,6 +24,17 @@
 //! so HTML mail that relies on CSS for layout/color renders as plain
 //! formatted text. Preserving inline styles safely needs a CSS sanitizer on
 //! top of ammonia's HTML one; out of scope for this pass.
+//!
+//! [`extract_attachments`] is B6 of PLAN.md: it walks the same parsed
+//! structure for leaf parts that are neither the chosen body nor already
+//! inlined via `cid:`, decoding each to bytes in memory. Saving/opening them
+//! (via `rfd`/`opener`) is `main.rs`'s job — this module only finds them.
+//! **Not done:** fetching them lazily. The whole `RFC822` is still
+//! downloaded eagerly by `imap.rs` regardless of whether a message has
+//! attachments, rather than fetching only their `BODY[n]` on demand — that's
+//! a change to the fetch itself (needs `BODYSTRUCTURE` to know which part
+//! numbers exist before fetching any of them), not to this parsing step, and
+//! waited for the same reason B2/B3/B4's live-IMAP-facing halves did.
 
 use base64::Engine as _;
 use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
@@ -38,6 +49,61 @@ pub fn render_message(raw: &[u8]) -> String {
         Err(e) => format!("<p>Could not parse this message: {}</p>", ammonia::clean_text(&e.to_string())),
     };
     wrap_document(&body_html)
+}
+
+/// One non-inline part of a message (B6 of PLAN.md): a leaf part that isn't
+/// the `text/plain`/`text/html` body and isn't already inlined into it via a
+/// resolved `cid:` reference. Holds the decoded bytes directly rather than a
+/// path — nothing has been written to disk yet; that's the save/open UI's job
+/// in `main.rs`.
+pub struct Attachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Find every attachment in a message's raw RFC822 bytes. Returns an empty
+/// list (never an error) for an unparseable message — the same "degrade
+/// rather than propagate" choice [`render_message`] makes, since a message
+/// with no readable attachments is not a distinguishable failure from one
+/// that simply has none.
+pub fn extract_attachments(raw: &[u8]) -> Vec<Attachment> {
+    let Ok(parsed) = parse_mail(raw) else {
+        return Vec::new();
+    };
+    all_parts(&parsed)
+        .into_iter()
+        .filter_map(|part| {
+            // Only leaf parts carry actual content; a multipart/* container
+            // itself is never the attachment.
+            if !part.subparts.is_empty() {
+                return None;
+            }
+            // These mimetypes are the *body* candidates find_html/find_text
+            // already pick from, not attachments in their own right.
+            if part.ctype.mimetype == "text/plain" || part.ctype.mimetype == "text/html" {
+                return None;
+            }
+            let disposition = part.get_content_disposition();
+            let has_cid = content_id(part).is_some();
+            // Anything explicitly marked as an attachment counts; so does
+            // anything else that isn't already accounted for as an inline
+            // image resolved into the body via cid: (checked above) --
+            // e.g. a PDF sent with no explicit Content-Disposition at all.
+            let is_attachment = matches!(disposition.disposition, mailparse::DispositionType::Attachment) || !has_cid;
+            if !is_attachment {
+                return None;
+            }
+            let filename = disposition
+                .params
+                .get("filename")
+                .cloned()
+                .or_else(|| part.ctype.params.get("name").cloned())
+                .unwrap_or_else(|| "attachment".to_string());
+            let data = part.get_body_raw().ok()?;
+            Some(Attachment { filename, mime_type: part.ctype.mimetype.clone(), data })
+        })
+        .collect()
 }
 
 fn render_parsed(parsed: &ParsedMail) -> String {
@@ -257,5 +323,73 @@ mod tests {
         let raw = message("Content-Type: text/plain", "");
         let html = render_message(&raw);
         assert!(html.len() > 0);
+    }
+
+    // ── extract_attachments ────────────────────────────────────────────────
+
+    #[test]
+    fn a_plain_text_only_message_has_no_attachments() {
+        let raw = message("Content-Type: text/plain", "just text, nothing attached");
+        assert!(extract_attachments(&raw).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_attachment_is_found_with_its_filename_and_bytes() {
+        let raw = message(
+            "Content-Type: multipart/mixed; boundary=b",
+            "--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+             --b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+             aGVsbG8=\r\n--b--",
+        );
+        let attachments = extract_attachments(&raw);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "report.pdf");
+        assert_eq!(attachments[0].mime_type, "application/pdf");
+        assert_eq!(attachments[0].data, b"hello");
+    }
+
+    #[test]
+    fn an_inline_image_resolved_via_cid_is_not_also_listed_as_an_attachment() {
+        let raw = message(
+            "Content-Type: multipart/related; boundary=b",
+            "--b\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:img1\">\r\n\
+             --b\r\nContent-Type: image/png\r\nContent-ID: <img1>\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+             aGVsbG8=\r\n--b--",
+        );
+        assert!(extract_attachments(&raw).is_empty());
+    }
+
+    #[test]
+    fn a_part_with_no_cid_and_no_disposition_is_still_treated_as_an_attachment() {
+        // e.g. a PDF some mail clients send with no explicit
+        // Content-Disposition at all -- it isn't the body and nothing
+        // references it inline, so it should still surface as downloadable.
+        let raw = message(
+            "Content-Type: multipart/mixed; boundary=b",
+            "--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+             --b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+             aGVsbG8=\r\n--b--",
+        );
+        let attachments = extract_attachments(&raw);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "attachment");
+    }
+
+    #[test]
+    fn filename_falls_back_to_the_content_type_name_param() {
+        let raw = message(
+            "Content-Type: multipart/mixed; boundary=b",
+            "--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+             --b\r\nContent-Type: application/pdf; name=\"named-via-content-type.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+             aGVsbG8=\r\n--b--",
+        );
+        let attachments = extract_attachments(&raw);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "named-via-content-type.pdf");
+    }
+
+    #[test]
+    fn an_unparseable_message_yields_no_attachments_rather_than_an_error() {
+        assert!(extract_attachments(b"not a valid mime message \xFF\xFE").is_empty());
     }
 }

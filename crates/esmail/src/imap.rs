@@ -72,7 +72,7 @@ pub enum ImapEvent {
     Error(String),
     Mailboxes(Vec<String>),
     Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64, mailbox_state: MailboxState },
-    Body { uid: u32, html: String, req_id: u64 },
+    Body { uid: u32, html: String, attachments: Vec<crate::render::Attachment>, req_id: u64 },
     DownloadProgress { current: u32, total: u32 },
     MailData { mailbox: String, header: MailHeader, body: String },
 }
@@ -159,8 +159,8 @@ impl ImapActor {
                     }
                     let session = self.session.as_mut().expect("ensure_connected just verified this");
                     match Self::fetch_body(session, &mailbox, uid).await {
-                        Ok(html) => {
-                            let _ = self.event_tx.send(ImapEvent::Body { uid, html, req_id }).await;
+                        Ok((html, attachments)) => {
+                            let _ = self.event_tx.send(ImapEvent::Body { uid, html, attachments, req_id }).await;
                         }
                         Err(e) => {
                             self.session = None;
@@ -321,7 +321,7 @@ impl ImapActor {
         Ok((headers, total_pages, mailbox_state))
     }
 
-    async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<String> {
+    async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<(String, Vec<crate::render::Attachment>)> {
         session.examine(mailbox_name).await?;
         let query = format!("{}", uid);
         let mut fetches = session.uid_fetch(query, "RFC822").await?;
@@ -329,7 +329,9 @@ impl ImapActor {
         if let Some(msg) = fetches.next().await {
             let msg = msg?;
             let body = msg.body().ok_or_else(|| anyhow::anyhow!("No body"))?;
-            return Ok(crate::render::render_message(body));
+            let html = crate::render::render_message(body);
+            let attachments = crate::render::extract_attachments(body);
+            return Ok((html, attachments));
         }
 
         Err(anyhow!("Message not found or no body"))

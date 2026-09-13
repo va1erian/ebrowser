@@ -90,6 +90,12 @@ struct EsMailApp {
     selected_uid: Option<u32>,
     current_page: u32,
     total_pages: u32,
+    /// Attachments for the currently-open message (B6), if fetched directly
+    /// from IMAP. Cleared whenever a different message is opened. A message
+    /// opened from a cached search result never populates this — the cache
+    /// only stores rendered HTML, not the raw bytes attachments come from;
+    /// see PLAN.md §B6.
+    current_attachments: Vec<render::Attachment>,
 
     /// Monotonic source for `ImapCommand::FetchHeaders`/`FetchBody` request
     /// ids. Only the reply matching `current_headers_req`/`current_body_req`
@@ -211,6 +217,7 @@ impl EsMailApp {
             selected_uid: None,
             current_page: 1,
             total_pages: 1,
+            current_attachments: Vec::new(),
             next_req_id: 0,
             current_headers_req: 0,
             current_body_req: 0,
@@ -260,12 +267,13 @@ impl EsMailApp {
                         uid_next: mailbox_state.uid_next,
                     });
                 }
-                ImapEvent::Body { uid, html, req_id } => {
+                ImapEvent::Body { uid, html, attachments, req_id } => {
                     if req_id == self.current_body_req
                         && self.selected_uid == Some(uid)
                         && self.search_results.is_none()
                     {
                         self.web_view.load(WebViewSource::Html(html));
+                        self.current_attachments = attachments;
                     }
                 }
                 ImapEvent::DownloadProgress { current, total } => {
@@ -577,6 +585,7 @@ impl eframe::App for EsMailApp {
                                 // content, same as any other mail client;
                                 // "Load remote images" opts back in per view.
                                 self.message_view_handler.borrow_mut().allow_remote = false;
+                                self.current_attachments.clear();
                                 self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
                             }
                         }
@@ -650,6 +659,31 @@ impl eframe::App for EsMailApp {
                             });
                         });
                     }
+
+                    if !self.current_attachments.is_empty() {
+                        egui::Panel::top("attachments_bar").show_inside(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for attachment in &self.current_attachments {
+                                    ui.group(|ui| {
+                                        ui.label(format!(
+                                            "{} — {}, {}",
+                                            attachment.filename,
+                                            attachment.mime_type,
+                                            format_size(attachment.data.len())
+                                        ));
+                                        if ui.button("Save…").clicked() {
+                                            save_attachment(attachment);
+                                        }
+                                        if ui.button("Open").clicked() {
+                                            if let Err(e) = open_attachment(attachment) {
+                                                log::warn!("could not open attachment {}: {e}", attachment.filename);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
                 }
 
                 let events = self.web_view.show(ui);
@@ -660,6 +694,62 @@ impl eframe::App for EsMailApp {
                 }
             });
         }
+    }
+}
+
+/// Save-as, via a native file picker pre-filled with the attachment's own
+/// name. Does nothing if the user cancels the dialog; a write failure is
+/// logged rather than surfaced (mirroring the "log, don't crash the UI over
+/// it" treatment other best-effort I/O gets in this file).
+fn save_attachment(attachment: &render::Attachment) {
+    let Some(path) = rfd::FileDialog::new().set_file_name(&attachment.filename).save_file() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, &attachment.data) {
+        log::warn!("could not save attachment to {}: {e}", path.display());
+    }
+}
+
+/// Open-with: write the attachment to a temp file (there is no path for it
+/// yet — it only exists as bytes in memory) and hand that to the OS's
+/// default handler for its type. The temp file is left behind rather than
+/// cleaned up immediately, since the opened application may still be reading
+/// it after this call returns.
+fn open_attachment(attachment: &render::Attachment) -> std::io::Result<()> {
+    let dir = std::env::temp_dir().join("esmail-attachments");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(safe_attachment_filename(&attachment.filename));
+    std::fs::write(&path, &attachment.data)?;
+    opener::open(&path).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// `filename` comes straight from the message's own
+/// Content-Disposition/Content-Type header — an attacker-controlled sender's
+/// mail. Taking only the final path component (and falling back to a fixed
+/// name if that leaves nothing usable) keeps a crafted `"../../../whatever"`
+/// or an absolute path from writing outside the caller's chosen directory,
+/// since `Path::join` would otherwise honor either verbatim.
+fn safe_attachment_filename(filename: &str) -> String {
+    std::path::Path::new(filename)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+/// A human-readable size, e.g. `"4.2 KB"`. Only goes up to MB since a mail
+/// attachment in the GB range would be unusual enough to want the exact byte
+/// count anyway.
+fn format_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes as u64)
     }
 }
 
@@ -717,4 +807,58 @@ fn init_logging() {
 
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| QUIET.to_string());
     let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_size_uses_bytes_below_one_kb() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_size_uses_kb_between_one_kb_and_one_mb() {
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(4300), "4.2 KB");
+    }
+
+    #[test]
+    fn format_size_uses_mb_at_one_mb_and_above() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
+    }
+
+    // ── safe_attachment_filename ─────────────────────────────────────────────
+
+    #[test]
+    fn safe_attachment_filename_passes_an_ordinary_name_through() {
+        assert_eq!(safe_attachment_filename("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn safe_attachment_filename_strips_relative_traversal() {
+        // Regression test: a crafted "../../../whatever" from a malicious
+        // sender's Content-Disposition header must not be able to write
+        // outside the caller's chosen directory when joined onto it.
+        assert_eq!(safe_attachment_filename("../../../evil.exe"), "evil.exe");
+        assert_eq!(safe_attachment_filename("../../etc/passwd"), "passwd");
+    }
+
+    #[test]
+    fn safe_attachment_filename_strips_a_windows_absolute_path() {
+        assert_eq!(
+            safe_attachment_filename(r"C:\Windows\System32\evil.dll"),
+            "evil.dll"
+        );
+    }
+
+    #[test]
+    fn safe_attachment_filename_falls_back_when_nothing_usable_remains() {
+        assert_eq!(safe_attachment_filename(""), "attachment");
+        assert_eq!(safe_attachment_filename(".."), "attachment");
+        assert_eq!(safe_attachment_filename("/"), "attachment");
+    }
 }

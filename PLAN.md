@@ -571,11 +571,34 @@ its default allowlist (no CSS sanitizer is wired in), so CSS-styled HTML mail
 renders as plain formatted text; noted in `render.rs`'s module docs as a
 known limitation, not silently accepted.
 
-### B6. Attachments
+### B6. Attachments — **PARTIALLY DONE**
 Enumerate non-inline parts during parse; show a chip row above the body with
 filename, MIME type and size; save-as via `rfd`, open-with via `opener`. Fetch
 lazily with `BODY.PEEK[n]` instead of pulling the whole `RFC822`
 ([src/imap.rs:227](src/imap.rs:227) always downloads everything).
+
+**What landed:** `render::extract_attachments` (6 unit tests) walks the same
+parsed structure `render_message` does for leaf parts that are neither the
+chosen body nor already resolved into it via `cid:`, decoding each to bytes
+in memory — `Content-Disposition: attachment` counts, and so does anything
+else with no `cid:` reference, since a part that's neither the body nor
+referenced inline has nothing else it could be. Wired into `fetch_body`
+(the single-message-open path only — see below), with a chip row per
+attachment (filename, MIME type, size) above the message and `Save…` (`rfd`
+native file picker) / `Open` (write to a temp file, then `opener::open`) per
+chip.
+
+**What did not land:** the lazy `BODY.PEEK[n]` fetch. `imap.rs` still
+downloads the whole `RFC822` for every message regardless of whether it has
+attachments — `extract_attachments` runs on bytes already in hand, not a
+separate targeted fetch. Doing this properly needs `BODYSTRUCTURE` first (to
+learn which part numbers exist before fetching any of them), which is new
+live-IMAP-protocol code with nothing here to verify it against — deferred for
+the same reason as B2/B3/B4's own live-IMAP halves. Also: attachments only
+appear when a message is opened via a direct `FetchBody` — a message opened
+from a cached search result (`DbEvent::MailFetched`) shows none, because
+`bodies` only caches the rendered HTML (B3), not the raw bytes attachments
+are extracted from.
 
 ### B7. Compose and send
 Add `lettre` (`tokio1-native-tls`, `builder`). A compose window with To/Cc/Bcc
@@ -618,8 +641,8 @@ and Outlook therefore need app passwords.
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
 | 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
-| 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), **B6 — start here** | — |
-| 6 | B7 | — |
+| 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
+| **6** | **B7 — start here** | — |
 | 7 | A5, A6, A7, B8, B9 | — |
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately

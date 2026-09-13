@@ -33,6 +33,9 @@ async-imap = { version = "0.9", default-features = false, features = ["runtime-t
 mailparse = "0.15"
 # HTML sanitization for message bodies before they reach the webview (B5).
 ammonia = "4"
+# Attachment save-as / open-with (B6).
+rfd = "0.15"
+opener = "0.7"
 
 # Storage / secrets
 # Pinned to 0.37 to unify with servo-storage's rusqlite; libsqlite3-sys sets
