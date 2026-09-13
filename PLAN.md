@@ -391,7 +391,7 @@ dead weight; add it when B7/OAuth needs to distinguish. `smtp_host`/`smtp_tls`
 are in the struct (defaulted) since B7 needs the field to exist, but nothing
 reads them yet.
 
-### B2. Session layer rework
+### B2. Session layer rework — **PARTIALLY DONE**
 Split `ImapActor` into a small pool: one long-lived control session per account
 for IDLE and mailbox state, plus a worker session for fetches, so opening a large
 message — or running `BulkDownload` — never freezes the header list. Give every
@@ -399,6 +399,38 @@ command a request id and echo it on the event, so late replies for a superseded
 selection are dropped (today the guard is a mailbox-name string compare,
 [src/main.rs:99](src/main.rs:99)). Add auto-reconnect with backoff, a
 `Disconnected` event, and cancellation of in-flight work on mailbox change.
+
+**What actually landed, and what did not:** the request-id plumbing, the
+`Disconnected` event, and auto-reconnect with exponential backoff are done —
+`ImapCommand::FetchHeaders`/`FetchBody` now carry a `req_id` echoed on their
+reply, `EsMailApp` only applies the reply matching its
+`current_headers_req`/`current_body_req`, and `ImapActor::ensure_connected`
+retries a dropped connection (5 attempts, 1s→16s backoff) using remembered
+credentials before any command that needs a session.
+
+**The single-session/worker-pool split and IDLE did not land.** There is
+still exactly one `async_imap::Session`; a body fetch still blocks the header
+list, and `BulkDownload` still blocks everything else for its duration. This
+was cut deliberately rather than attempted blind: splitting into a
+control+worker pool and adding IDLE is a large, failure-prone rewrite of live
+network code, and this environment has no real IMAP server to test it
+against — landing it un-verified risked a subtly broken actor that looks fine
+in `cargo check`. "Cancellation of in-flight work on mailbox change" is
+covered only in the sense that a stale reply is now dropped by `req_id`, not
+in the stronger sense of interrupting an in-flight fetch (servo 0.1.0's
+webview has the same limit — no `stop()` — noted at A4). The session split
+is real, standalone work; pick it up as its own phase, ideally with a way to
+exercise it against a live or mock IMAP server.
+
+**One more simplification worth knowing about:** any error from
+`fetch_mailboxes`/`fetch_headers`/`fetch_body`/`bulk_download` clears
+`self.session`, not just IO/TLS-level failures. There is no clean way to tell
+"the connection died" apart from "the server said no" once both have gone
+through `anyhow`'s `?` a few layers up, so this errs toward self-healing: a
+transient protocol error (e.g. a mailbox that no longer exists) now costs a
+full reconnect instead of just an error message, which is wasteful but never
+leaves the actor stuck. Worth revisiting once real error variants are threaded
+through instead of `anyhow::Error`.
 
 ### B3. Local cache — finish and harden `db.rs`
 The WIP `DbActor` is the right idea; give it the schema the rest of the plan
@@ -493,8 +525,8 @@ and Outlook therefore need app passwords.
 | ~~**0**~~ | ~~Manifest fix; clear 4 deprecations; commit `db.rs`~~ **DONE** | everything |
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
-| **3** | ~~B1~~ **DONE**, **B2 — start here** | B3, B7 |
-| 4 | B3, B4 | B8 |
+| 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
+| **4** | **B3, B4 — start here** | B8 |
 | 5 | B5, B6 | — |
 | 6 | B7 | — |
 | 7 | A5, A6, A7, B8, B9 | — |

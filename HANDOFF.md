@@ -4,8 +4,11 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is B2** ([PLAN.md](PLAN.md) §B2). Everything in phases 0-2 is
-done and committed, and B1 (phase 3) is done too.
+**Your next task is B3, then B4** ([PLAN.md](PLAN.md) §B3, §B4). Phases 0-2 are
+done. B1 is done. B2 is only partially done — request ids, `Disconnected`, and
+auto-reconnect landed, but the control/worker session split and IDLE did not
+(see PLAN.md §B2 for exactly why and what's left); pick that up whenever there
+is a way to test it against a real or mock IMAP server.
 
 ---
 
@@ -235,7 +238,8 @@ the `glow` renderer. That is §A6.
 | `9143154` | Size derived from the painted rect; 13 unit tests; log filtering |
 | `237fc42` | Mark phases 0-1 done in the plan; add HANDOFF.md |
 | `3e908f7` | **A3, A4** — `NavigationPolicy` / `WebViewHandler` (real resource interception via `load_web_resource`; every `notify_*` hook now emits a `WebViewEvent`), full navigation API (`reload`, `go_back`/`go_forward`, `url`/`page_title`/`status_text`/`favicon`/`load_status`), `WebViewSource::HtmlWithBase` for relative links |
-| *(this branch)* | **B1** — `config.rs`/`secrets.rs`: TOML `Config` in the platform config dir, passwords in the OS keyring, legacy `esmail_config.txt` migration, inline saved-accounts list on the login screen |
+| `be05ebf` | **B1** — `config.rs`/`secrets.rs`: TOML `Config` in the platform config dir, passwords in the OS keyring, legacy `esmail_config.txt` migration, inline saved-accounts list on the login screen |
+| *(this branch)* | **B2 (partial)** — `req_id` on `FetchHeaders`/`FetchBody`, dropped when stale; `Disconnected` event; `ensure_connected` auto-reconnects with backoff using remembered credentials. Session pool + IDLE not done — see PLAN.md §B2 |
 
 State: `cargo check --workspace` clean, `cargo test --workspace` 25 passing, app
 builds, runs, screenshots and exits cleanly.

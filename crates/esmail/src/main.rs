@@ -46,6 +46,15 @@ struct EsMailApp {
     current_page: u32,
     total_pages: u32,
 
+    /// Monotonic source for `ImapCommand::FetchHeaders`/`FetchBody` request
+    /// ids. Only the reply matching `current_headers_req`/`current_body_req`
+    /// is applied; an older one arriving late (e.g. a slow page-2 fetch
+    /// answered after the user already moved to page 3) is dropped instead of
+    /// clobbering newer state.
+    next_req_id: u64,
+    current_headers_req: u64,
+    current_body_req: u64,
+
     // Search and Progress
     search_query: String,
     search_results: Option<Vec<MailHeader>>,
@@ -152,6 +161,9 @@ impl EsMailApp {
             selected_uid: None,
             current_page: 1,
             total_pages: 1,
+            next_req_id: 0,
+            current_headers_req: 0,
+            current_body_req: 0,
             search_query: String::new(),
             search_results: None,
             download_progress: None,
@@ -166,7 +178,10 @@ impl EsMailApp {
                     self.is_connected = true;
                     self.persist_current_account();
                     let _ = self.imap_tx.try_send(ImapCommand::FetchMailboxes);
-                    let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: 1 });
+                    self.fetch_headers(self.selected_mailbox.clone(), 1);
+                }
+                ImapEvent::Disconnected => {
+                    self.status = "Connection lost, reconnecting...".to_string();
                 }
                 ImapEvent::Error(e) => {
                     self.status = format!("Error: {}", e);
@@ -174,16 +189,22 @@ impl EsMailApp {
                 ImapEvent::Mailboxes(mbs) => {
                     self.mailboxes = mbs;
                 }
-                ImapEvent::Headers { mailbox, headers, page, total_pages } => {
-                    if mailbox == self.selected_mailbox {
+                ImapEvent::Headers { mailbox, headers, page, total_pages, req_id } => {
+                    // Only the most recently issued FetchHeaders' reply is
+                    // applied; an older one arriving late (e.g. the mailbox
+                    // was changed again before it came back) is dropped.
+                    if req_id == self.current_headers_req && mailbox == self.selected_mailbox {
                         self.headers = headers;
                         self.current_page = page;
                         self.total_pages = total_pages;
                         self.status = format!("Page {} of {}", page, total_pages);
                     }
                 }
-                ImapEvent::Body { uid, html } => {
-                    if self.selected_uid == Some(uid) && self.search_results.is_none() {
+                ImapEvent::Body { uid, html, req_id } => {
+                    if req_id == self.current_body_req
+                        && self.selected_uid == Some(uid)
+                        && self.search_results.is_none()
+                    {
                         self.web_view.load(WebViewSource::Html(html));
                     }
                 }
@@ -217,6 +238,28 @@ impl EsMailApp {
                 }
             }
         }
+    }
+
+    /// A fresh request id for `FetchHeaders`/`FetchBody`, mechanically
+    /// distinct from the last one handed out.
+    fn next_req_id(&mut self) -> u64 {
+        self.next_req_id += 1;
+        self.next_req_id
+    }
+
+    /// Send `FetchHeaders`, recording its request id as the only one whose
+    /// reply `handle_imap_events` will still accept.
+    fn fetch_headers(&mut self, mailbox: String, page: u32) {
+        let req_id = self.next_req_id();
+        self.current_headers_req = req_id;
+        let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox, page, req_id });
+    }
+
+    /// Send `FetchBody`, recording its request id the same way `fetch_headers` does.
+    fn fetch_body(&mut self, mailbox: String, uid: u32) {
+        let req_id = self.next_req_id();
+        self.current_body_req = req_id;
+        let _ = self.imap_tx.try_send(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
     /// Fill the login form from a saved account and pull its password back
@@ -373,15 +416,23 @@ impl eframe::App for EsMailApp {
                 ui.heading("Mailboxes");
                 egui::ScrollArea::vertical().id_salt("mailboxes_scroll").max_height(150.0).show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        // Deferred past the loop for the same reason as the
+                        // message list below: fetch_headers needs &mut self,
+                        // which can't happen while `mb` still borrows
+                        // self.mailboxes.
+                        let mut clicked_mailbox = None;
                         for mb in &self.mailboxes {
                             let is_selected = self.selected_mailbox == *mb;
                             if ui.add(egui::Button::selectable(is_selected, mb)).clicked() {
+                                clicked_mailbox = Some(mb.clone());
+                            }
+                        }
+                        if let Some(mb) = clicked_mailbox {
                             self.selected_mailbox = mb.clone();
                             self.selected_uid = None;
                             self.current_page = 1;
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: mb.clone(), page: 1 });
+                            self.fetch_headers(mb, 1);
                         }
-                    }
                     });
                 });
                 
@@ -391,7 +442,7 @@ impl eframe::App for EsMailApp {
                     ui.heading(title);
                     if self.search_results.is_none() {
                         if ui.button("Refresh").clicked() {
-                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                            self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
                         }
                     }
                 });
@@ -401,12 +452,12 @@ impl eframe::App for EsMailApp {
                         ui.horizontal(|ui| {
                             if ui.button("<").clicked() && self.current_page > 1 {
                                 self.current_page -= 1;
-                                let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                                self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
                             }
                             ui.label(format!("Page {} of {}", self.current_page, self.total_pages));
                             if ui.button(">").clicked() && self.current_page < self.total_pages {
                                 self.current_page += 1;
-                                let _ = self.imap_tx.try_send(ImapCommand::FetchHeaders { mailbox: self.selected_mailbox.clone(), page: self.current_page });
+                                self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
                             }
                         });
                     });
@@ -414,25 +465,33 @@ impl eframe::App for EsMailApp {
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        // `clicked_uid` defers the FetchBody/FetchMail send
+                        // until after `list`'s borrow of self.headers /
+                        // self.search_results ends below: fetch_body takes
+                        // &mut self, which the borrow checker won't allow
+                        // while `list` (borrowed from those same fields) is
+                        // still alive across the loop.
                         let list = self.search_results.as_ref().unwrap_or(&self.headers);
+                        let is_search = self.search_results.is_some();
+                        let mut clicked_uid = None;
                         for header in list {
                             let is_selected = self.selected_uid == Some(header.uid);
                             let text = format!("{}\n{}", header.from, header.subject);
                             let resp = ui.add(egui::Button::selectable(is_selected, text));
                             if resp.clicked() {
                                 self.selected_uid = Some(header.uid);
-                                if self.search_results.is_some() {
-                                    let _ = self.db_tx.try_send(DbCommand::FetchMail { 
-                                        mailbox: self.selected_mailbox.clone(), 
-                                        uid: header.uid 
-                                    });
-                                } else {
-                                    let _ = self.imap_tx.try_send(ImapCommand::FetchBody { 
-                                        mailbox: self.selected_mailbox.clone(), 
-                                        uid: header.uid 
-                                    });
-                                }
+                                clicked_uid = Some(header.uid);
                                 self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
+                            }
+                        }
+                        if let Some(uid) = clicked_uid {
+                            if is_search {
+                                let _ = self.db_tx.try_send(DbCommand::FetchMail {
+                                    mailbox: self.selected_mailbox.clone(),
+                                    uid,
+                                });
+                            } else {
+                                self.fetch_body(self.selected_mailbox.clone(), uid);
                             }
                         }
                     });

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
@@ -6,6 +8,23 @@ use mailparse::parse_mail;
 use secrecy::{SecretString, ExposeSecret};
 use futures::StreamExt;
 use anyhow::anyhow;
+
+/// How many times [`ImapActor::ensure_connected`] retries a lost connection
+/// before giving up and reporting the error to the UI.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// Backoff between reconnect attempts: 1s, 2s, 4s, 8s, capped at 16s.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(16);
+
+/// Credentials kept around so a dropped connection can be retried without the
+/// user re-entering their password. Held only in memory, never persisted —
+/// see `crate::secrets` for the on-disk (keyring) copy.
+#[derive(Clone)]
+struct Credentials {
+    host: String,
+    port: u16,
+    username: String,
+    password: SecretString,
+}
 
 #[derive(Debug, Clone)]
 pub struct MailHeader {
@@ -24,17 +43,27 @@ pub enum ImapCommand {
         password: SecretString,
     },
     FetchMailboxes,
-    FetchHeaders { mailbox: String, page: u32 },
-    FetchBody { mailbox: String, uid: u32 },
+    /// `req_id` is echoed on the resulting [`ImapEvent::Headers`] (or
+    /// `Error`, which does not carry it — see its doc) so the UI can drop a
+    /// reply that arrives after a newer request superseded it, instead of the
+    /// old mailbox-name string compare which could not tell two requests for
+    /// the *same* mailbox apart (e.g. hitting "Refresh" twice quickly).
+    FetchHeaders { mailbox: String, page: u32, req_id: u64 },
+    /// See `FetchHeaders`; echoed on [`ImapEvent::Body`].
+    FetchBody { mailbox: String, uid: u32, req_id: u64 },
     BulkDownload { mailbox: String },
 }
 
 pub enum ImapEvent {
     Connected,
+    /// The connection was lost (or a command needed a reconnect). Followed by
+    /// either a `Connected` once [`ImapActor::ensure_connected`]'s retry loop
+    /// succeeds, or an `Error` once it exhausts its attempts.
+    Disconnected,
     Error(String),
     Mailboxes(Vec<String>),
-    Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32 },
-    Body { uid: u32, html: String },
+    Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64 },
+    Body { uid: u32, html: String, req_id: u64 },
     DownloadProgress { current: u32, total: u32 },
     MailData { mailbox: String, header: MailHeader, body: String },
 }
@@ -43,6 +72,10 @@ pub struct ImapActor {
     cmd_rx: mpsc::Receiver<ImapCommand>,
     event_tx: mpsc::Sender<ImapEvent>,
     session: Option<async_imap::Session<TlsStream<TcpStream>>>,
+    /// Set on the first successful [`ImapActor::connect`]; reused by
+    /// [`ImapActor::ensure_connected`] to reconnect without the user retyping
+    /// their password.
+    credentials: Option<Credentials>,
 }
 
 impl ImapActor {
@@ -54,6 +87,7 @@ impl ImapActor {
             cmd_rx,
             event_tx,
             session: None,
+            credentials: None,
         };
 
         tokio::spawn(async move {
@@ -67,6 +101,9 @@ impl ImapActor {
                 ImapCommand::Connect { host, port, username, password } => {
                     match self.connect(&host, port, &username, password.expose_secret()).await {
                         Ok(_) => {
+                            // Remembered so `ensure_connected` can reconnect
+                            // without the user retyping their password.
+                            self.credentials = Some(Credentials { host, port, username, password });
                             let _ = self.event_tx.send(ImapEvent::Connected).await;
                         }
                         Err(e) => {
@@ -75,65 +112,122 @@ impl ImapActor {
                     }
                 }
                 ImapCommand::FetchMailboxes => {
-                    if let Some(ref mut session) = self.session {
-                        match Self::fetch_mailboxes(session).await {
-                            Ok(mbs) => {
-                                let _ = self.event_tx.send(ImapEvent::Mailboxes(mbs)).await;
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                            }
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::fetch_mailboxes(session).await {
+                        Ok(mbs) => {
+                            let _ = self.event_tx.send(ImapEvent::Mailboxes(mbs)).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                         }
                     }
                 }
-                ImapCommand::FetchHeaders { mailbox, page } => {
-                    if let Some(ref mut session) = self.session {
-                        match Self::fetch_headers(session, &mailbox, page).await {
-                            Ok((headers, total_pages)) => {
-                                let _ = self.event_tx.send(ImapEvent::Headers { mailbox, headers, page, total_pages }).await;
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                            }
+                ImapCommand::FetchHeaders { mailbox, page, req_id } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::fetch_headers(session, &mailbox, page).await {
+                        Ok((headers, total_pages)) => {
+                            let _ = self.event_tx.send(ImapEvent::Headers { mailbox, headers, page, total_pages, req_id }).await;
                         }
-                    } else {
-                        let _ = self.event_tx.send(ImapEvent::Error("Not connected".into())).await;
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        }
                     }
                 }
-                ImapCommand::FetchBody { mailbox, uid } => {
-                    if let Some(ref mut session) = self.session {
-                        match Self::fetch_body(session, &mailbox, uid).await {
-                            Ok(html) => {
-                                let _ = self.event_tx.send(ImapEvent::Body { uid, html }).await;
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                            }
+                ImapCommand::FetchBody { mailbox, uid, req_id } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::fetch_body(session, &mailbox, uid).await {
+                        Ok(html) => {
+                            let _ = self.event_tx.send(ImapEvent::Body { uid, html, req_id }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                         }
                     }
                 }
                 ImapCommand::BulkDownload { mailbox } => {
-                    if let Some(ref mut session) = self.session {
-                        if let Err(e) = Self::bulk_download(session, &mailbox, &self.event_tx).await {
-                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                        }
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    if let Err(e) = Self::bulk_download(session, &mailbox, &self.event_tx).await {
+                        self.session = None;
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                     }
                 }
             }
         }
     }
 
+    /// Reconnect using the last credentials that worked, with exponential
+    /// backoff, if the session was dropped (by `Connect` never having
+    /// succeeded, or by a prior command failing and clearing `self.session`).
+    /// A no-op — and free — when already connected.
+    ///
+    /// This is the auto-reconnect half of B2; it does *not* attempt to keep a
+    /// separate control session alive for IDLE (there is no IDLE session yet
+    /// at all — see PLAN.md §B2's noted scope cut).
+    async fn ensure_connected(&mut self) -> anyhow::Result<()> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let creds = self
+            .credentials
+            .clone()
+            .ok_or_else(|| anyhow!("not connected yet"))?;
+
+        let _ = self.event_tx.send(ImapEvent::Disconnected).await;
+
+        let mut delay = Duration::from_secs(1);
+        let mut last_err = None;
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+            match self
+                .connect(&creds.host, creds.port, &creds.username, creds.password.expose_secret())
+                .await
+            {
+                Ok(()) => {
+                    let _ = self.event_tx.send(ImapEvent::Connected).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {e}");
+                    last_err = Some(e);
+                    if attempt < MAX_RECONNECT_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed")))
+    }
+
     async fn connect(&mut self, host: &str, port: u16, username: &str, password: &str) -> anyhow::Result<()> {
         let tls_connector = TlsConnector::builder().build()?;
         let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-        
+
         let stream = TcpStream::connect((host, port)).await?;
         let tls_stream = tokio_tls_connector.connect(host, stream).await?;
         let mut client = async_imap::Client::new(tls_stream);
         let _ = client.read_response().await;
-        
+
         let session = client.login(username, password).await.map_err(|(e, _)| e)?;
-        
+
         self.session = Some(session);
         Ok(())
     }
