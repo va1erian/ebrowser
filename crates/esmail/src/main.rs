@@ -1,5 +1,6 @@
 mod imap;
 mod db;
+mod screenshot;
 
 use egui_servo_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
@@ -13,6 +14,7 @@ struct EsMailApp {
     web_view: WebView,
     /// Owns the Servo engine; one per window. Outlives every view.
     web_view_host: WebViewHost,
+    screenshotter: screenshot::Screenshotter,
     imap_tx: mpsc::Sender<ImapCommand>,
     imap_rx: mpsc::Receiver<ImapEvent>,
     db_tx: mpsc::Sender<DbCommand>,
@@ -92,6 +94,7 @@ impl EsMailApp {
         Self {
             web_view_host,
             web_view,
+            screenshotter: screenshot::Screenshotter::from_env(),
             imap_tx: imap_cmd_tx,
             imap_rx: imap_evt_rx,
             db_tx: db_cmd_tx,
@@ -180,6 +183,8 @@ impl eframe::App for EsMailApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Drive Servo once per frame, independent of how many views are drawn.
         self.web_view_host.spin();
+
+        self.screenshotter.update(ui.ctx());
 
         self.handle_imap_events();
         self.handle_db_events();

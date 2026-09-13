@@ -1935,6 +1935,7 @@ dependencies = [
  "egui_glow",
  "env_logger",
  "futures",
+ "image",
  "keyring",
  "log",
  "mailparse",

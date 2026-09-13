@@ -270,17 +270,79 @@ rather than faking it, and say so in the README.
 into a `data:` URL, which makes every relative link dead.
 
 ### A5. Input completeness
-Handle `egui::Event::Text` for character input; add right/middle buttons and
-double-click; route clipboard copy/cut/paste; adopt egui focus
-(`response.request_focus()` on click, key events only while `has_focus()`);
-apply `CursorChanged` to `ui.output_mut().cursor_icon`.
+Every item below was checked against servoshell — Servo's own egui-based
+browser — and against the vendored `InputEvent` enum, which has
+`Keyboard`, `Ime`, `MouseButton`, `MouseMove`, `MouseLeftViewport`, `Wheel`,
+`Touch` and `EditingAction`. Nothing here needs winit access: where servoshell
+reads a raw winit event, egui has already translated the same thing for us.
+
+- **Text input is the worst of it.** `egui_key_to_keyboard_types` maps
+  `egui::Key::A..Z` to hardcoded *lowercase* characters, so the widget can
+  never produce `@`, `É`, `€`, or any shifted symbol — capital letters
+  included. servoshell never does this: winit hands it a fully layout- and
+  shift-resolved string. Our equivalent is `egui::Event::Text(String)`, which
+  egui-winit derives from exactly the same source. Forward `Event::Text` as
+  `Key::Character(text)` and stop deriving characters from `egui::Key`, which
+  carries no case information. Keep `Event::Key` for named keys, `code`, and
+  modifiers.
+- **IME** is a separate channel: forward `egui::Event::Ime` to
+  `InputEvent::Ime(ImeEvent::Composition { .. })`, mirroring servoshell's
+  Start / Update / End / Dismissed states. Without it, dead keys and any CJK
+  input are impossible.
+- **Focus:** servoshell routes keys to the page whenever *no egui widget* holds
+  `ctx.memory().focused()`. Our `hovered() || clicked()` test leaks keystrokes
+  into the page merely because the pointer is over it — type in a sibling text
+  field with the mouse resting on the message body and the page gets the keys
+  too. Call `request_focus(resp.id)` on click and gate on `has_focus()`.
+- **Pointer exit:** send `InputEvent::MouseLeftViewport` when the pointer
+  leaves the widget rect. We currently just stop sending moves, which leaves
+  stale `:hover` state stuck in the page.
+- **Scroll is on the wrong API.** We call
+  `notify_scroll_event(Scroll::Delta(..))`, which is the *touch-pan* path
+  servoshell uses only in its mobile port; desktop servoshell sends
+  `InputEvent::Wheel(WheelEvent)`. The difference is visible to pages: our path
+  never fires a DOM `wheel` event, so no page can `preventDefault()` it and any
+  custom scroll handling silently breaks. Switch to `InputEvent::Wheel`. That
+  also sidesteps the sign convention our code currently asserts in a comment
+  and has never verified.
+- **Cursor:** implement the cursor-change delegate hook and map Servo's
+  `Cursor` onto `egui::CursorIcon` via `ctx.set_cursor_icon`. servoshell does
+  the same thing through winit; egui exposes the equivalent.
+- **Clipboard:** libservo ships a default `ClipboardDelegate` that talks to the
+  OS clipboard, and servoshell relies on it rather than implementing its own.
+  We likely get it for free — verify, then add servoshell's
+  Ctrl/Cmd+X/C/V → `InputEvent::EditingAction(Cut/Copy/Paste)` shortcuts.
+- Also add right/middle buttons and double-click, which nothing upstream
+  needed to teach us.
 
 ### A6. Rendering path
-Keep `read_to_image` as the portable default, but (a) re-upload only when Servo
-signals a new frame rather than every frame, and (b) investigate sharing the GL
-texture with `egui_glow` via `PaintCallback` behind a `glow-direct` feature.
-Measure before committing to (b) — the CPU path may be fine at mail-reading
-sizes.
+**The zero-copy path exists and we are already on the backend it needs.**
+servoshell does not read pixels back to the CPU at all; it registers an
+`egui::PaintCallback` and lets Servo blit its framebuffer straight into egui's
+GL context. The hook is real in our vendored version:
+
+```rust
+// servo-paint-api-0.1.0/rendering_context.rs:748
+impl OffscreenRenderingContext {
+    pub fn render_to_parent_callback(&self) -> Option<RenderToParentCallback>
+}
+```
+
+It returns a closure that blits the offscreen framebuffer into a target rect
+given a `glow` context — and our eframe is configured with the `glow` renderer,
+so `painter.gl()` hands us exactly that. This replaces the whole
+`read_to_image` → `ColorImage` → texture-upload block with a `PaintCallback`,
+removing a full-surface GPU→CPU readback stall plus an RGBA copy every frame.
+
+Keep the CPU readback behind a fallback path — `render_to_parent_callback`
+returns `Option`, and a wgpu-backed eframe would need a different mechanism
+entirely — but the GL path should be the default, not an experiment. (A2
+already landed the cheap half of the old plan: the texture is allocated once
+and reused rather than reallocated per frame.)
+
+Still worth doing on the fallback path: only re-read when
+`notify_new_frame_ready` has fired since the last blit, rather than
+unconditionally every `show()`.
 
 ### A7. Packaging *(internal — not published)*
 The crate stays in this repo; **crates.io publication is explicitly out of

@@ -32,3 +32,4 @@ serde.workspace = true
 url.workspace = true
 log.workspace = true
 env_logger.workspace = true
+image.workspace = true
