@@ -46,7 +46,7 @@ struct EsMailApp {
 
 impl EsMailApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let _ = env_logger::try_init();
+        init_logging();
         
         let (imap_cmd_tx, imap_cmd_rx) = mpsc::channel(32);
         let (imap_evt_tx, imap_evt_rx) = mpsc::channel(32);
@@ -459,4 +459,25 @@ fn preview_demo_html() -> String {
 <h2 id="bottom">Bottom of the page</h2>
 "#
     .to_string()
+}
+
+/// Install the logger, quietening Servo's known-benign chatter by default.
+///
+/// These are engine-internal and not caused by (or fixable from) the embedder:
+///
+/// * `webrender::device::gl` warns "Cropping texture upload Box2D((0,0),(0,1))"
+///   six times while its GPU cache warms up over the first two paints, and
+///   reports missing optimised shader sources.
+/// * `profile_traits::mem` warns that the memory profiler thread disconnected,
+///   once per component, while Servo tears itself down on drop. This happens
+///   even when no webview is ever drawn.
+/// * `fontdb` complains about individual malformed fonts installed on the
+///   system, which says nothing about this application.
+///
+/// Setting RUST_LOG overrides all of it, so nothing is permanently hidden.
+fn init_logging() {
+    const QUIET: &str = "warn,webrender::device::gl=error,profile_traits::mem=error,fontdb=error";
+
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| QUIET.to_string());
+    let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
 }

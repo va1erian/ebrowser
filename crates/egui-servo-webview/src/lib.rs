@@ -283,31 +283,36 @@ impl WebView {
     /// Call once per frame per view. The engine itself is driven separately by
     /// [`WebViewHost::spin`], which must be called once per frame overall.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
-        let available = ui.available_size();
         let dpi = ui.ctx().pixels_per_point();
 
-        // Physical pixel size for this frame.
-        let phys_w = ((available.x * dpi) as u32).max(1);
-        let phys_h = ((available.y * dpi) as u32).max(1);
-        let phys_size = PhysicalSize::new(phys_w, phys_h);
-
-        if phys_size != self.last_phys_size {
-            self.servo_view.resize(phys_size);
-            self.servo_view.set_hidpi_scale_factor(
-                Scale::<f32, DeviceIndependentPixel, DevicePixel>::new(dpi),
-            );
-            self.last_phys_size = phys_size;
-        }
-
-        // Paint Servo's current frame into the offscreen framebuffer.
-        self.servo_view.paint();
-
-        // Allocate the widget rect before drawing.
+        // Claim the rect first, then size the engine to exactly what we claimed.
+        // Deriving the size from `available_size()` while painting into
+        // `available_rect_before_wrap()` let the two disagree.
         let resp = ui.allocate_rect(
             ui.available_rect_before_wrap(),
             egui::Sense::click_and_drag(),
         );
         let widget_rect = resp.rect;
+
+        let (phys_w, phys_h) = Self::physical_size(widget_rect.size(), dpi);
+        let phys_size = PhysicalSize::new(phys_w, phys_h);
+
+        if phys_size != self.last_phys_size {
+            // Resize the view only. `WebView::resize` calls
+            // `resize_rendering_context` internally, and resizing the offscreen
+            // context ourselves first makes that a no-op (it early-outs on an
+            // unchanged size), leaving the page laid out at the old width.
+            self.servo_view.resize(phys_size);
+            self.servo_view.set_hidpi_scale_factor(
+                Scale::<f32, DeviceIndependentPixel, DevicePixel>::new(dpi),
+            );
+            log::debug!("resize {:?} -> {:?} (dpi {dpi})", self.last_phys_size, phys_size);
+            self.last_phys_size = phys_size;
+        }
+
+        // Paint Servo's current frame into the offscreen framebuffer, after any
+        // resize above so this frame targets the size we are about to read.
+        self.servo_view.paint();
 
         // ── Blit offscreen framebuffer → egui texture ─────────────────────────
         let read_rect = euclid::Box2D::<i32, DevicePixel>::new(
@@ -365,7 +370,7 @@ impl WebView {
         if let Some(pos) = interact_pos {
             // We only send clicks to servo if the mouse is over the webview
             if widget_rect.contains(pos) || resp.dragged() {
-                let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
+                let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
                 
                 if primary_down {
                     self.servo_view.focus();
@@ -392,7 +397,7 @@ impl WebView {
         if let Some(pos) = interact_pos {
             if widget_rect.contains(pos) || resp.dragged() || primary_up {
                 if self.last_mouse_pos != Some(pos) {
-                    let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
+                    let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
                     self.servo_view
                         .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
                     self.last_mouse_pos = Some(pos);
@@ -411,9 +416,9 @@ impl WebView {
                 .input(|i| i.pointer.hover_pos())
                 .unwrap_or(widget_rect.center());
             // Scroll even if pointer is slightly outside – common while using wheel
-            let center_pt = self.egui_to_servo_point(widget_rect.center(), widget_rect.min, dpi);
+            let center_pt = Self::egui_to_servo_point(widget_rect.center(), widget_rect.min, dpi);
             let scroll_pt = if widget_rect.contains(hover) {
-                self.egui_to_servo_point(hover, widget_rect.min, dpi)
+                Self::egui_to_servo_point(hover, widget_rect.min, dpi)
             } else {
                 center_pt
             };
@@ -435,7 +440,7 @@ impl WebView {
             // Line-height in device pixels for arrow key steps.
             let line_px = (24.0 * dpi) as f32;
             let page_px = (phys_h as f32) * 0.85;
-            let center = self.egui_to_servo_point(widget_rect.center(), widget_rect.min, dpi);
+            let center = Self::egui_to_servo_point(widget_rect.center(), widget_rect.min, dpi);
 
             let keys_pressed = ui.input(|i| i.keys_down.clone());
             for key in &keys_pressed {
@@ -497,14 +502,23 @@ impl WebView {
 
     // ─── Private helpers ──────────────────────────────────────────────────────
 
+    /// Widget size in logical points -> physical pixels, clamped to at least
+    /// 1x1 so a collapsed or zero-sized layout never asks for an empty surface.
+    fn physical_size(size: egui::Vec2, dpi: f32) -> (u32, u32) {
+        let to_px = |v: f32| {
+            let px = v * dpi;
+            if px.is_finite() && px >= 1.0 {
+                px.round() as u32
+            } else {
+                1
+            }
+        };
+        (to_px(size.x), to_px(size.y))
+    }
+
     /// Convert an egui logical-pixel position to a Servo device-pixel `WebViewPoint`,
     /// relative to the top-left corner of the webview widget.
-    fn egui_to_servo_point(
-        &self,
-        pos: egui::Pos2,
-        origin: egui::Pos2,
-        dpi: f32,
-    ) -> WebViewPoint {
+    fn egui_to_servo_point(pos: egui::Pos2, origin: egui::Pos2, dpi: f32) -> WebViewPoint {
         use euclid::Point2D;
         let x = (pos.x - origin.x) * dpi;
         let y = (pos.y - origin.y) * dpi;
@@ -665,4 +679,155 @@ fn egui_modifiers_to_keyboard_types(m: &egui::Modifiers) -> Modifiers {
     // Note: on Windows, command == ctrl, so we don't add META for command.
     // On Mac, command == mac_cmd, so we add META via mac_cmd.
     out
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+//
+// Only the pure helpers are covered here. Anything touching `Servo`,
+// `WebViewHost` or `WebView` construction needs a live GL context and a real
+// window, so it cannot run under `cargo test`; that path is exercised instead
+// by the esmail binary's ESMAIL_PREVIEW + ESMAIL_SCREENSHOT mode.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── physical_size ────────────────────────────────────────────────────────
+
+    #[test]
+    fn physical_size_scales_by_dpi_and_rounds() {
+        assert_eq!(WebView::physical_size(egui::vec2(100.0, 50.0), 1.0), (100, 50));
+        assert_eq!(WebView::physical_size(egui::vec2(100.0, 50.0), 2.0), (200, 100));
+        // 1264.0 * 1.25 == 1580.0 exactly; 100.4 * 1.25 == 125.5, which rounds to 126.
+        assert_eq!(WebView::physical_size(egui::vec2(1264.0, 100.4), 1.25), (1580, 126));
+    }
+
+    #[test]
+    fn physical_size_never_returns_zero() {
+        // A collapsed panel, a zero-height layout or a hidden tab must never ask
+        // Servo for an empty surface.
+        assert_eq!(WebView::physical_size(egui::vec2(0.0, 0.0), 1.0), (1, 1));
+        assert_eq!(WebView::physical_size(egui::vec2(0.4, 800.0), 1.0), (1, 800));
+        assert_eq!(WebView::physical_size(egui::vec2(-10.0, 10.0), 1.0), (1, 10));
+    }
+
+    #[test]
+    fn physical_size_rejects_non_finite() {
+        assert_eq!(WebView::physical_size(egui::vec2(f32::NAN, 10.0), 1.0), (1, 10));
+        assert_eq!(WebView::physical_size(egui::vec2(f32::INFINITY, 10.0), 1.0), (1, 10));
+        assert_eq!(WebView::physical_size(egui::vec2(10.0, 10.0), f32::NAN), (1, 1));
+    }
+
+    // ── source_to_url ────────────────────────────────────────────────────────
+
+    #[test]
+    fn url_source_passes_through() {
+        let url = WebView::source_to_url(&WebViewSource::Url("https://servo.org/a?b=c".into()));
+        assert_eq!(url.as_str(), "https://servo.org/a?b=c");
+    }
+
+    #[test]
+    fn unparseable_url_falls_back_to_blank_rather_than_panicking() {
+        let url = WebView::source_to_url(&WebViewSource::Url("not a url".into()));
+        assert_eq!(url.as_str(), "about:blank");
+    }
+
+    #[test]
+    fn html_source_round_trips_through_a_data_url() {
+        // Mail bodies are full of non-ASCII; it must survive the base64 hop.
+        let html = "<p>café € &amp; \"quotes\"</p>";
+        let url = WebView::source_to_url(&WebViewSource::Html(html.to_string()));
+
+        let encoded = url
+            .as_str()
+            .strip_prefix("data:text/html;charset=utf-8;base64,")
+            .expect("should be a base64 data URL");
+        let decoded = general_purpose::STANDARD
+            .decode(encoded)
+            .expect("should be valid base64");
+
+        assert_eq!(String::from_utf8(decoded).unwrap(), html);
+    }
+
+    #[test]
+    fn empty_html_is_still_a_valid_url() {
+        let url = WebView::source_to_url(&WebViewSource::Html(String::new()));
+        assert_eq!(url.as_str(), "data:text/html;charset=utf-8;base64,");
+    }
+
+    // ── coordinate transform ─────────────────────────────────────────────────
+
+    fn device_xy(p: WebViewPoint) -> (f32, f32) {
+        match p {
+            WebViewPoint::Device(p) => (p.x, p.y),
+            other => panic!("expected a device-space point, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn point_is_relative_to_the_widget_origin() {
+        // A click on the widget's top-left corner is (0, 0) to the page,
+        // wherever the widget happens to sit on screen.
+        let at_origin =
+            WebView::egui_to_servo_point(egui::pos2(300.0, 80.0), egui::pos2(300.0, 80.0), 1.0);
+        assert_eq!(device_xy(at_origin), (0.0, 0.0));
+
+        let inside =
+            WebView::egui_to_servo_point(egui::pos2(310.0, 100.0), egui::pos2(300.0, 80.0), 1.0);
+        assert_eq!(device_xy(inside), (10.0, 20.0));
+    }
+
+    #[test]
+    fn point_scales_by_dpi() {
+        let p = WebView::egui_to_servo_point(egui::pos2(110.0, 90.0), egui::pos2(100.0, 80.0), 2.0);
+        assert_eq!(device_xy(p), (20.0, 20.0));
+    }
+
+    // ── key and modifier mapping ─────────────────────────────────────────────
+
+    #[test]
+    fn named_keys_map_across() {
+        use keyboard_types::{Key, NamedKey};
+        assert_eq!(egui_key_to_keyboard_types(&egui::Key::Enter), Key::Named(NamedKey::Enter));
+        assert_eq!(egui_key_to_keyboard_types(&egui::Key::Escape), Key::Named(NamedKey::Escape));
+        assert_eq!(
+            egui_key_to_keyboard_types(&egui::Key::ArrowDown),
+            Key::Named(NamedKey::ArrowDown)
+        );
+    }
+
+    #[test]
+    fn unmapped_keys_are_unidentified_rather_than_a_panic() {
+        use keyboard_types::{Key, NamedKey};
+        assert_eq!(
+            egui_key_to_keyboard_types(&egui::Key::Insert),
+            Key::Named(NamedKey::Unidentified)
+        );
+    }
+
+    /// Documents a known defect rather than asserting desirable behaviour.
+    /// `egui::Key` carries no case information, so this mapping can only ever
+    /// produce lowercase and can never produce a shifted symbol — typing "A" or
+    /// "@" into a page is impossible. A5 replaces it with `egui::Event::Text`;
+    /// delete this test when that lands.
+    #[test]
+    fn letter_keys_are_lowercase_only_which_a5_must_fix() {
+        use keyboard_types::Key;
+        assert_eq!(egui_key_to_keyboard_types(&egui::Key::A), Key::Character("a".into()));
+    }
+
+    #[test]
+    fn modifiers_map_across() {
+        let none = egui_modifiers_to_keyboard_types(&egui::Modifiers::default());
+        assert!(none.is_empty());
+
+        let shift_ctrl = egui_modifiers_to_keyboard_types(&egui::Modifiers {
+            shift: true,
+            ctrl: true,
+            ..Default::default()
+        });
+        assert!(shift_ctrl.contains(Modifiers::SHIFT));
+        assert!(shift_ctrl.contains(Modifiers::CONTROL));
+        assert!(!shift_ctrl.contains(Modifiers::ALT));
+    }
 }
