@@ -23,6 +23,7 @@
 // taking their own dependency on these crates (and risking a version skew).
 pub use dpi;
 pub use url;
+pub use servo::{LoadStatus, WebResourceRequest, Image};
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -37,7 +38,8 @@ use url::Url;
 use servo::{
     DevicePixel, DeviceVector2D, InputEvent, OffscreenRenderingContext, RenderingContext,
     Scroll, Servo, ServoBuilder, WebViewBuilder, WebViewDelegate,
-    WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest,
+    WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest, WebResourceLoad,
+    WebResourceResponse,
 };
 // `servo::WebView` is the engine-side view. Ours (below) wraps it, so alias the
 // engine type to keep the two unambiguous at every use site.
@@ -59,26 +61,122 @@ use keyboard_types::{KeyState, Location, Modifiers};
 pub enum WebViewSource {
     /// Navigate to a remote (or local) URL, e.g. `"https://example.com"`.
     Url(String),
-    /// Render an in-memory HTML string.
+    /// Render an in-memory HTML string. Always base64-encoded into a
+    /// `data:` URL, so every relative link and resource in it is dead — use
+    /// [`WebViewSource::HtmlWithBase`] when the HTML has any.
     Html(String),
+    /// Render an in-memory HTML string with relative links and resources
+    /// resolved against `base` (e.g. a mail message's `Content-Location`, or
+    /// the sender's domain), via an injected `<base href>`.
+    HtmlWithBase {
+        /// The HTML to render.
+        html: String,
+        /// The base URL relative links/resources resolve against.
+        base: String,
+    },
 }
 
 /// Events emitted by [`WebView::show`].
 #[derive(Debug, Clone)]
 pub enum WebViewEvent {
-    /// The user triggered a navigation to a new URL (link click, etc.).
+    /// The user triggered a navigation to a new URL (link click, etc.) and the
+    /// [`WebViewHandler`] denied it. The host typically opens this externally.
     LinkClicked(String),
+    /// `WebViewDelegate::notify_url_changed`.
+    UrlChanged(String),
+    /// `WebViewDelegate::notify_page_title_changed`.
+    TitleChanged(Option<String>),
+    /// `WebViewDelegate::notify_status_text_changed`.
+    StatusTextChanged(Option<String>),
+    /// `WebViewDelegate::notify_load_status_changed`.
+    LoadStatusChanged(LoadStatus),
+    /// `WebViewDelegate::notify_favicon_changed`. Carries no payload upstream;
+    /// re-read the favicon via [`WebView::favicon`].
+    FaviconChanged,
+    /// `WebViewDelegate::notify_history_changed`.
+    HistoryChanged {
+        /// The full back/forward list, oldest first.
+        entries: Vec<String>,
+        /// Index of the current entry within `entries`.
+        current: usize,
+    },
+    /// `WebViewDelegate::notify_traversal_complete` — a `go_back`/`go_forward`
+    /// finished.
+    TraversalComplete,
 }
+
+/// Decision returned by [`WebViewHandler::navigation`] for a navigation past
+/// the view's initial load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationPolicy {
+    /// Let the navigation proceed in this view.
+    Allow,
+    /// Block it. The view stays where it is; a [`WebViewEvent::LinkClicked`]
+    /// is queued so the host can act on it (open externally, etc.).
+    Deny,
+}
+
+/// A response to serve in place of a real network fetch, returned from
+/// [`WebViewHandler::intercept`].
+pub struct InterceptedResponse {
+    /// HTTP status code, e.g. `200`.
+    pub status_code: u16,
+    /// The response body.
+    pub body: Vec<u8>,
+}
+
+impl InterceptedResponse {
+    /// A `200 OK` response with `body`.
+    pub fn ok(body: Vec<u8>) -> Self {
+        Self { status_code: 200, body }
+    }
+}
+
+/// Host-supplied policy for navigation and resource loading in a [`WebView`].
+///
+/// Both Servo hooks behind this trait **fail open**: an unhandled
+/// [`NavigationRequest`] allows the navigation, and an unhandled
+/// [`WebResourceLoad`] lets the resource load unmodified. The default
+/// [`WebViewHandler::navigation`] below denies rather than relying on that, but
+/// [`WebViewHandler::intercept`]'s default of `None` is the same "let it
+/// through" behaviour Servo would apply anyway — that one is a real default,
+/// not a footgun, since choosing not to intercept a resource is a legitimate,
+/// common answer.
+pub trait WebViewHandler {
+    /// Called for every navigation after the view's initial load (which is
+    /// always allowed — otherwise the view could never load anything).
+    /// Defaults to [`NavigationPolicy::Deny`], matching this crate's
+    /// pre-A3 behaviour of reporting every subsequent navigation as a
+    /// [`WebViewEvent::LinkClicked`] rather than navigating the view itself.
+    fn navigation(&mut self, url: &Url) -> NavigationPolicy {
+        let _ = url;
+        NavigationPolicy::Deny
+    }
+
+    /// Called for every resource load the view makes. Returning `Some` serves
+    /// that response instead of the network; `None` (the default) lets the
+    /// load continue normally.
+    fn intercept(&mut self, request: &WebResourceRequest) -> Option<InterceptedResponse> {
+        let _ = request;
+        None
+    }
+}
+
+/// The [`WebViewHandler`] used when a [`WebViewConfig`] does not supply one:
+/// both methods run their documented defaults.
+struct DefaultHandler;
+impl WebViewHandler for DefaultHandler {}
 
 // ─── Internal delegate ───────────────────────────────────────────────────────
 
 struct Delegate {
     egui_ctx: egui::Context,
-    /// Events queued during `request_navigation`; drained by `show()` each frame.
+    /// Events queued during delegate callbacks; drained by `show()` each frame.
     events: Rc<RefCell<Vec<WebViewEvent>>>,
     /// Track whether the very first load has been dispatched so we can
     /// distinguish the initial navigation from user-initiated link clicks.
     initial_load_done: Rc<RefCell<bool>>,
+    handler: Rc<RefCell<dyn WebViewHandler>>,
 }
 
 impl WebViewDelegate for Delegate {
@@ -89,23 +187,76 @@ impl WebViewDelegate for Delegate {
     fn request_navigation(&self, _webview: ServoWebView, request: NavigationRequest) {
         let mut done = self.initial_load_done.borrow_mut();
         if *done {
-            // User navigated away – report it and let the host decide.
-            //
-            // `deny()` is required, not optional: servo's `NavigationRequest`
-            // fails OPEN. Its `Drop` impl sends "allow", so simply dropping the
-            // request here let the navigation proceed *and* emitted a
-            // LinkClicked event, so a link opened in the webview and in the
-            // system browser at once. A3 replaces this with a host-supplied
-            // policy; until then, deny and surface the event.
-            self.events
-                .borrow_mut()
-                .push(WebViewEvent::LinkClicked(request.url.to_string()));
-            request.deny();
+            // `deny()` is required, not optional, when the policy says so:
+            // servo's `NavigationRequest` fails OPEN. Its `Drop` impl sends
+            // "allow", so simply dropping the request here would let the
+            // navigation proceed *and* emit a LinkClicked event, so a link
+            // would open in the webview and in the system browser at once.
+            // This already shipped as a bug once; see the A2 commit.
+            match self.handler.borrow_mut().navigation(&request.url) {
+                NavigationPolicy::Allow => request.allow(),
+                NavigationPolicy::Deny => {
+                    self.events
+                        .borrow_mut()
+                        .push(WebViewEvent::LinkClicked(request.url.to_string()));
+                    request.deny();
+                }
+            }
         } else {
             *done = true;
-            // Allow initial navigation
+            // The initial load is always allowed; there would otherwise be no
+            // way to get anything on screen at all.
             request.allow();
         }
+    }
+
+    fn load_web_resource(&self, _webview: ServoWebView, load: WebResourceLoad) {
+        let response = self.handler.borrow_mut().intercept(load.request());
+        if let Some(intercepted) = response {
+            let servo_response = WebResourceResponse::new(load.request().url.clone())
+                .status_code(
+                    http::StatusCode::from_u16(intercepted.status_code)
+                        .unwrap_or(http::StatusCode::OK),
+                );
+            let mut in_flight = load.intercept(servo_response);
+            in_flight.send_body_data(intercepted.body);
+            in_flight.finish();
+        }
+        // else: dropping `load` here sends `DoNotIntercept`, which is exactly
+        // "let this load through unmodified" — the correct outcome when the
+        // handler chose not to intercept, not a footgun like the navigation
+        // fail-open above.
+    }
+
+    fn notify_url_changed(&self, _webview: ServoWebView, url: Url) {
+        self.events.borrow_mut().push(WebViewEvent::UrlChanged(url.to_string()));
+    }
+
+    fn notify_page_title_changed(&self, _webview: ServoWebView, title: Option<String>) {
+        self.events.borrow_mut().push(WebViewEvent::TitleChanged(title));
+    }
+
+    fn notify_status_text_changed(&self, _webview: ServoWebView, status: Option<String>) {
+        self.events.borrow_mut().push(WebViewEvent::StatusTextChanged(status));
+    }
+
+    fn notify_load_status_changed(&self, _webview: ServoWebView, status: LoadStatus) {
+        self.events.borrow_mut().push(WebViewEvent::LoadStatusChanged(status));
+    }
+
+    fn notify_favicon_changed(&self, _webview: ServoWebView) {
+        self.events.borrow_mut().push(WebViewEvent::FaviconChanged);
+    }
+
+    fn notify_history_changed(&self, _webview: ServoWebView, entries: Vec<Url>, current: usize) {
+        self.events.borrow_mut().push(WebViewEvent::HistoryChanged {
+            entries: entries.into_iter().map(|u| u.to_string()).collect(),
+            current,
+        });
+    }
+
+    fn notify_traversal_complete(&self, _webview: ServoWebView, _id: servo::TraversalId) {
+        self.events.borrow_mut().push(WebViewEvent::TraversalComplete);
     }
 }
 
@@ -200,11 +351,16 @@ impl WebViewHost {
 
         let events: Rc<RefCell<Vec<WebViewEvent>>> = Rc::new(RefCell::new(Vec::new()));
         let initial_load_done: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let handler = config
+            .handler
+            .clone()
+            .unwrap_or_else(|| Rc::new(RefCell::new(DefaultHandler)));
 
         let delegate = Rc::new(Delegate {
             egui_ctx: egui_ctx.clone(),
             events: events.clone(),
             initial_load_done,
+            handler,
         });
 
         let servo_view = WebViewBuilder::new(
@@ -242,15 +398,29 @@ pub struct WebViewConfig {
     pub source: WebViewSource,
     /// Initial size in physical pixels. Corrected on the first [`WebView::show`].
     pub size: PhysicalSize<u32>,
+    /// Navigation and resource-load policy for this view. `None` uses
+    /// [`DefaultHandler`]'s behaviour: allow the initial load, deny every
+    /// later navigation (reporting it as [`WebViewEvent::LinkClicked`]), and
+    /// never intercept resources.
+    pub handler: Option<Rc<RefCell<dyn WebViewHandler>>>,
 }
 
 impl WebViewConfig {
-    /// A config that loads `source` at a default size.
+    /// A config that loads `source` at a default size, with the default
+    /// navigation/interception policy.
     pub fn new(source: WebViewSource) -> Self {
         Self {
             source,
             size: PhysicalSize::new(1024, 768),
+            handler: None,
         }
+    }
+
+    /// Use `handler` for this view's navigation and resource-interception
+    /// decisions instead of the default policy.
+    pub fn with_handler(mut self, handler: Rc<RefCell<dyn WebViewHandler>>) -> Self {
+        self.handler = Some(handler);
+        self
     }
 }
 
@@ -276,6 +446,61 @@ impl WebView {
     /// Navigate to a new source programmatically.
     pub fn load(&self, source: WebViewSource) {
         self.servo_view.load(Self::source_to_url(&source));
+    }
+
+    /// Reload the current page.
+    ///
+    /// There is no `stop()`: `servo::WebView` 0.1.0 has no way to cancel an
+    /// in-flight load once it has started. The only control points are up
+    /// front, via [`WebView::load`] and resource interception
+    /// ([`WebViewHandler::intercept`]).
+    pub fn reload(&self) {
+        self.servo_view.reload();
+    }
+
+    /// Whether [`WebView::go_back`] would do anything.
+    pub fn can_go_back(&self) -> bool {
+        self.servo_view.can_go_back()
+    }
+
+    /// Step back `amount` entries in the joint session history.
+    pub fn go_back(&self, amount: usize) {
+        self.servo_view.go_back(amount);
+    }
+
+    /// Whether [`WebView::go_forward`] would do anything.
+    pub fn can_go_forward(&self) -> bool {
+        self.servo_view.can_go_forward()
+    }
+
+    /// Step forward `amount` entries in the joint session history.
+    pub fn go_forward(&self, amount: usize) {
+        self.servo_view.go_forward(amount);
+    }
+
+    /// The view's current URL, if it has navigated anywhere yet.
+    pub fn url(&self) -> Option<Url> {
+        self.servo_view.url()
+    }
+
+    /// The current page's title, if the page has set one.
+    pub fn page_title(&self) -> Option<String> {
+        self.servo_view.page_title()
+    }
+
+    /// The current status text (e.g. a hovered link's target), if any.
+    pub fn status_text(&self) -> Option<String> {
+        self.servo_view.status_text()
+    }
+
+    /// The current page's favicon, if it has one and it has finished loading.
+    pub fn favicon(&self) -> Option<Image> {
+        self.servo_view.favicon().map(|image| image.clone())
+    }
+
+    /// Where the view currently is in its own load lifecycle.
+    pub fn load_status(&self) -> LoadStatus {
+        self.servo_view.load_status()
     }
 
     /// Draw the view into `ui` and return any queued [`WebViewEvent`]s.
@@ -526,18 +751,32 @@ impl WebView {
     }
 
     /// Convert a [`WebViewSource`] into a [`Url`] Servo can load.
-    /// `Html` is base64-encoded into a `data:` URL so no server is needed.
+    /// `Html`/`HtmlWithBase` are base64-encoded into a `data:` URL so no
+    /// server is needed.
     fn source_to_url(source: &WebViewSource) -> Url {
         match source {
             WebViewSource::Url(u) => Url::parse(u).unwrap_or_else(|_| {
                 Url::parse("about:blank").expect("about:blank is always valid")
             }),
-            WebViewSource::Html(html) => {
-                let b64 = general_purpose::STANDARD.encode(html.as_bytes());
-                let s = format!("data:text/html;charset=utf-8;base64,{}", b64);
-                Url::parse(&s).expect("data URL is always valid")
+            WebViewSource::Html(html) => Self::html_to_data_url(html),
+            WebViewSource::HtmlWithBase { html, base } => {
+                // A `data:` URL's own address is its effective base, so a
+                // relative `href`/`src` in the HTML resolves against
+                // "data:...", which is never what the caller wants. Servo has
+                // no separate "load this data with that base" entry point, so
+                // give the document an explicit base the same way any HTML
+                // author would.
+                let escaped_base = base.replace('&', "&amp;").replace('"', "&quot;");
+                let with_base = format!("<base href=\"{escaped_base}\">{html}");
+                Self::html_to_data_url(&with_base)
             }
         }
+    }
+
+    fn html_to_data_url(html: &str) -> Url {
+        let b64 = general_purpose::STANDARD.encode(html.as_bytes());
+        let s = format!("data:text/html;charset=utf-8;base64,{}", b64);
+        Url::parse(&s).expect("data URL is always valid")
     }
 }
 
@@ -753,6 +992,62 @@ mod tests {
     fn empty_html_is_still_a_valid_url() {
         let url = WebView::source_to_url(&WebViewSource::Html(String::new()));
         assert_eq!(url.as_str(), "data:text/html;charset=utf-8;base64,");
+    }
+
+    #[test]
+    fn html_with_base_injects_a_base_tag_so_relative_links_resolve() {
+        // A `data:` URL's own address is its base, so a plain `Html` source
+        // can never resolve a relative link/resource. `HtmlWithBase` fixes
+        // that by giving the document an explicit `<base href>`.
+        let url = WebView::source_to_url(&WebViewSource::HtmlWithBase {
+            html: "<p><a href=\"reply\">reply</a></p>".to_string(),
+            base: "https://mail.example.com/inbox/42/".to_string(),
+        });
+
+        let encoded = url
+            .as_str()
+            .strip_prefix("data:text/html;charset=utf-8;base64,")
+            .expect("should be a base64 data URL");
+        let decoded = general_purpose::STANDARD.decode(encoded).unwrap();
+        let html = String::from_utf8(decoded).unwrap();
+
+        assert_eq!(
+            html,
+            "<base href=\"https://mail.example.com/inbox/42/\"><p><a href=\"reply\">reply</a></p>"
+        );
+    }
+
+    #[test]
+    fn html_with_base_escapes_quotes_and_ampersands_in_the_base() {
+        // The base is spliced into an HTML attribute; an unescaped `"` in it
+        // would let the base URL close the attribute early and inject markup.
+        let url = WebView::source_to_url(&WebViewSource::HtmlWithBase {
+            html: "<p>hi</p>".to_string(),
+            base: "https://example.com/\"><script>evil()</script>&x=1".to_string(),
+        });
+
+        let encoded = url
+            .as_str()
+            .strip_prefix("data:text/html;charset=utf-8;base64,")
+            .unwrap();
+        let html = String::from_utf8(general_purpose::STANDARD.decode(encoded).unwrap()).unwrap();
+
+        // The base's own `"` and `&` must come through as entities, so the
+        // whole thing stays inert text inside the attribute value rather than
+        // closing it early and turning `<script>` into a real element.
+        assert_eq!(
+            html,
+            "<base href=\"https://example.com/&quot;><script>evil()</script>&amp;x=1\"><p>hi</p>"
+        );
+    }
+
+    // ── navigation & interception policy ─────────────────────────────────────
+
+    #[test]
+    fn default_handler_denies_navigation_and_never_intercepts() {
+        let mut handler = DefaultHandler;
+        let url = Url::parse("https://example.com/clicked").unwrap();
+        assert_eq!(handler.navigation(&url), NavigationPolicy::Deny);
     }
 
     // ── coordinate transform ─────────────────────────────────────────────────

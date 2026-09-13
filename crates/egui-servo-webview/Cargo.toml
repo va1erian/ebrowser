@@ -15,6 +15,7 @@ keyboard-types.workspace = true
 url.workspace = true
 log.workspace = true
 base64.workspace = true
+http.workspace = true
 
 # Optional: convenience constructor that takes an eframe CreationContext.
 eframe = { workspace = true, optional = true }

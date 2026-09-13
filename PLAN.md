@@ -10,7 +10,7 @@ rendered safely, so A3 must land before B5.
 
 ---
 
-> **Status: phases 0 and 1 are done.** See [HANDOFF.md](HANDOFF.md) for how to
+> **Status: phases 0-2 are done.** See [HANDOFF.md](HANDOFF.md) for how to
 > pick this up, including the landmines that cost real time. Sections marked
 > **DONE** below are kept for the reasoning, not as work remaining.
 
@@ -214,7 +214,7 @@ Split into two types:
 `host.spin()` runs once per frame; `view.show(ui)` no longer drives the engine
 loop, so N views cost one event-loop spin per frame.
 
-### A3. Real delegate surface *(prerequisite for B5)* — **NEXT**
+### A3. Real delegate surface *(prerequisite for B5)* — **DONE**
 Replace the one-shot boolean with a host-supplied policy:
 
 ```rust
@@ -262,7 +262,7 @@ Emit a proper event enum. Every one of these is backed by a real hook —
 `notify_load_status_changed`, `notify_favicon_changed` (no payload; re-read via
 `WebView::favicon()`), `notify_history_changed`, `notify_traversal_complete`.
 
-### A4. Navigation API
+### A4. Navigation API — **DONE**
 All confirmed present on `servo::WebView`: `load`, `reload`, `can_go_back`,
 `go_back(amount)`, `can_go_forward`, `go_forward(amount)` (the `can_*` are cheap
 index checks on the in-memory back/forward list), plus getters for `url()`,
@@ -480,8 +480,8 @@ and Outlook therefore need app passwords.
 |---|---|---|
 | ~~**0**~~ | ~~Manifest fix; clear 4 deprecations; commit `db.rs`~~ **DONE** | everything |
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
-| **2** | **A3, A4 — start here** | B5 |
-| 3 | B1, B2 | B3, B7 |
+| ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
+| **3** | **B1, B2 — start here** | B3, B7 |
 | 4 | B3, B4 | B8 |
 | 5 | B5, B6 | — |
 | 6 | B7 | — |

@@ -4,8 +4,8 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is A3, then A4** ([PLAN.md](PLAN.md) §A3, §A4). Everything in
-phases 0 and 1 is done and committed.
+**Your next task is B1, then B2** ([PLAN.md](PLAN.md) §B1, §B2). Everything in
+phases 0-2 is done and committed.
 
 ---
 
@@ -145,6 +145,25 @@ when no view is ever drawn. Both were investigated and are not embedder bugs.
 `init_logging()` in `main.rs` filters them; `RUST_LOG` overrides it. Do not go
 hunting for them again.
 
+### 3.9 The exe needs `libEGL.dll` / `libGLESv2.dll` next to it, not just built
+
+`ESMAIL_PREVIEW` screenshotting panics with `egl function was not loaded` at
+`surfman`'s `egl_bindings.rs` unless `libEGL.dll` and `libGLESv2.dll` are next
+to `esmail.exe` (or on `PATH`). Cargo does not copy them there. They exist
+untracked at the *repo* root (`C:\Users\hadri\Documents\repos\ebrowser`, one
+level above `src`) — copy them into `target/debug` (or `target/release`)
+before running the binary in a fresh worktree:
+
+```bash
+cp "$(git rev-parse --show-toplevel)/../libEGL.dll" \
+   "$(git rev-parse --show-toplevel)/../libGLESv2.dll" ./target/debug/
+```
+
+This is the same untracked-DLL situation noted in [PLAN.md](PLAN.md)'s Risks
+section; that section still owns the packaging decision (gitignore vs. commit
+vs. fetch-at-build-time). This entry just saves you from re-diagnosing the
+panic.
+
 ---
 
 ## 4. Servo API facts, already researched — do not re-derive
@@ -214,8 +233,10 @@ the `glow` renderer. That is §A6.
 | `a8cd40c` | Screenshot dumps; A5/A6 rewritten from servoshell research |
 | `5825a0c` | Preview mode |
 | `9143154` | Size derived from the painted rect; 13 unit tests; log filtering |
+| `237fc42` | Mark phases 0-1 done in the plan; add HANDOFF.md |
+| *(this branch)* | **A3, A4** — `NavigationPolicy` / `WebViewHandler` (real resource interception via `load_web_resource`; every `notify_*` hook now emits a `WebViewEvent`), full navigation API (`reload`, `go_back`/`go_forward`, `url`/`page_title`/`status_text`/`favicon`/`load_status`), `WebViewSource::HtmlWithBase` for relative links |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` 13 passing, app
+State: `cargo check --workspace` clean, `cargo test --workspace` 16 passing, app
 builds, runs, screenshots and exits cleanly.
 
 ---

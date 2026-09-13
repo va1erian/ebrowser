@@ -1678,6 +1678,7 @@ dependencies = [
  "eframe",
  "egui",
  "euclid",
+ "http 1.4.0",
  "keyboard-types",
  "log",
  "raw-window-handle",

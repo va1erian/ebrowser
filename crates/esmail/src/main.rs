@@ -207,8 +207,9 @@ impl eframe::App for EsMailApp {
         if self.preview {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 for event in self.web_view.show(ui) {
-                    let egui_servo_webview::WebViewEvent::LinkClicked(url) = event;
-                    log::info!("preview: link clicked -> {url}");
+                    if let egui_servo_webview::WebViewEvent::LinkClicked(url) = event {
+                        log::info!("preview: link clicked -> {url}");
+                    }
                 }
             });
             return;
@@ -399,8 +400,9 @@ impl eframe::App for EsMailApp {
                 
                 let events = self.web_view.show(ui);
                 for event in events {
-                    let egui_servo_webview::WebViewEvent::LinkClicked(url) = event;
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    if let egui_servo_webview::WebViewEvent::LinkClicked(url) = event {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    }
                 }
             });
         }
