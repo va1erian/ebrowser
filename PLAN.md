@@ -432,7 +432,7 @@ full reconnect instead of just an error message, which is wasteful but never
 leaves the actor stuck. Worth revisiting once real error variants are threaded
 through instead of `anyhow::Error`.
 
-### B3. Local cache — finish and harden `db.rs`
+### B3. Local cache — finish and harden `db.rs` — **PARTIALLY DONE**
 The WIP `DbActor` is the right idea; give it the schema the rest of the plan
 needs: `accounts`, `mailboxes` (with `uidvalidity` / `uidnext` /
 `highestmodseq`), `messages` (envelope + flags + size + thread key), `bodies`
@@ -443,7 +443,39 @@ replaces the current position-range paging ([src/imap.rs:191](src/imap.rs:191))
 with stable UID-based paging. It is also what makes the list render instantly and
 makes offline reading possible.
 
-### B4. Search
+**What landed:** the real schema — `mailboxes` (`uid_validity`/`uid_next`/
+`highest_modseq`), `messages` (envelope + size + a `flags`/`thread_key` column,
+both unpopulated until B7/B8 need them), `bodies`, all keyed by
+`(account_id, mailbox, uid)` — plus an LRU cap on `bodies` (2000 rows,
+oldest `cached_at` evicted first) and `messages_fts`, a proper FTS5 mirror
+kept in sync on every write instead of being the only table. `imap.rs`'s
+`fetch_headers` already calls `session.examine()`, which parses
+`UIDVALIDITY`/`UIDNEXT` off the server's own untagged response — that ride
+along for free as `MailboxState`, and `db.rs`'s `sync_decision` (pure, unit
+tested) turns "previous state, what the server just said" into
+`UpToDate`/`FetchFrom`/`Resync`, wiping the cache on a `Resync` before the
+caller can re-populate it.
+
+**Also fixed in passing:** the local search's mailbox filter used to build
+its `WHERE` clause with `format!("mailbox = '{}'", mb)` — an IMAP mailbox
+name spliced straight into SQL, reachable from the server. It's a bound
+parameter now (regression test:
+`db::tests::search_mailbox_filter_does_not_allow_sql_injection`). Also:
+`mails.db` was accidentally committed (an empty schema, no real data in it —
+checked) as a stray runtime artifact; it's untracked and gitignored now.
+
+**What did not land:** nothing yet *acts* on a `FetchFrom`/`Resync` decision.
+`DbEvent::SyncPlan` is computed and logged, but no incremental UID fetch is
+issued in response — `BulkDownload` is still the only way to pull more than
+the current page, and still pulls the whole mailbox unconditionally every
+time. Turning a `SyncPlan` into an actual `UID FETCH` request, and switching
+header paging from sequence-number ranges to UID-based ranges served from the
+local cache (so the list renders instantly and works offline), is real
+follow-on work — the DB-side half above is what it needs to build on, but
+doing the IMAP-side half blind (no live server here to verify it against)
+felt like the wrong tradeoff, same reasoning as B2's deferred session split.
+
+### B4. Search — **PARTIALLY DONE**
 Two paths behind one search box:
 
 - **Server-side:** `ImapCommand::Search { mailbox, query }` issuing
@@ -456,6 +488,26 @@ Parse a small grammar — bare text → `OR SUBJECT x FROM x`, plus `from:`, `to
 `subject:`, `body:`, `since:`, `before:`, `is:unread`, `has:attachment` — into
 IMAP search keys and the equivalent SQL. UI: search box above the message list
 with result count and a clear button.
+
+**What landed:** the grammar, in `search_query.rs` — `ParsedQuery::parse`
+handles all of `from:`/`to:`/`subject:`/`body:`/`since:`/`before:`/
+`is:unread`/`has:attachment` plus bare text and quoted phrases (with `""` as
+an escaped literal quote, the usual SQL/FTS5 convention), fully unit tested.
+`ParsedQuery::to_fts_match` turns the fielded and bare-text parts into an
+FTS5 `MATCH` expression against `messages_fts` — bare text becomes
+`(subject:x OR from_addr:x OR body:x)` per the plan's wording above, fielded
+terms target only their own column, joined with `AND`.
+
+**What did not land:** `since:`/`before:`/`is:unread`/`has:attachment` parse
+correctly but are not applied to the query — `messages.date` is still a raw
+IMAP envelope date string, not a comparable timestamp, and `messages.flags`
+carries nothing yet (that's B8). A query made only of those (e.g.
+`is:unread`) is currently equivalent to an empty query. The **server-side**
+`UID SEARCH`/`ESEARCH` path is not wired at all: turning a `ParsedQuery` into
+IMAP search keys is mechanical, but issuing it is live-network code with
+nothing here to verify it against, so — again, matching B2 and B3's
+reasoning — it waited rather than landing unverified. A result count next to
+the (already-existing) Clear button is also still missing from the UI.
 
 ### B5. HTML rendering, safely *(depends on A3)*
 The pipeline becomes: parse with `mailparse` → pick the best `text/html`
@@ -526,8 +578,8 @@ and Outlook therefore need app passwords.
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
-| **4** | **B3, B4 — start here** | B8 |
-| 5 | B5, B6 | — |
+| 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
+| **5** | **B5, B6 — start here** | — |
 | 6 | B7 | — |
 | 7 | A5, A6, A7, B8, B9 | — |
 

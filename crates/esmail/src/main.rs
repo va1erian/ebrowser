@@ -3,11 +3,13 @@ mod db;
 mod screenshot;
 mod config;
 mod secrets;
+mod search_query;
 
 use egui_servo_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use config::{AccountConfig, Config};
+use search_query::ParsedQuery;
 use egui_servo_webview::dpi::PhysicalSize;
 use secrecy::SecretString;
 use tokio::sync::mpsc;
@@ -189,7 +191,7 @@ impl EsMailApp {
                 ImapEvent::Mailboxes(mbs) => {
                     self.mailboxes = mbs;
                 }
-                ImapEvent::Headers { mailbox, headers, page, total_pages, req_id } => {
+                ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, mailbox_state } => {
                     // Only the most recently issued FetchHeaders' reply is
                     // applied; an older one arriving late (e.g. the mailbox
                     // was changed again before it came back) is dropped.
@@ -199,6 +201,16 @@ impl EsMailApp {
                         self.total_pages = total_pages;
                         self.status = format!("Page {} of {}", page, total_pages);
                     }
+                    // Rides along on every header fetch regardless of
+                    // req_id/mailbox staleness — db.rs's cache bookkeeping for
+                    // `mailbox` should stay current even if this particular
+                    // reply is no longer the one the UI is showing.
+                    let _ = self.db_tx.try_send(DbCommand::ReportMailboxState {
+                        account_id: self.account_id(),
+                        mailbox,
+                        uid_validity: mailbox_state.uid_validity,
+                        uid_next: mailbox_state.uid_next,
+                    });
                 }
                 ImapEvent::Body { uid, html, req_id } => {
                     if req_id == self.current_body_req
@@ -216,7 +228,12 @@ impl EsMailApp {
                     }
                 }
                 ImapEvent::MailData { mailbox, header, body } => {
-                    let _ = self.db_tx.try_send(DbCommand::IndexMail { mailbox, header, body });
+                    let _ = self.db_tx.try_send(DbCommand::IndexMail {
+                        account_id: self.account_id(),
+                        mailbox,
+                        header,
+                        body,
+                    });
                 }
             }
         }
@@ -233,11 +250,29 @@ impl EsMailApp {
                         self.web_view.load(WebViewSource::Html(body));
                     }
                 }
+                DbEvent::SyncPlan { account_id, mailbox, plan } => {
+                    // Not yet acted on — no incremental fetch is issued in
+                    // response to `FetchFrom`/`Resync` today, so BulkDownload
+                    // remains the only way to pull more than the current
+                    // page. Logged (not surfaced in the UI) so the decision
+                    // is at least visible while nothing consumes it yet.
+                    // See PLAN.md §B3.
+                    log::debug!("sync plan for {account_id}/{mailbox}: {plan:?}");
+                }
                 DbEvent::Error(e) => {
                     self.status = format!("DB Error: {}", e);
                 }
             }
         }
+    }
+
+    /// Identifies the connected account to `db.rs`, in the same
+    /// `username@host` shape [`AccountConfig::new`] uses for its `id` — so
+    /// the cache keys line up with the saved-accounts list even though this
+    /// is derived from the live login form rather than looked up from
+    /// `self.config`.
+    fn account_id(&self) -> String {
+        format!("{}@{}", self.username, self.host)
     }
 
     /// A fresh request id for `FetchHeaders`/`FetchBody`, mechanically
@@ -343,13 +378,22 @@ impl eframe::App for EsMailApp {
                     ui.label("Search:");
                     let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Enter keywords..."));
                     if search_resp.changed() || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        if self.search_query.is_empty() {
-                            self.search_results = None;
-                        } else {
-                            let _ = self.db_tx.try_send(DbCommand::Search { 
-                                query: self.search_query.clone(), 
-                                mailbox: Some(self.selected_mailbox.clone()) 
-                            });
+                        // `from:`/`to:`/`subject:`/`body:` and bare text all
+                        // become an FTS5 MATCH expression; `since:`/`before:`/
+                        // `is:unread`/`has:attachment` parse but aren't
+                        // applied yet (see search_query.rs) — a query made
+                        // only of those is treated the same as an empty one.
+                        match ParsedQuery::parse(&self.search_query).to_fts_match() {
+                            Some(fts_query) => {
+                                let _ = self.db_tx.try_send(DbCommand::Search {
+                                    account_id: self.account_id(),
+                                    query: fts_query,
+                                    mailbox: Some(self.selected_mailbox.clone()),
+                                });
+                            }
+                            None => {
+                                self.search_results = None;
+                            }
                         }
                     }
                     if ui.button("Clear").clicked() {
@@ -487,6 +531,7 @@ impl eframe::App for EsMailApp {
                         if let Some(uid) = clicked_uid {
                             if is_search {
                                 let _ = self.db_tx.try_send(DbCommand::FetchMail {
+                                    account_id: self.account_id(),
                                     mailbox: self.selected_mailbox.clone(),
                                     uid,
                                 });

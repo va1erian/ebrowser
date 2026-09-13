@@ -28,3 +28,8 @@ target
 # Screenshot dumps from ESMAIL_SCREENSHOT / F12
 esmail-screenshot-*.png
 shot-*.png
+shot_*.png
+
+# esmail's local SQLite cache (db.rs) — a runtime artifact, not source; was
+# accidentally committed as an empty schema, see the B3 commit that untracked it.
+mails.db

@@ -35,6 +35,16 @@ pub struct MailHeader {
     pub date: String,
 }
 
+/// UIDVALIDITY/UIDNEXT as of the most recent `EXAMINE`/`SELECT`, read off
+/// values `async_imap` already parses from the server's untagged response —
+/// getting this costs nothing beyond what `fetch_headers`/`fetch_body`
+/// already do. Feeds `db.rs`'s incremental-sync bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxState {
+    pub uid_validity: u32,
+    pub uid_next: u32,
+}
+
 pub enum ImapCommand {
     Connect {
         host: String,
@@ -62,7 +72,7 @@ pub enum ImapEvent {
     Disconnected,
     Error(String),
     Mailboxes(Vec<String>),
-    Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64 },
+    Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64, mailbox_state: MailboxState },
     Body { uid: u32, html: String, req_id: u64 },
     DownloadProgress { current: u32, total: u32 },
     MailData { mailbox: String, header: MailHeader, body: String },
@@ -134,8 +144,8 @@ impl ImapActor {
                     }
                     let session = self.session.as_mut().expect("ensure_connected just verified this");
                     match Self::fetch_headers(session, &mailbox, page).await {
-                        Ok((headers, total_pages)) => {
-                            let _ = self.event_tx.send(ImapEvent::Headers { mailbox, headers, page, total_pages, req_id }).await;
+                        Ok((headers, total_pages, mailbox_state)) => {
+                            let _ = self.event_tx.send(ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, mailbox_state }).await;
                         }
                         Err(e) => {
                             self.session = None;
@@ -254,21 +264,29 @@ impl ImapActor {
         }
     }
 
-    async fn fetch_headers(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32)> {
+    async fn fetch_headers(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32, MailboxState)> {
         let mailbox = session.examine(mailbox_name).await?;
-        
+        // `examine` already gets these off the server's untagged response —
+        // no extra round trip. `db.rs`'s incremental-sync bookkeeping
+        // (`DbCommand::ReportMailboxState`) rides along on every header
+        // fetch for free.
+        let mailbox_state = MailboxState {
+            uid_validity: mailbox.uid_validity.unwrap_or(0),
+            uid_next: mailbox.uid_next.unwrap_or(0),
+        };
+
         let total = mailbox.exists;
         if total == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, mailbox_state));
         }
-        
+
         let per_page = 50;
         let total_pages = (total + per_page - 1) / per_page;
         let page = page.min(total_pages).max(1);
-        
+
         let end = total.saturating_sub((page - 1) * per_page);
         let start = end.saturating_sub(per_page - 1).max(1);
-        
+
         let query = format!("{}:{}", start, end);
         let fetches = session.fetch(query, "(UID ENVELOPE)").await?;
         let messages = fetches.collect::<Vec<_>>().await;
@@ -301,7 +319,7 @@ impl ImapActor {
         }
         
         headers.reverse(); // Newest first
-        Ok((headers, total_pages))
+        Ok((headers, total_pages, mailbox_state))
     }
 
     async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<String> {

@@ -4,11 +4,11 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is B3, then B4** ([PLAN.md](PLAN.md) §B3, §B4). Phases 0-2 are
-done. B1 is done. B2 is only partially done — request ids, `Disconnected`, and
-auto-reconnect landed, but the control/worker session split and IDLE did not
-(see PLAN.md §B2 for exactly why and what's left); pick that up whenever there
-is a way to test it against a real or mock IMAP server.
+**Your next task is B5, then B6** ([PLAN.md](PLAN.md) §B5, §B6). Phases 0-2 and
+B1 are done. B2, B3, and B4 are each partially done — see their PLAN.md
+sections for exactly what landed vs. what's deliberately deferred (mostly: the
+live-IMAP-facing half of each, since there is no real or mock IMAP server here
+to verify that kind of change against). None of what's deferred blocks B5.
 
 ---
 
@@ -239,9 +239,10 @@ the `glow` renderer. That is §A6.
 | `237fc42` | Mark phases 0-1 done in the plan; add HANDOFF.md |
 | `3e908f7` | **A3, A4** — `NavigationPolicy` / `WebViewHandler` (real resource interception via `load_web_resource`; every `notify_*` hook now emits a `WebViewEvent`), full navigation API (`reload`, `go_back`/`go_forward`, `url`/`page_title`/`status_text`/`favicon`/`load_status`), `WebViewSource::HtmlWithBase` for relative links |
 | `be05ebf` | **B1** — `config.rs`/`secrets.rs`: TOML `Config` in the platform config dir, passwords in the OS keyring, legacy `esmail_config.txt` migration, inline saved-accounts list on the login screen |
-| *(this branch)* | **B2 (partial)** — `req_id` on `FetchHeaders`/`FetchBody`, dropped when stale; `Disconnected` event; `ensure_connected` auto-reconnects with backoff using remembered credentials. Session pool + IDLE not done — see PLAN.md §B2 |
+| `e3b695f` | **B2 (partial)** — `req_id` on `FetchHeaders`/`FetchBody`, dropped when stale; `Disconnected` event; `ensure_connected` auto-reconnects with backoff using remembered credentials. Session pool + IDLE not done — see PLAN.md §B2 |
+| *(this branch)* | **B3 (partial)** — real `mailboxes`/`messages`/`bodies` schema, LRU-capped bodies, FTS5 fixed (was building its mailbox filter with `format!()` — SQL injection, now a bound param), `sync_decision` (pure, tested) fed by UIDVALIDITY/UIDNEXT `fetch_headers` already had. Nothing acts on a `FetchFrom`/`Resync` yet — see PLAN.md §B3. **B4 (partial)** — `search_query.rs`'s DSL parser + FTS5 `MATCH` builder, wired into the search box. `since:`/`before:`/`is:unread`/`has:attachment` parse but aren't applied; server-side `UID SEARCH` not wired — see PLAN.md §B4. Also: untracked the accidentally-committed `mails.db`. |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` 25 passing, app
+State: `cargo check --workspace` clean, `cargo test --workspace` 52 passing, app
 builds, runs, screenshots and exits cleanly.
 
 ---
