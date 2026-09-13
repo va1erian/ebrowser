@@ -1,8 +1,8 @@
-//! `es_webview` – a reusable egui widget that embeds the Servo browser engine.
+//! `egui-servo-webview` – a reusable egui widget that embeds the Servo browser engine.
 //!
 //! # Quick start
 //! ```no_run
-//! # use es_webview::{ESWebView, WebViewSource};
+//! # use egui_servo_webview::{ESWebView, WebViewSource};
 //! // Inside an eframe::App::new():
 //! // let web_view = ESWebView::new(cc, WebViewSource::Url("https://servo.org".into()));
 //! //
@@ -107,8 +107,6 @@ impl ESWebView {
     /// * `cc`     – eframe [`CreationContext`] (provides window/display handles)
     /// * `source` – initial page to display
     pub fn new(cc: &eframe::CreationContext<'_>, source: WebViewSource) -> Self {
-        let _ = env_logger::try_init();
-
         let servo = ServoBuilder::default().build();
 
         // eframe's CreationContext implements HasWindowHandle / HasDisplayHandle.

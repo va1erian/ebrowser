@@ -1670,6 +1670,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-servo-webview"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "dpi",
+ "eframe",
+ "egui",
+ "euclid",
+ "keyboard-types",
+ "log",
+ "raw-window-handle",
+ "servo",
+ "url",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,23 +1929,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-imap",
- "base64 0.22.1",
- "dpi",
  "eframe",
  "egui",
+ "egui-servo-webview",
  "egui_glow",
  "env_logger",
- "euclid",
  "futures",
- "keyboard-types",
  "keyring",
  "log",
  "mailparse",
- "raw-window-handle",
  "rusqlite",
  "secrecy",
  "serde",
- "servo",
  "tokio",
  "tokio-native-tls",
  "url",

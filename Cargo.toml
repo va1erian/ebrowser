@@ -1,39 +1,48 @@
-[package]
-name = "esmail"
+[workspace]
+members = ["crates/egui-servo-webview", "crates/esmail"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+publish = false
 
-[lib]
-name = "es_webview"
-path = "src/lib.rs"
-
-[[bin]]
-name = "esmail"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+# GUI
 eframe = { version = "0.34.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-servo = { version = "0.1" }
 egui = "0.34.1"
 egui_glow = "0.34.1"
-tokio = { version = "1", features = ["full"] }
-tokio-native-tls = "0.3"
-anyhow = "1.0"
-futures = "0.3"
-async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
-mailparse = "0.15"
-keyring = "3.2"
-secrecy = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-url = "2.5"
-log = "0.4"
-env_logger = "0.11"
+
+# Web engine
+servo = { version = "0.1" }
 dpi = "0.1"
 raw-window-handle = "0.6"
 euclid = "0.22"
 keyboard-types = "0.8"
-base64 = "0.22"
+
+# Async / IO
+tokio = { version = "1", features = ["full"] }
+tokio-native-tls = "0.3"
+futures = "0.3"
+
+# Mail
+async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+mailparse = "0.15"
+
+# Storage / secrets
+# Pinned to 0.37 to unify with servo-storage's rusqlite; libsqlite3-sys sets
+# `links = "sqlite3"`, so only one copy may exist in the dependency graph.
 rusqlite = { version = "0.37", features = ["bundled"] }
+keyring = "3.2"
+secrecy = "0.10"
+
+# Misc
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+url = "2.5"
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"     # Optimize for size
@@ -41,5 +50,3 @@ lto = true          # Link Time Optimization (further reduces size, increases bu
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # No unwinding on panic
 strip = true        # Automatically strip symbols from the binary
-
-[workspace]

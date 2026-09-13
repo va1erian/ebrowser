@@ -1,7 +1,7 @@
 mod imap;
 mod db;
 
-use es_webview::{ESWebView, WebViewSource};
+use egui_servo_webview::{ESWebView, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use tokio::sync::mpsc;
@@ -351,7 +351,7 @@ impl eframe::App for EsMailApp {
                 
                 let events = self.web_view.show(ui);
                 for event in events {
-                    let es_webview::ESWebViewEvent::LinkClicked(url) = event;
+                    let egui_servo_webview::ESWebViewEvent::LinkClicked(url) = event;
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
             });
