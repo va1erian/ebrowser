@@ -99,6 +99,43 @@ copy.
 
 ---
 
+### Prior art (checked 2026-09-13)
+
+**No egui + Servo webview crate exists.** A crates.io search for `egui webview`
+and `servo webview` returns nothing that embeds Servo in egui, so this crate
+would be the first. Four things are worth reading before writing A2–A6:
+
+- **[`iced_servo`](https://docs.rs/iced_servo/)** — the closest analogue: Servo
+  embedded in Iced through an offscreen rendering context. It independently
+  arrived at exactly the A2 split — `ServoRuntime` (shared engine, `Rc`, cheap
+  to clone, "passing one to multiple tabs does not duplicate the underlying
+  engine") + a per-view `ServoWebViewController` + a `WebViewConfig`. Strong
+  confirmation that `WebViewHost` / `WebView` / `WebViewConfig` is the right
+  shape. It also has `LoadStatus`, JS evaluation, and a generic `FrameSource`
+  trait worth stealing. It does **not** expose navigation policy, resource
+  interception, or back/forward — so A3 and A4 are where this crate would go
+  further, and there is no reference implementation to copy for them.
+- **[servoshell](https://github.com/servo/servo)** — Servo's own demo browser is
+  *already egui-based*, making it the single most direct reference for egui
+  input forwarding and compositing. Servo upstream actively maintains this
+  integration (e.g. servo/servo#45290, forwarding all mouse motion events to
+  egui so tooltips dismiss correctly — the same class of bug the WIP mouse-move
+  reordering in `lib.rs` fixes). Read its input handling before doing A5.
+- **[servo-gtk](https://servo.org/made-with/)**, **Servo-as-a-Qt-widget**, and
+  the **Slint WebView component** — three more toolkit embeddings to compare
+  API surfaces against.
+- **[`tauri-runtime-servo`](https://crates.io/crates/tauri-runtime-servo)** — a
+  different embedding style (whole-runtime replacement rather than a widget);
+  useful mainly as a check on how much Servo setup can be hidden.
+
+**One concrete correction to A6 from `iced_servo`:** it reads back via
+`read_to_image` and uploads into a *persistent* texture. Our code calls
+`ui.ctx().load_texture(..)` every frame ([src/lib.rs:207](src/lib.rs:207)),
+which allocates a fresh texture each frame rather than reusing one. Retaining a
+`TextureHandle` and calling `set()` on it is a cheap, portable win that should
+land before any GL-sharing experiment — quite possibly making the `glow-direct`
+feature unnecessary.
+
 ### Track A blockers in [src/lib.rs](src/lib.rs)
 
 1. **Single-instance by construction.** `ESWebView::new` builds its own `Servo`
