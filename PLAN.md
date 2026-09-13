@@ -97,9 +97,9 @@ copy.
    fixing and phase 0 is a one-commit manifest change, not a triage exercise.
    Clear the deprecation warnings in the same commit while they are only four.
 
-5. **`find_html` / `find_text` are now defined twice** — once in `fetch_body`,
-   once in the WIP `bulk_download`. Legal, but lift them to module scope as part
-   of B5 rather than letting the copy drift.
+5. ~~**`find_html` / `find_text` are now defined twice**~~ **DONE (B5)** — was
+   once in `fetch_body`, once in the WIP `bulk_download`. Both now call
+   `render::render_message`, which owns a single copy of each.
 
 6. **`db.rs` is untracked.** Commit it (or explicitly discard it) before
    branching further work, or it will be lost to a stray `git clean`.
@@ -249,6 +249,16 @@ impl InterceptedWebResourceLoad {
 That is exactly what B5 needs: block a remote image by intercepting and
 `cancel()`ing it, serve a `cid:` part by intercepting and `send_body_data()`ing
 the attachment bytes. Both are the intended mechanism, not a workaround.
+
+**Addendum from B5:** the A3 commit's actual `WebViewHandler::intercept`
+signature was `fn intercept(&mut self, request: &WebResourceRequest) ->
+Option<InterceptedResponse>` — `Some` to serve substitute bytes, `None` to let
+the load through. That has no way to express the `cancel()` case this section
+already called for, so it could serve or allow but never block. Fixed when B5
+needed it: `intercept` now returns `InterceptOutcome { Allow, Block,
+Serve(InterceptedResponse) }`, and `Block` calls `load.intercept(..).cancel()`
+— the same primitives this section names, just actually reachable from a
+`WebViewHandler` now.
 
 **The safety-critical detail: both hooks fail OPEN.** `NavigationRequest`'s
 `Drop` impl sends *allow*, and an unhandled `WebResourceLoad` sends
@@ -509,7 +519,7 @@ nothing here to verify it against, so — again, matching B2 and B3's
 reasoning — it waited rather than landing unverified. A result count next to
 the (already-existing) Clear button is also still missing from the UI.
 
-### B5. HTML rendering, safely *(depends on A3)*
+### B5. HTML rendering, safely *(depends on A3)* — **DONE** (allowlist deferred)
 The pipeline becomes: parse with `mailparse` → pick the best `text/html`
 alternative (falling back to `text/plain`, **HTML-escaped** — the current
 `format!("<pre>{}</pre>", text)` at [src/imap.rs:244](src/imap.rs:244) injects
@@ -531,6 +541,35 @@ Add a per-message "Load remote images" bar that re-renders unblocked, plus a
 per-sender allowlist. External link clicks keep opening in the system browser via
 `LinkClicked`, now backed by a real `NavigationPolicy::Deny` so the view never
 navigates itself away from the message.
+
+**What landed:** `render.rs` (parse → pick html/escaped-plain → sanitize →
+resolve `cid:`), 9 unit tests covering script/iframe/form stripping, event-
+handler stripping, plain-text escaping, and `cid:` resolution (including an
+unmatched `cid:` staying inert rather than being guessed at). `find_html`/
+`find_text` are no longer duplicated in `imap.rs`'s `fetch_body` and
+`bulk_download` — both call `render::render_message` now (Track 0's
+build-blocker list item 5). Blocking is real: `WebViewHandler::intercept`
+gained a `Block` outcome (see A3's addendum above) that
+`MessageViewHandler` in `main.rs` uses to cancel every `http(s)` request
+unless the per-message "Load remote images" button (also landed) flipped it
+open — the message's own `WebView` is reused for every message and reloaded
+in place rather than rebuilt, so this is one shared, mutable handler rather
+than a fresh one per message.
+
+**One deliberate change from the wording above:** remote `http(s)` URLs are
+**not** rewritten to a placeholder in the markup. That instruction predates
+A3's settlement (the "Blocking happens in `load_web_resource`, not via
+injected CSS" paragraph right above it) and the two now say different
+things — markup rewriting would also delete the URL a later "load remote
+images" click needs, so `render.rs` leaves every remote reference exactly as
+the message had it and blocking is 100% the network-layer handler's job.
+
+**Not done:** the per-sender allowlist ("always load images from this
+sender") — only the per-message toggle landed. Also unexercised: `ammonia`
+strips inline `style` attributes/blocks along with everything else outside
+its default allowlist (no CSS sanitizer is wired in), so CSS-styled HTML mail
+renders as plain formatted text; noted in `render.rs`'s module docs as a
+known limitation, not silently accepted.
 
 ### B6. Attachments
 Enumerate non-inline parts during parse; show a chip row above the body with
@@ -579,7 +618,7 @@ and Outlook therefore need app passwords.
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
 | 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
-| **5** | **B5, B6 — start here** | — |
+| 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), **B6 — start here** | — |
 | 6 | B7 | — |
 | 7 | A5, A6, A7, B8, B9 | — |
 

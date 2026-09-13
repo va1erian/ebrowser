@@ -31,6 +31,8 @@ futures = "0.3"
 # Mail
 async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 mailparse = "0.15"
+# HTML sanitization for message bodies before they reach the webview (B5).
+ammonia = "4"
 
 # Storage / secrets
 # Pinned to 0.37 to unify with servo-storage's rusqlite; libsqlite3-sys sets

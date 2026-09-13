@@ -117,7 +117,7 @@ pub enum NavigationPolicy {
 }
 
 /// A response to serve in place of a real network fetch, returned from
-/// [`WebViewHandler::intercept`].
+/// [`WebViewHandler::intercept`] wrapped in [`InterceptOutcome::Serve`].
 pub struct InterceptedResponse {
     /// HTTP status code, e.g. `200`.
     pub status_code: u16,
@@ -132,16 +132,32 @@ impl InterceptedResponse {
     }
 }
 
+/// What [`WebViewHandler::intercept`] decided to do with one resource load.
+pub enum InterceptOutcome {
+    /// Let it load normally, from the network.
+    Allow,
+    /// Cancel it — the page sees a network error, the same as a blocked
+    /// request in any other browser. This is the real "stop a remote image
+    /// or stylesheet from loading" control point; markup alone cannot do
+    /// this (removing an `<img src>` in the DOM doesn't un-issue a request
+    /// already made, and Servo's `UserContentManager` has no CSP to forbid
+    /// one either — see B5 in PLAN.md).
+    Block,
+    /// Serve `InterceptedResponse` instead of the network — for e.g. a
+    /// `cid:` part resolved to bytes already in memory.
+    Serve(InterceptedResponse),
+}
+
 /// Host-supplied policy for navigation and resource loading in a [`WebView`].
 ///
 /// Both Servo hooks behind this trait **fail open**: an unhandled
 /// [`NavigationRequest`] allows the navigation, and an unhandled
 /// [`WebResourceLoad`] lets the resource load unmodified. The default
 /// [`WebViewHandler::navigation`] below denies rather than relying on that, but
-/// [`WebViewHandler::intercept`]'s default of `None` is the same "let it
-/// through" behaviour Servo would apply anyway — that one is a real default,
-/// not a footgun, since choosing not to intercept a resource is a legitimate,
-/// common answer.
+/// [`WebViewHandler::intercept`]'s default of [`InterceptOutcome::Allow`] is
+/// the same "let it through" behaviour Servo would apply anyway — that one is
+/// a real default, not a footgun, since choosing not to intercept a resource
+/// is a legitimate, common answer.
 pub trait WebViewHandler {
     /// Called for every navigation after the view's initial load (which is
     /// always allowed — otherwise the view could never load anything).
@@ -153,12 +169,10 @@ pub trait WebViewHandler {
         NavigationPolicy::Deny
     }
 
-    /// Called for every resource load the view makes. Returning `Some` serves
-    /// that response instead of the network; `None` (the default) lets the
-    /// load continue normally.
-    fn intercept(&mut self, request: &WebResourceRequest) -> Option<InterceptedResponse> {
+    /// Called for every resource load the view makes. See [`InterceptOutcome`].
+    fn intercept(&mut self, request: &WebResourceRequest) -> InterceptOutcome {
         let _ = request;
-        None
+        InterceptOutcome::Allow
     }
 }
 
@@ -211,21 +225,33 @@ impl WebViewDelegate for Delegate {
     }
 
     fn load_web_resource(&self, _webview: ServoWebView, load: WebResourceLoad) {
-        let response = self.handler.borrow_mut().intercept(load.request());
-        if let Some(intercepted) = response {
-            let servo_response = WebResourceResponse::new(load.request().url.clone())
-                .status_code(
-                    http::StatusCode::from_u16(intercepted.status_code)
-                        .unwrap_or(http::StatusCode::OK),
-                );
-            let mut in_flight = load.intercept(servo_response);
-            in_flight.send_body_data(intercepted.body);
-            in_flight.finish();
+        match self.handler.borrow_mut().intercept(load.request()) {
+            InterceptOutcome::Allow => {
+                // Dropping `load` here sends `DoNotIntercept`, which is
+                // exactly "let this load through unmodified" — the correct
+                // outcome when the handler chose not to intercept, not a
+                // footgun like the navigation fail-open above.
+            }
+            InterceptOutcome::Block => {
+                // `intercept()` must be called before `cancel()` — there is
+                // no "refuse without first intercepting" entry point in
+                // Servo's API. The response passed in is never seen by the
+                // page: cancelling turns this into a network error, not a
+                // `200` with this body.
+                let placeholder = WebResourceResponse::new(load.request().url.clone());
+                load.intercept(placeholder).cancel();
+            }
+            InterceptOutcome::Serve(intercepted) => {
+                let servo_response = WebResourceResponse::new(load.request().url.clone())
+                    .status_code(
+                        http::StatusCode::from_u16(intercepted.status_code)
+                            .unwrap_or(http::StatusCode::OK),
+                    );
+                let mut in_flight = load.intercept(servo_response);
+                in_flight.send_body_data(intercepted.body);
+                in_flight.finish();
+            }
         }
-        // else: dropping `load` here sends `DoNotIntercept`, which is exactly
-        // "let this load through unmodified" — the correct outcome when the
-        // handler chose not to intercept, not a footgun like the navigation
-        // fail-open above.
     }
 
     fn notify_url_changed(&self, _webview: ServoWebView, url: Url) {
@@ -1048,6 +1074,15 @@ mod tests {
         let mut handler = DefaultHandler;
         let url = Url::parse("https://example.com/clicked").unwrap();
         assert_eq!(handler.navigation(&url), NavigationPolicy::Deny);
+
+        let request = WebResourceRequest {
+            method: http::Method::GET,
+            headers: http::HeaderMap::new(),
+            url,
+            is_for_main_frame: false,
+            is_redirect: false,
+        };
+        assert!(matches!(handler.intercept(&request), InterceptOutcome::Allow));
     }
 
     // ── coordinate transform ─────────────────────────────────────────────────

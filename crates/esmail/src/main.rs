@@ -4,15 +4,54 @@ mod screenshot;
 mod config;
 mod secrets;
 mod search_query;
+mod render;
 
-use egui_servo_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
+use egui_servo_webview::{
+    InterceptOutcome, NavigationPolicy, WebResourceRequest, WebView, WebViewConfig, WebViewHandler,
+    WebViewHost, WebViewSource,
+};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
 use egui_servo_webview::dpi::PhysicalSize;
 use secrecy::SecretString;
+use std::cell::RefCell;
+use std::rc::Rc;
 use tokio::sync::mpsc;
+
+/// Navigation/interception policy for the single [`WebView`] esmail reuses to
+/// show every message body.
+///
+/// - Navigation is always denied: a clicked link is reported as
+///   [`egui_servo_webview::WebViewEvent::LinkClicked`] and opened in the
+///   system browser instead (see below), so the view showing untrusted mail
+///   HTML never navigates itself away from the message (B5 in PLAN.md).
+/// - Remote `http(s)` resources are blocked unless `allow_remote` is set,
+///   which the "Load remote images" button flips for the message currently
+///   showing. This is the real blocking mechanism B5 calls for — markup
+///   alone can't stop a network fetch, so `render.rs` leaves every remote
+///   URL in the message's HTML exactly as it was, and this is what actually
+///   decides whether the request happens at all.
+struct MessageViewHandler {
+    allow_remote: bool,
+}
+
+impl WebViewHandler for MessageViewHandler {
+    fn navigation(&mut self, _url: &egui_servo_webview::url::Url) -> NavigationPolicy {
+        NavigationPolicy::Deny
+    }
+
+    fn intercept(&mut self, request: &WebResourceRequest) -> InterceptOutcome {
+        if self.allow_remote {
+            return InterceptOutcome::Allow;
+        }
+        match request.url.scheme() {
+            "http" | "https" => InterceptOutcome::Block,
+            _ => InterceptOutcome::Allow,
+        }
+    }
+}
 
 struct EsMailApp {
     // Field order is drop order: the view must be torn down before the engine
@@ -20,6 +59,10 @@ struct EsMailApp {
     web_view: WebView,
     /// Owns the Servo engine; one per window. Outlives every view.
     web_view_host: WebViewHost,
+    /// Bound to `web_view` at construction. Toggled per-message by the "Load
+    /// remote images" button; reset to blocked whenever a new message is
+    /// opened. See [`MessageViewHandler`].
+    message_view_handler: Rc<RefCell<MessageViewHandler>>,
     screenshotter: screenshot::Screenshotter,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
     preview: bool,
@@ -139,11 +182,16 @@ impl EsMailApp {
         // (a compose preview, say) would come from this same host.
         let web_view_host = WebViewHost::from_eframe(cc, PhysicalSize::new(1280, 720))
             .expect("failed to initialise the Servo engine");
-        let web_view = web_view_host.new_view(&cc.egui_ctx, WebViewConfig::new(source));
+        let message_view_handler = Rc::new(RefCell::new(MessageViewHandler { allow_remote: false }));
+        let web_view = web_view_host.new_view(
+            &cc.egui_ctx,
+            WebViewConfig::new(source).with_handler(message_view_handler.clone()),
+        );
 
         Self {
             web_view_host,
             web_view,
+            message_view_handler,
             screenshotter: screenshot::Screenshotter::from_env(),
             preview: preview.is_some(),
             imap_tx: imap_cmd_tx,
@@ -525,6 +573,10 @@ impl eframe::App for EsMailApp {
                             if resp.clicked() {
                                 self.selected_uid = Some(header.uid);
                                 clicked_uid = Some(header.uid);
+                                // A new message defaults to blocked remote
+                                // content, same as any other mail client;
+                                // "Load remote images" opts back in per view.
+                                self.message_view_handler.borrow_mut().allow_remote = false;
                                 self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
                             }
                         }
@@ -561,23 +613,45 @@ impl eframe::App for EsMailApp {
                                 ui.label(egui::RichText::new("From:").strong());
                                 ui.add(egui::Label::new(&header.from).selectable(true));
                                 ui.end_row();
-                                
+
                                 ui.label(egui::RichText::new("To:").strong());
                                 ui.add(egui::Label::new(&header.to).selectable(true));
                                 ui.end_row();
-                                
+
                                 ui.label(egui::RichText::new("Date:").strong());
                                 ui.add(egui::Label::new(&header.date).selectable(true));
                                 ui.end_row();
-                                
+
                                 ui.label(egui::RichText::new("Subject:").strong());
                                 ui.add(egui::Label::new(&header.subject).selectable(true));
                                 ui.end_row();
                             });
                         });
                     }
+
+                    // Every message opens with remote content blocked (see
+                    // MessageViewHandler); this is the opt-in per B5. Always
+                    // shown rather than only when the message actually has
+                    // remote images — knowing whether it does would mean
+                    // parsing the HTML again here just to answer that.
+                    if !self.message_view_handler.borrow().allow_remote {
+                        egui::Panel::top("remote_images_bar").show_inside(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Remote images are blocked for this message.");
+                                if ui.button("Load remote images").clicked() {
+                                    self.message_view_handler.borrow_mut().allow_remote = true;
+                                    // The markup never lost its original
+                                    // http(s) URLs (see render.rs) -- a
+                                    // reload against the same document is
+                                    // enough for the now-unblocked requests
+                                    // to actually go out.
+                                    self.web_view.reload();
+                                }
+                            });
+                        });
+                    }
                 }
-                
+
                 let events = self.web_view.show(ui);
                 for event in events {
                     if let egui_servo_webview::WebViewEvent::LinkClicked(url) = event {

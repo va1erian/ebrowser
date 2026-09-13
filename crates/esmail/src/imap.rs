@@ -4,7 +4,6 @@ use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
 use tokio_native_tls::native_tls::TlsConnector;
-use mailparse::parse_mail;
 use secrecy::{SecretString, ExposeSecret};
 use futures::StreamExt;
 use anyhow::anyhow;
@@ -326,44 +325,13 @@ impl ImapActor {
         session.examine(mailbox_name).await?;
         let query = format!("{}", uid);
         let mut fetches = session.uid_fetch(query, "RFC822").await?;
-        
+
         if let Some(msg) = fetches.next().await {
             let msg = msg?;
             let body = msg.body().ok_or_else(|| anyhow::anyhow!("No body"))?;
-            let parsed = parse_mail(body)?;
-            
-            // Try to find HTML part, fallback to text
-            fn find_html(part: &mailparse::ParsedMail) -> Option<String> {
-                if part.ctype.mimetype == "text/html" {
-                    return part.get_body().ok();
-                }
-                for subpart in &part.subparts {
-                    if let Some(html) = find_html(subpart) {
-                        return Some(html);
-                    }
-                }
-                None
-            }
-
-            fn find_text(part: &mailparse::ParsedMail) -> Option<String> {
-                if part.ctype.mimetype == "text/plain" {
-                    return part.get_body().ok();
-                }
-                for subpart in &part.subparts {
-                    if let Some(text) = find_text(subpart) {
-                        return Some(text);
-                    }
-                }
-                None
-            }
-
-            if let Some(html) = find_html(&parsed) {
-                return Ok(html);
-            } else if let Some(text) = find_text(&parsed) {
-                return Ok(format!("<pre>{}</pre>", text));
-            }
+            return Ok(crate::render::render_message(body));
         }
-        
+
         Err(anyhow!("Message not found or no body"))
     }
 
@@ -417,37 +385,7 @@ impl ImapActor {
             if let Some(body_msg) = body_fetches.next().await {
                 let body_msg = body_msg?;
                 if let Some(bytes) = body_msg.body() {
-                    let parsed = parse_mail(bytes)?;
-                    
-                    fn find_html(part: &mailparse::ParsedMail) -> Option<String> {
-                        if part.ctype.mimetype == "text/html" {
-                            return part.get_body().ok();
-                        }
-                        for subpart in &part.subparts {
-                            if let Some(html) = find_html(subpart) {
-                                return Some(html);
-                            }
-                        }
-                        None
-                    }
-
-                    fn find_text(part: &mailparse::ParsedMail) -> Option<String> {
-                        if part.ctype.mimetype == "text/plain" {
-                            return part.get_body().ok();
-                        }
-                        for subpart in &part.subparts {
-                            if let Some(text) = find_text(subpart) {
-                                return Some(text);
-                            }
-                        }
-                        None
-                    }
-
-                    if let Some(html) = find_html(&parsed) {
-                        body = html;
-                    } else if let Some(text) = find_text(&parsed) {
-                        body = format!("<pre>{}</pre>", text);
-                    }
+                    body = crate::render::render_message(bytes);
                 }
             }
 
