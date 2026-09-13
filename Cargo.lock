@@ -1926,6 +1926,7 @@ dependencies = [
  "log",
  "mailparse",
  "raw-window-handle",
+ "rusqlite",
  "secrecy",
  "serde",
  "servo",

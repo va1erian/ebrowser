@@ -170,11 +170,11 @@ impl eframe::App for EsMailApp {
         self.handle_db_events();
 
         if self.is_connected {
-            egui::menu::bar(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Download All (This Mailbox)").clicked() {
                         let _ = self.imap_tx.try_send(ImapCommand::BulkDownload { mailbox: self.selected_mailbox.clone() });
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Logout").clicked() {
@@ -183,7 +183,7 @@ impl eframe::App for EsMailApp {
                         self.selected_uid = None;
                         self.status = "Logged out".to_string();
                         self.web_view.load(WebViewSource::Html("<h1>Logged out</h1>".to_string()));
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
@@ -315,7 +315,7 @@ impl eframe::App for EsMailApp {
             });
 
             if let Some((current, total)) = self.download_progress {
-                egui::TopBottomPanel::bottom("progress_status").show_inside(ui, |ui| {
+                egui::Panel::bottom("progress_status").show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("Indexing {}... ", self.selected_mailbox));
                         ui.add(egui::ProgressBar::new(current as f32 / total as f32)
