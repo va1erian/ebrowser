@@ -10,18 +10,25 @@ rendered safely, so A3 must land before B5.
 
 ---
 
+> **Status: phases 0 and 1 are done.** See [HANDOFF.md](HANDOFF.md) for how to
+> pick this up, including the landmines that cost real time. Sections marked
+> **DONE** below are kept for the reasoning, not as work remaining.
+
 ## Where things actually stand
+
+*(Written before any work started; kept because the reasoning still explains
+why the code looks the way it does.)*
 
 | Location | State |
 |---|---|
 | worktree `imap-mail-client-egui-736b94` @ `f46d6ad` | clean; 1009 lines across `lib.rs` / `imap.rs` / `main.rs` |
 | main checkout `repos/ebrowser` | uncommitted WIP: `Cargo.toml`, `src/imap.rs`, `src/lib.rs`, `src/main.rs` modified; `src/db.rs` (183 lines) untracked |
 
-The WIP in the main checkout is a half-landed feature set — a `DbActor` over
+The WIP in the main checkout was a half-landed feature set — a `DbActor` over
 SQLite for local indexing and search, an `ImapCommand::BulkDownload` that pulls
 every message in a mailbox, a mouse-move ordering fix and a real `Code` mapping
-in the webview. It is worth keeping — and it compiles fine; only the manifest
-around it is broken.
+in the webview. It was worth keeping — and it compiled fine; only the manifest
+around it was broken. It is now committed on this branch as `0bbfd2d`.
 
 ### Track 0 — confirmed build blockers
 
@@ -184,7 +191,7 @@ feature unnecessary.
 
 ## Track A — `egui-servo-webview` as a real crate
 
-### A1. Cargo workspace split
+### A1. Cargo workspace split — **DONE** (`11c815f`)
 Make `repos/ebrowser/Cargo.toml` a real `[workspace]` with
 `crates/egui-servo-webview` (the widget) and `crates/esmail` (the app). The
 widget crate depends on `egui`, `servo`, `raw-window-handle`, `euclid`,
@@ -192,7 +199,7 @@ widget crate depends on `egui`, `servo`, `raw-window-handle`, `euclid`,
 mail-related. Keep the release profile at the workspace root. This also
 permanently fixes Track 0 issue (2).
 
-### A2. Decouple from eframe; support N instances
+### A2. Decouple from eframe; support N instances — **DONE** (`06db971`)
 Split into two types:
 
 - `WebViewHost` — owns the `Servo` instance and the `WindowRenderingContext`.
@@ -207,7 +214,7 @@ Split into two types:
 `host.spin()` runs once per frame; `view.show(ui)` no longer drives the engine
 loop, so N views cost one event-loop spin per frame.
 
-### A3. Real delegate surface *(prerequisite for B5)*
+### A3. Real delegate surface *(prerequisite for B5)* — **NEXT**
 Replace the one-shot boolean with a host-supplied policy:
 
 ```rust
@@ -471,9 +478,9 @@ and Outlook therefore need app passwords.
 
 | Phase | Content | Unblocks |
 |---|---|---|
-| **0** | **Manifest fix (drop dup key, `rusqlite` → `0.37`); clear 4 deprecations; commit `db.rs`** | **everything** |
-| 1 | A1, A2 | all of A |
-| 2 | A3, A4 | B5 |
+| ~~**0**~~ | ~~Manifest fix; clear 4 deprecations; commit `db.rs`~~ **DONE** | everything |
+| ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
+| **2** | **A3, A4 — start here** | B5 |
 | 3 | B1, B2 | B3, B7 |
 | 4 | B3, B4 | B8 |
 | 5 | B5, B6 | — |
@@ -482,6 +489,17 @@ and Outlook therefore need app passwords.
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.
+
+**Landed outside the phase plan**, because verifying anything visual was
+impossible without them:
+
+- **Screenshot dumps** (`a8cd40c`) — F12, or `ESMAIL_SCREENSHOT=<path>` to
+  capture non-interactively and exit.
+- **Preview mode** (`5825a0c`) — `ESMAIL_PREVIEW=demo|<file>|<url>` renders one
+  page full-window with no IMAP account, so the widget can be exercised without
+  credentials.
+- **13 unit tests + log filtering** (`9143154`) — covering the pure helpers, and
+  quietening Servo's benign chatter from 19 lines to 2 per run.
 
 ## Risks
 
