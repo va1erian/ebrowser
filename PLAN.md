@@ -248,13 +248,21 @@ texture with `egui_glow` via `PaintCallback` behind a `glow-direct` feature.
 Measure before committing to (b) — the CPU path may be fine at mail-reading
 sizes.
 
-### A7. Packaging
-`impl egui::Widget for &mut WebView`, `#![deny(missing_docs)]`, README with a
-runnable snippet, `examples/minimal.rs` (URL bar + back/forward) and
-`examples/two_views.rs` (proves multi-instance), unit tests for the pure helpers
-(key mapping, `source_to_url`, coordinate transform), CI running
-`cargo test -p egui-servo-webview` and `cargo doc`. Publish to crates.io only if
-the `servo 0.1` git dependency permits; otherwise document git-dependency usage.
+### A7. Packaging *(internal — not published)*
+The crate stays in this repo; **crates.io publication is explicitly out of
+scope**, which drops the need to pin `servo` for publishability, to choose a
+redistribution license, or to keep a stable semver surface. "Reusable" here
+means a clean boundary another crate in this workspace can depend on — not a
+public crate.
+
+What still earns its keep at that bar: `impl egui::Widget for &mut WebView`,
+doc comments on the public API (`#![warn(missing_docs)]`, not `deny`), a short
+README covering setup and the `WebViewHost` / `WebView` split,
+`examples/two_views.rs` because it is the only real proof that A2's
+multi-instance work holds, and unit tests for the pure helpers (key mapping,
+`source_to_url`, coordinate transform) since those need no Servo build. Drop
+the polished `examples/minimal.rs` browser and the `cargo doc` CI job — the
+mail client is the demo.
 
 ---
 
@@ -389,6 +397,14 @@ late: they improve the widget, but nothing in Track B waits on them.
 - **Provider auth.** Gmail and Outlook have largely disabled password auth;
   without OAuth2 this is usable mainly with app passwords or IMAP-friendly and
   self-hosted providers. Say so up front.
-- **Two divergent working trees.** The WIP in the main checkout and this worktree
-  will conflict in `lib.rs`, `imap.rs` and `main.rs`. Land phase 0 on one of them
-  and rebase the other before starting phase 1.
+- **The WIP now exists in two places.** It is committed on
+  `claude/imap-mail-client-egui-736b94`, and the *same* changes are still sitting
+  uncommitted in the `mail` checkout. Editing there diverges from the branch and
+  will conflict in `lib.rs`, `imap.rs` and `main.rs`. Once the branch is
+  confirmed good, reset the `mail` working tree rather than hand-merging the two.
+  The manifest fix was applied to `mail` directly, so that checkout builds either
+  way.
+- **`libEGL.dll` and `libGLESv2.dll` are untracked and not ignored** at the repo
+  root — Servo runtime libraries loose in the working tree. Decide whether they
+  are build output (gitignore them) or required redistributables (commit them, or
+  fetch them during the build) before they get committed by accident.
