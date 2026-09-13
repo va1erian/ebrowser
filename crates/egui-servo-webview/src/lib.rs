@@ -2,15 +2,30 @@
 //!
 //! # Quick start
 //! ```no_run
-//! # use egui_servo_webview::{ESWebView, WebViewSource};
-//! // Inside an eframe::App::new():
-//! // let web_view = ESWebView::new(cc, WebViewSource::Url("https://servo.org".into()));
+//! # use egui_servo_webview::{WebViewConfig, WebViewHost, WebViewSource};
+//! # use dpi::PhysicalSize;
+//! // Once per window, in eframe::App::new():
+//! // let host = WebViewHost::from_eframe(cc, PhysicalSize::new(1280, 720))?;
+//! // let view = host.new_view(
+//! //     &cc.egui_ctx,
+//! //     WebViewConfig::new(WebViewSource::Url("https://servo.org".into())),
+//! // );
 //! //
-//! // Inside eframe::App::ui():
-//! // let events = self.web_view.show(ui);
+//! // Every frame, in eframe::App::update():
+//! // host.spin();                 // drive the engine once, whatever the view count
+//! // let events = view.show(ui);  // draw, once per view
 //! ```
+//!
+//! One [`WebViewHost`] owns the engine; it can produce any number of
+//! [`WebView`]s that share it.
 
-use std::cell::RefCell;
+// Re-exported so callers can name the types in this crate's signatures without
+// taking their own dependency on these crates (and risking a version skew).
+pub use dpi;
+pub use url;
+
+use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::rc::Rc;
 
 use base64::{Engine as _, engine::general_purpose};
@@ -21,9 +36,12 @@ use url::Url;
 
 use servo::{
     DevicePixel, DeviceVector2D, InputEvent, OffscreenRenderingContext, RenderingContext,
-    Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate,
+    Scroll, Servo, ServoBuilder, WebViewBuilder, WebViewDelegate,
     WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest,
 };
+// `servo::WebView` is the engine-side view. Ours (below) wraps it, so alias the
+// engine type to keep the two unambiguous at every use site.
+use servo::WebView as ServoWebView;
 use servo::input_events::{
     KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
 };
@@ -45,9 +63,9 @@ pub enum WebViewSource {
     Html(String),
 }
 
-/// Events emitted by [`ESWebView::show`].
+/// Events emitted by [`WebView::show`].
 #[derive(Debug, Clone)]
-pub enum ESWebViewEvent {
+pub enum WebViewEvent {
     /// The user triggered a navigation to a new URL (link click, etc.).
     LinkClicked(String),
 }
@@ -57,26 +75,32 @@ pub enum ESWebViewEvent {
 struct Delegate {
     egui_ctx: egui::Context,
     /// Events queued during `request_navigation`; drained by `show()` each frame.
-    events: Rc<RefCell<Vec<ESWebViewEvent>>>,
+    events: Rc<RefCell<Vec<WebViewEvent>>>,
     /// Track whether the very first load has been dispatched so we can
     /// distinguish the initial navigation from user-initiated link clicks.
     initial_load_done: Rc<RefCell<bool>>,
 }
 
 impl WebViewDelegate for Delegate {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
+    fn notify_new_frame_ready(&self, _webview: ServoWebView) {
         self.egui_ctx.request_repaint();
     }
 
-    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+    fn request_navigation(&self, _webview: ServoWebView, request: NavigationRequest) {
         let mut done = self.initial_load_done.borrow_mut();
         if *done {
-            // User navigated away – treat as a link click event.
-            // `url` is a `pub` field of type `url::Url`.
+            // User navigated away – report it and let the host decide.
+            //
+            // `deny()` is required, not optional: servo's `NavigationRequest`
+            // fails OPEN. Its `Drop` impl sends "allow", so simply dropping the
+            // request here let the navigation proceed *and* emitted a
+            // LinkClicked event, so a link opened in the webview and in the
+            // system browser at once. A3 replaces this with a host-supplied
+            // policy; until then, deny and surface the event.
             self.events
                 .borrow_mut()
-                .push(ESWebViewEvent::LinkClicked(request.url.to_string()));
-            drop(request);
+                .push(WebViewEvent::LinkClicked(request.url.to_string()));
+            request.deny();
         } else {
             *done = true;
             // Allow initial navigation
@@ -85,88 +109,180 @@ impl WebViewDelegate for Delegate {
     }
 }
 
-// ─── ESWebView ───────────────────────────────────────────────────────────────
+// ─── Errors ──────────────────────────────────────────────────────────────────
 
-/// A reusable egui widget that embeds the Servo browser engine.
-///
-/// Create one instance per webview per application. **Must be driven on the UI
-/// thread** because [`servo::WebView`] is `!Send + !Sync`.
-pub struct ESWebView {
-    servo: Servo,
-    web_view: WebView,
-    /// The offscreen GL framebuffer that Servo renders into.
-    offscreen_ctx: Rc<OffscreenRenderingContext>,
-    events: Rc<RefCell<Vec<ESWebViewEvent>>>,
-    last_phys_size: PhysicalSize<u32>,
-    last_mouse_pos: Option<egui::Pos2>,
+/// Something went wrong setting up the engine.
+#[derive(Debug)]
+pub enum WebViewError {
+    /// The window or display handle could not be obtained from the host.
+    Handle(raw_window_handle::HandleError),
+    /// Servo could not create a rendering context for the window.
+    RenderingContext(String),
 }
 
-impl ESWebView {
-    /// Construct a new `ESWebView`.
+impl fmt::Display for WebViewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Handle(e) => write!(f, "could not get a window/display handle: {e}"),
+            Self::RenderingContext(e) => write!(f, "could not create a rendering context: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WebViewError {}
+
+impl From<raw_window_handle::HandleError> for WebViewError {
+    fn from(e: raw_window_handle::HandleError) -> Self {
+        Self::Handle(e)
+    }
+}
+
+// ─── WebViewHost ─────────────────────────────────────────────────────────────
+
+/// Owns the Servo engine and the window's rendering context.
+///
+/// Create **one per window**, then create any number of [`WebView`]s from it
+/// with [`WebViewHost::new_view`]. The engine is shared, so a second view costs
+/// a rendering context rather than a second browser engine.
+///
+/// **Must live on the UI thread** — Servo's types are `!Send + !Sync`.
+pub struct WebViewHost {
+    servo: Servo,
+    window_ctx: Rc<WindowRenderingContext>,
+    /// Source of per-view ids, used to give each view a distinct egui texture.
+    next_view_id: Cell<u64>,
+}
+
+impl WebViewHost {
+    /// Create the engine and bind it to a window.
     ///
-    /// * `cc`     – eframe [`CreationContext`] (provides window/display handles)
-    /// * `source` – initial page to display
-    pub fn new(cc: &eframe::CreationContext<'_>, source: WebViewSource) -> Self {
+    /// `size` is the window's size in physical pixels; individual views are
+    /// sized independently when they are shown.
+    pub fn new(
+        display: &impl HasDisplayHandle,
+        window: &impl HasWindowHandle,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self, WebViewError> {
         let servo = ServoBuilder::default().build();
 
-        // eframe's CreationContext implements HasWindowHandle / HasDisplayHandle.
-        let display_handle = cc
-            .display_handle()
-            .expect("Failed to get display handle from eframe");
-        let window_handle = cc
-            .window_handle()
-            .expect("Failed to get window handle from eframe");
+        let window_ctx = WindowRenderingContext::new(
+            display.display_handle()?,
+            window.window_handle()?,
+            size,
+        )
+        .map_err(|e| WebViewError::RenderingContext(format!("{e:?}")))?;
 
-        let window_size = PhysicalSize::new(1280u32, 720u32);
-        let window_ctx = Rc::new(
-            WindowRenderingContext::new(display_handle, window_handle, window_size)
-                .expect("Failed to create WindowRenderingContext"),
-        );
+        Ok(Self {
+            servo,
+            window_ctx: Rc::new(window_ctx),
+            next_view_id: Cell::new(0),
+        })
+    }
 
-        let initial_size = PhysicalSize::new(1024u32, 768u32);
-        let offscreen_ctx = Rc::new(window_ctx.offscreen_context(initial_size));
+    /// Convenience constructor for eframe applications.
+    ///
+    /// Equivalent to [`WebViewHost::new`] with the handles eframe's
+    /// [`eframe::CreationContext`] provides.
+    #[cfg(feature = "eframe")]
+    pub fn from_eframe(
+        cc: &eframe::CreationContext<'_>,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self, WebViewError> {
+        Self::new(cc, cc, size)
+    }
 
-        // Shared state between this struct and the delegate.
-        let events: Rc<RefCell<Vec<ESWebViewEvent>>> = Rc::new(RefCell::new(Vec::new()));
+    /// Create a new view. The engine is shared with every other view.
+    pub fn new_view(&self, egui_ctx: &egui::Context, config: WebViewConfig) -> WebView {
+        let view_id = self.next_view_id.get();
+        self.next_view_id.set(view_id + 1);
+
+        let offscreen_ctx = Rc::new(self.window_ctx.offscreen_context(config.size));
+
+        let events: Rc<RefCell<Vec<WebViewEvent>>> = Rc::new(RefCell::new(Vec::new()));
         let initial_load_done: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
         let delegate = Rc::new(Delegate {
-            egui_ctx: cc.egui_ctx.clone(),
+            egui_ctx: egui_ctx.clone(),
             events: events.clone(),
             initial_load_done,
         });
 
-        let url = Self::source_to_url(&source);
-
-        let web_view = WebViewBuilder::new(
-            &servo,
+        let servo_view = WebViewBuilder::new(
+            &self.servo,
             offscreen_ctx.clone() as Rc<dyn RenderingContext>,
         )
-        .url(url)
+        .url(WebView::source_to_url(&config.source))
         .delegate(delegate)
         .build();
 
-        Self {
-            servo,
-            web_view,
+        WebView {
+            servo_view,
             offscreen_ctx,
             events,
-            last_phys_size: initial_size,
+            texture: None,
+            texture_name: format!("egui_servo_webview_{view_id}"),
+            last_phys_size: config.size,
             last_mouse_pos: None,
         }
     }
 
+    /// Drive the engine. Call **once per frame**, regardless of how many views
+    /// exist — this is why views no longer spin the loop themselves.
+    pub fn spin(&self) {
+        self.servo.spin_event_loop();
+    }
+}
+
+// ─── WebView ─────────────────────────────────────────────────────────────────
+
+/// How a view should start up.
+#[derive(Clone)]
+pub struct WebViewConfig {
+    /// The page to load first.
+    pub source: WebViewSource,
+    /// Initial size in physical pixels. Corrected on the first [`WebView::show`].
+    pub size: PhysicalSize<u32>,
+}
+
+impl WebViewConfig {
+    /// A config that loads `source` at a default size.
+    pub fn new(source: WebViewSource) -> Self {
+        Self {
+            source,
+            size: PhysicalSize::new(1024, 768),
+        }
+    }
+}
+
+/// One embedded web view, drawn with [`WebView::show`].
+///
+/// Created by [`WebViewHost::new_view`]. **Must be driven on the UI thread.**
+pub struct WebView {
+    servo_view: ServoWebView,
+    /// The offscreen GL framebuffer that Servo renders into.
+    offscreen_ctx: Rc<OffscreenRenderingContext>,
+    events: Rc<RefCell<Vec<WebViewEvent>>>,
+    /// Reused across frames; reallocating one per frame was measurable waste.
+    texture: Option<egui::TextureHandle>,
+    /// Unique per view, so two views cannot collide on one egui texture.
+    texture_name: String,
+    last_phys_size: PhysicalSize<u32>,
+    last_mouse_pos: Option<egui::Pos2>,
+}
+
+impl WebView {
     // ── Public helpers ────────────────────────────────────────────────────────
 
     /// Navigate to a new source programmatically.
     pub fn load(&self, source: WebViewSource) {
-        self.web_view.load(Self::source_to_url(&source));
+        self.servo_view.load(Self::source_to_url(&source));
     }
 
-    /// Draw the webview into `ui` and return any queued [`ESWebViewEvent`]s.
+    /// Draw the view into `ui` and return any queued [`WebViewEvent`]s.
     ///
-    /// Call this once per frame from your `eframe::App::ui` implementation.
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<ESWebViewEvent> {
+    /// Call once per frame per view. The engine itself is driven separately by
+    /// [`WebViewHost::spin`], which must be called once per frame overall.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
         let available = ui.available_size();
         let dpi = ui.ctx().pixels_per_point();
 
@@ -176,15 +292,15 @@ impl ESWebView {
         let phys_size = PhysicalSize::new(phys_w, phys_h);
 
         if phys_size != self.last_phys_size {
-            self.web_view.resize(phys_size);
-            self.web_view.set_hidpi_scale_factor(
+            self.servo_view.resize(phys_size);
+            self.servo_view.set_hidpi_scale_factor(
                 Scale::<f32, DeviceIndependentPixel, DevicePixel>::new(dpi),
             );
             self.last_phys_size = phys_size;
         }
 
         // Paint Servo's current frame into the offscreen framebuffer.
-        self.web_view.paint();
+        self.servo_view.paint();
 
         // Allocate the widget rect before drawing.
         let resp = ui.allocate_rect(
@@ -206,11 +322,20 @@ impl ESWebView {
             if w > 0 && h > 0 {
                 let color_image =
                     egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
-                let texture = ui.ctx().load_texture(
-                    "es_webview_fbo",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
+                // Reuse one texture for the life of the view. `load_texture`
+                // allocates a new one on every call, which meant a fresh
+                // full-surface texture every frame.
+                let texture = match &mut self.texture {
+                    Some(handle) => {
+                        handle.set(color_image, egui::TextureOptions::LINEAR);
+                        handle
+                    }
+                    slot => slot.insert(ui.ctx().load_texture(
+                        &self.texture_name,
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    )),
+                };
                 ui.painter().image(
                     texture.id(),
                     widget_rect,
@@ -243,8 +368,8 @@ impl ESWebView {
                 let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
                 
                 if primary_down {
-                    self.web_view.focus();
-                    self.web_view
+                    self.servo_view.focus();
+                    self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Down,
                             MouseButton::Left,
@@ -253,7 +378,7 @@ impl ESWebView {
                 }
                 
                 if primary_up {
-                    self.web_view
+                    self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Up,
                             MouseButton::Left,
@@ -268,7 +393,7 @@ impl ESWebView {
             if widget_rect.contains(pos) || resp.dragged() || primary_up {
                 if self.last_mouse_pos != Some(pos) {
                     let dp = self.egui_to_servo_point(pos, widget_rect.min, dpi);
-                    self.web_view
+                    self.servo_view
                         .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
                     self.last_mouse_pos = Some(pos);
                 }
@@ -299,7 +424,7 @@ impl ESWebView {
                 (-scroll.x * dpi) as f32,
                 (-scroll.y * dpi) as f32,
             ));
-            self.web_view
+            self.servo_view
                 .notify_scroll_event(Scroll::Delta(vec), scroll_pt);
         }
 
@@ -322,18 +447,18 @@ impl ESWebView {
                     egui::Key::PageDown   => Some((0.0,  page_px)),
                     egui::Key::PageUp     => Some((0.0, -page_px)),
                     egui::Key::Home       => {
-                        self.web_view.notify_scroll_event(Scroll::Start, center);
+                        self.servo_view.notify_scroll_event(Scroll::Start, center);
                         None
                     }
                     egui::Key::End => {
-                        self.web_view.notify_scroll_event(Scroll::End, center);
+                        self.servo_view.notify_scroll_event(Scroll::End, center);
                         None
                     }
                     _ => None,
                 };
                 if let Some((dx, dy)) = delta {
                     let vec = WebViewVector::Device(DeviceVector2D::new(dx, dy));
-                    self.web_view.notify_scroll_event(Scroll::Delta(vec), center);
+                    self.servo_view.notify_scroll_event(Scroll::Delta(vec), center);
                 }
             }
 
@@ -359,15 +484,12 @@ impl ESWebView {
                             repeat,
                             is_composing: false,
                         });
-                        self.web_view
+                        self.servo_view
                             .notify_input_event(InputEvent::Keyboard(kb_event));
                     }
                 }
             }
         }
-
-        // ── Spin the Servo event loop ─────────────────────────────────────────
-        self.servo.spin_event_loop();
 
         // Drain accumulated events for the caller.
         std::mem::take(&mut *self.events.borrow_mut())

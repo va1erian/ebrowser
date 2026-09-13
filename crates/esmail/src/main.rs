@@ -1,13 +1,18 @@
 mod imap;
 mod db;
 
-use egui_servo_webview::{ESWebView, WebViewSource};
+use egui_servo_webview::{WebView, WebViewConfig, WebViewHost, WebViewSource};
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
+use egui_servo_webview::dpi::PhysicalSize;
 use tokio::sync::mpsc;
 
 struct EsMailApp {
-    web_view: ESWebView,
+    // Field order is drop order: the view must be torn down before the engine
+    // that backs it, so it stays declared above the host.
+    web_view: WebView,
+    /// Owns the Servo engine; one per window. Outlives every view.
+    web_view_host: WebViewHost,
     imap_tx: mpsc::Sender<ImapCommand>,
     imap_rx: mpsc::Receiver<ImapEvent>,
     db_tx: mpsc::Sender<DbCommand>,
@@ -78,8 +83,15 @@ impl EsMailApp {
         let password_str = "".to_string();
         let initial_status = "Ready".to_string();
 
+        // One engine per window; the view borrows it to start up. A second view
+        // (a compose preview, say) would come from this same host.
+        let web_view_host = WebViewHost::from_eframe(cc, PhysicalSize::new(1280, 720))
+            .expect("failed to initialise the Servo engine");
+        let web_view = web_view_host.new_view(&cc.egui_ctx, WebViewConfig::new(source));
+
         Self {
-            web_view: ESWebView::new(cc, source),
+            web_view_host,
+            web_view,
             imap_tx: imap_cmd_tx,
             imap_rx: imap_evt_rx,
             db_tx: db_cmd_tx,
@@ -166,6 +178,9 @@ impl EsMailApp {
 
 impl eframe::App for EsMailApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Drive Servo once per frame, independent of how many views are drawn.
+        self.web_view_host.spin();
+
         self.handle_imap_events();
         self.handle_db_events();
 
@@ -351,7 +366,7 @@ impl eframe::App for EsMailApp {
                 
                 let events = self.web_view.show(ui);
                 for event in events {
-                    let egui_servo_webview::ESWebViewEvent::LinkClicked(url) = event;
+                    let egui_servo_webview::WebViewEvent::LinkClicked(url) = event;
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
             });
