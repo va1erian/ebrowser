@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Screenshot dumps from ESMAIL_SCREENSHOT / F12
+esmail-screenshot-*.png
+shot-*.png

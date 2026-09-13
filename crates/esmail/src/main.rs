@@ -15,6 +15,8 @@ struct EsMailApp {
     /// Owns the Servo engine; one per window. Outlives every view.
     web_view_host: WebViewHost,
     screenshotter: screenshot::Screenshotter,
+    /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
+    preview: bool,
     imap_tx: mpsc::Sender<ImapCommand>,
     imap_rx: mpsc::Receiver<ImapEvent>,
     db_tx: mpsc::Sender<DbCommand>,
@@ -76,7 +78,22 @@ impl EsMailApp {
         });
         DbActor::spawn(db_cmd_rx, tx_db);
 
-        let source = WebViewSource::Html("<h1>Welcome to esMail</h1><p>Connect to your IMAP account to start reading.</p>".to_string());
+        // Preview mode: render one page full-window with no IMAP account, so the
+        // webview itself can be exercised and screenshotted. ESMAIL_PREVIEW is
+        // either a path to an HTML file, a URL, or "demo" for a built-in page.
+        let preview = std::env::var("ESMAIL_PREVIEW").ok();
+        let source = match preview.as_deref() {
+            None => WebViewSource::Html(
+                "<h1>Welcome to esMail</h1><p>Connect to your IMAP account to start reading.</p>"
+                    .to_string(),
+            ),
+            Some("demo") => WebViewSource::Html(preview_demo_html()),
+            Some(target) if target.starts_with("http") => WebViewSource::Url(target.to_string()),
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(html) => WebViewSource::Html(html),
+                Err(e) => WebViewSource::Html(format!("<h1>could not read {path}</h1><p>{e}</p>")),
+            },
+        };
         
         let (host_str, port_str, username_str) = load_config().unwrap_or_else(|| {
             ("imap.gmail.com".to_string(), "993".to_string(), "".to_string())
@@ -95,6 +112,7 @@ impl EsMailApp {
             web_view_host,
             web_view,
             screenshotter: screenshot::Screenshotter::from_env(),
+            preview: preview.is_some(),
             imap_tx: imap_cmd_tx,
             imap_rx: imap_evt_rx,
             db_tx: db_cmd_tx,
@@ -185,6 +203,16 @@ impl eframe::App for EsMailApp {
         self.web_view_host.spin();
 
         self.screenshotter.update(ui.ctx());
+
+        if self.preview {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                for event in self.web_view.show(ui) {
+                    let egui_servo_webview::WebViewEvent::LinkClicked(url) = event;
+                    log::info!("preview: link clicked -> {url}");
+                }
+            });
+            return;
+        }
 
         self.handle_imap_events();
         self.handle_db_events();
@@ -410,4 +438,25 @@ fn load_config() -> Option<(String, String, String)> {
 fn save_config(host: &str, port: &str, username: &str) {
     let content = format!("{}\n{}\n{}", host, port, username);
     let _ = std::fs::write(get_config_path(), content);
+}
+
+/// A page that exercises the parts of the webview we care about for mail:
+/// text flow, images, tables, links, forms, and scrolling past the fold.
+fn preview_demo_html() -> String {
+    r#"<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; color: #111; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #999; padding: .3rem .6rem; }
+  .tall { height: 60vh; background: linear-gradient(#eee, #fff); }
+</style>
+<h1>esMail webview preview</h1>
+<p>Accented text to check character encoding: <b>&eacute;&agrave;&uuml;&ccedil;</b> &euro; &mdash; &ldquo;quoted&rdquo;.</p>
+<p><a href="https://example.com/clicked">A link</a> &mdash; clicking it should emit LinkClicked and not navigate.</p>
+<table><tr><th>From</th><th>Subject</th></tr><tr><td>a@b.c</td><td>Hello</td></tr></table>
+<p>Type here to check keyboard input: <input type="text" size="30" placeholder="type me"></p>
+<div class="tall">Scroll down past this block to check scrolling.</div>
+<h2 id="bottom">Bottom of the page</h2>
+"#
+    .to_string()
 }
