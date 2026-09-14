@@ -897,6 +897,116 @@ back?), leave it running with new mail arriving in INBOX (does a toast show
 up within ~60s, with the right sender/subject?), and "Quit" from the tray
 (does the process actually exit?).
 
+### B11. IMAP push (`IDLE`) — **DONE**
+A new phase, added once `crates/mail-mock-server` (below) existed to verify
+it against — the "IDLE did not land" cuts in §B2 and §B10's "detection:
+polling, not IDLE" were both explicit placeholders for exactly this.
+
+**Why a separate connection, not a session-pool rework.** §B2 originally
+called for "a small pool: one long-lived control session per account for
+IDLE and mailbox state, plus a worker session for fetches" — a real rework
+of `ImapActor`'s single-session design. `async_imap::extensions::idle::
+Handle`'s own doc comment explains why IDLE needs *some* dedicated
+connection at all: "As long as a `Handle` is active, the mailbox cannot be
+otherwise accessed" — sharing `ImapActor`'s session would mean interrupting
+IDLE (send `DONE`, do the fetch, re-issue `IDLE`) around every header/body
+fetch. This phase gets the push behavior without the full pool rework: a
+new module, `idle_watch.rs`, opens and keeps alive its *own* IMAP
+connection that does nothing but `EXAMINE` one mailbox and sit in `IDLE`,
+completely independent of `ImapActor`. The full control+worker pool (so a
+*fetch* session, not just IDLE, gets its own connection — letting a body
+fetch stop blocking the header list) is still real, separate follow-on
+work; this phase only closes the "no push, only polling" gap.
+
+**What a push means.** IMAP's `IDLE` reports "something changed" without
+saying what — new mail, an expunge, a flag change all look identical from
+outside. `idle_watch` makes no attempt to tell them apart: on any server
+push it sends a bare `MailboxChanged` signal, which `main.rs`'s
+`spawn_new_mail_watch` (B10) treats exactly like its own poll-timer tick —
+send `ImapCommand::PollMailbox`, and let the existing `notify::
+update_watermark` logic decide whether a UIDNEXT advance actually happened.
+No new "what changed" parsing was needed because B10's watermark-based
+detection already answers that question the same way regardless of what
+triggered the check.
+
+**Push augments the poll timer; it doesn't replace it.** `spawn_new_mail_
+watch`'s `NEW_MAIL_POLL_INTERVAL` (60s) timer keeps running unconditionally
+alongside `idle_watch`'s pushes. This is deliberate, not a leftover: it's
+what keeps new-mail detection working at all if the server doesn't support
+`IDLE` (`idle_watch`'s connection then just fails to `IDLE`, backs off, and
+retries forever, silently contributing nothing — see below), or while
+`idle_watch`'s connection is mid-reconnect. `IDLE` only ever makes new mail
+show up *sooner* than the timer would have; nothing regresses versus B10's
+original poll-only behavior on a server (or network path) where `IDLE`
+doesn't work.
+
+**Connection lifecycle.** `idle_watch::spawn` is called from the same
+"Connect" button click that sends `ImapCommand::Connect`, with the same
+host/port/username/password — there was nowhere else in the UI those
+credentials are known. It runs its own independent connect → login →
+`EXAMINE` → `IDLE`-loop → (on any error) backoff-and-retry cycle forever,
+completely decoupled from `ImapActor`'s own connection state; there is no
+ordering requirement between the two connecting, since `idle_watch` simply
+has nothing to push until its own login succeeds. Each `IDLE` round trip is
+capped at 29 minutes (`IDLE_ROUND_TRIP`) and re-issued before that, per RFC
+2177's recommendation to avoid a server-side inactivity timeout silently
+dropping the connection. Backoff on failure is exponential (1s → 30s cap),
+reset back to 1s once a connection has stayed up for at least 60 seconds —
+so a connection that was genuinely working and then dropped doesn't inherit
+a maxed-out backoff from an unrelated earlier flapping period, but a
+connection that fails immediately and repeatedly (bad credentials, a server
+with no `IDLE` support that answers `BAD`) doesn't hammer the server either.
+
+**Mock server support, added alongside the client.** `mail-mock-server`
+previously had no `IDLE` at all (its own README listed it under "no
+`SEARCH`, `IDLE`, `APPEND`..."). `imap_server.rs` now handles `IDLE`:
+responds `+ idling`, subscribes to a new `Store::notify` broadcast channel
+(`tokio::sync::broadcast<String>`, the changed mailbox's name) that
+`Store::deliver` sends on after every append, and pushes an untagged
+`* N EXISTS` for any delivery into the client's selected mailbox until it
+sends `DONE`. This only ever reports the current message count — no
+`EXPUNGE`, no flag-change `FETCH` — since nothing in this mock server
+removes a message or changes a flag; `idle_watch`'s "any push means go
+re-check" handling doesn't care which kind a real server would send, so the
+narrower mock is still a faithful test of that contract. `CAPABILITY` now
+advertises `IDLE` too, for realism (nothing here currently checks it before
+using the command).
+
+**What landed:** `idle_watch.rs` (the always-on IDLE connection + reconnect
+loop), its wiring into `main.rs` (an `idle_wake_tx`/`idle_wake_rx` channel
+threaded from `EsMailApp::new` through the "Connect" button to
+`spawn_new_mail_watch`'s `select!` loop), and `mail-mock-server`'s `IDLE`
+support (`store.rs`'s `notify` broadcast channel, `imap_server.rs`'s `IDLE`
+handler) plus an integration test
+(`idle_push_notifies_of_new_mail_without_polling`) proving a push arrives
+in low single-digit seconds rather than needing the 60s poll timer —
+verified against the real mock server, not asserted from unit tests alone,
+since this is exactly the kind of live-protocol code this session's whole
+established pattern (B2/B3/B4/B6/B7's deferrals) was waiting on something
+to verify against.
+
+**What did not land:**
+- **The full B2 control+worker session-pool rework.** As explained above,
+  this phase deliberately scopes down to "one more dedicated connection for
+  IDLE", not "fetches get their own connection too" — a body fetch still
+  blocks the header list, and `BulkDownload` still blocks everything else
+  for its duration. Real, separate follow-on work.
+- **Watching more than INBOX.** Same scope cut as B10's polling had, for
+  the same reason — `idle_watch::spawn` is called with a single hardcoded
+  mailbox (`NEW_MAIL_POLL_MAILBOX`, "INBOX"), not a per-mailbox or
+  user-configurable list. A second `idle_watch::spawn` call per additional
+  watched mailbox is the mechanical extension, once there's a UI for
+  choosing which mailboxes to watch.
+- **Distinguishing push types.** As above — every push is treated as "go
+  re-check", which is correct but leaves no way to (for example) react
+  differently to an `EXPUNGE` than to new mail, if a future feature wanted
+  to.
+- **A "connected"/"watching" indicator in the UI.** There's no visible
+  sign of whether `idle_watch`'s connection is currently up, reconnecting,
+  or has given up (it never gives up — it retries forever — but nothing
+  shows the user its current state). A status string or icon would be
+  B9-adjacent polish, not part of this phase.
+
 ---
 
 ## Sequencing
@@ -912,6 +1022,7 @@ up within ~60s, with the right sender/subject?), and "Quit" from the tray
 | 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
 | 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); **A6, A7, B8, B9 — start here** | — |
 | *(unordered)* | ~~B10~~ **DONE** (Windows only; INBOX-only polling, see §B10) — independent of B7/A5/B8/B9, landed out of sequence alongside whichever of those another session was mid-way through | — |
+| *(unordered)* | ~~B11~~ **DONE** (IMAP `IDLE`/push, augments B10's poll timer rather than replacing it, see §B11) — depended on `mail-mock-server` existing, independent of everything else in this table | — |
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.

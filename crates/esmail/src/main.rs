@@ -1,4 +1,4 @@
-use esmail::{compose, config, db, imap, notify, render, screenshot, search_query, secrets, smtp};
+use esmail::{compose, config, db, idle_watch, imap, notify, render, screenshot, search_query, secrets, smtp};
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately
 /// and builds everywhere.
@@ -71,6 +71,25 @@ struct EsMailApp {
     db_rx: mpsc::Receiver<DbEvent>,
     smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
     smtp_rx: mpsc::Receiver<smtp::SmtpEvent>,
+    /// Sender half of the channel `spawn_new_mail_watch`'s task reads
+    /// [`idle_watch::MailboxChanged`] pushes from. Kept on `EsMailApp` so the
+    /// "Connect" button can hand a fresh clone to `idle_watch::spawn` once it
+    /// knows the account's host/username/password — `idle_watch` itself has
+    /// no way to learn those except from the same login form `ImapCommand::
+    /// Connect` already reads them from.
+    idle_wake_tx: mpsc::Sender<idle_watch::MailboxChanged>,
+    /// Set once the "Connect" button has spawned an `idle_watch` task, so a
+    /// second click (retrying after a typo'd password, say) doesn't leak
+    /// another one. Unlike `ImapActor`'s single `Option<Session>` — which
+    /// naturally drops (and so closes) the old TLS connection when `connect`
+    /// overwrites it — each `idle_watch::spawn` call starts an independent
+    /// `tokio::spawn` loop with no handle to cancel the previous one, so
+    /// without this guard every retry would leave one more IDLE connection
+    /// running forever. Never reset back to `false`: reconnecting to a
+    /// *different* account without restarting the app is already not
+    /// supported cleanly ("Logout" doesn't tear down `ImapActor`'s session
+    /// either — a pre-existing limitation, not one this field adds).
+    idle_watch_started: bool,
 
     /// Saved accounts (host/port/username; no passwords — those are in the OS
     /// keyring, see `secrets`). Persisted to `config.toml`.
@@ -164,7 +183,15 @@ impl EsMailApp {
         // its doc comment and tray.rs for how the window survives being
         // "closed".
         let (tx, rx) = mpsc::channel(32);
-        spawn_new_mail_watch(rx, imap_evt_tx, imap_cmd_tx.clone(), egui_ctx.clone());
+        // `idle_watch::spawn` (created once the "Connect" button knows the
+        // account's credentials — see its call site) sends here whenever its
+        // dedicated IDLE connection sees the server push something, so
+        // `spawn_new_mail_watch` can poll immediately instead of waiting for
+        // its own timer. A small buffer is enough: this only ever carries a
+        // "go check" signal, never data, and a missed send just means the
+        // next poll-timer tick catches it instead.
+        let (idle_wake_tx, idle_wake_rx) = mpsc::channel(4);
+        spawn_new_mail_watch(rx, imap_evt_tx, imap_cmd_tx.clone(), egui_ctx.clone(), idle_wake_rx);
         ImapActor::spawn(imap_cmd_rx, tx);
 
         // Wrap DB events
@@ -286,6 +313,8 @@ impl EsMailApp {
             db_rx: db_evt_rx,
             smtp_tx: smtp_cmd_tx,
             smtp_rx: smtp_evt_rx,
+            idle_wake_tx,
+            idle_watch_started: false,
             config,
             host: host_str,
             port: port_str,
@@ -826,13 +855,38 @@ impl eframe::App for EsMailApp {
 
                         if ui.button("Connect").clicked() {
                             self.status = "Connecting...".to_string();
+                            let port: u16 = self.port.parse().unwrap_or(993);
                             let cmd = ImapCommand::Connect {
                                 host: self.host.clone(),
-                                port: self.port.parse().unwrap_or(993),
+                                port,
                                 username: self.username.clone(),
                                 password: self.password.clone().into(),
                             };
                             let _ = self.imap_tx.try_send(cmd);
+                            // A separate, dedicated IDLE connection (see
+                            // idle_watch's module doc for why it can't share
+                            // ImapActor's session) so new-mail detection is
+                            // push-based instead of relying only on
+                            // spawn_new_mail_watch's poll timer. Started
+                            // alongside the normal connect rather than only
+                            // after `ImapEvent::Connected` arrives: it does
+                            // its own independent login/reconnect and simply
+                            // has nothing to push until it succeeds, so there
+                            // is no ordering requirement between the two.
+                            // Guarded by `idle_watch_started` -- see that
+                            // field's doc -- so clicking Connect more than
+                            // once can't spawn more than one.
+                            if !self.idle_watch_started {
+                                self.idle_watch_started = true;
+                                idle_watch::spawn(
+                                    self.host.clone(),
+                                    port,
+                                    self.username.clone(),
+                                    self.password.clone().into(),
+                                    NEW_MAIL_POLL_MAILBOX.to_string(),
+                                    self.idle_wake_tx.clone(),
+                                );
+                            }
                         }
                     });
                 });
@@ -1068,7 +1122,14 @@ const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// - tracking whether the account is currently connected (from `Connected`/
 ///   `Disconnected`, which pass through this same stream already),
 /// - asking for a [`ImapCommand::PollMailbox`] on [`NEW_MAIL_POLL_INTERVAL`]
-///   whenever connected,
+///   whenever connected, **and** immediately on every `idle_wake` push (IMAP
+///   `IDLE`, via `idle_watch` -- see its module doc) rather than waiting for
+///   the timer, so new mail shows up within about as long as the round trip
+///   takes instead of up to [`NEW_MAIL_POLL_INTERVAL`] later. The interval
+///   timer still runs unconditionally: it is what keeps working if `IDLE`
+///   isn't supported by the server, or `idle_watch`'s connection is
+///   mid-reconnect, so nothing regresses versus B10's original poll-only
+///   behavior -- `IDLE` only ever makes new mail show up *sooner*,
 /// - folding each [`ImapEvent::MailboxPolled`] into `notify::update_watermark`
 ///   and, on a `NewMail` verdict, requesting the envelopes that describe it,
 /// - turning the resulting [`ImapEvent::NewHeaders`] into a toast via
@@ -1094,12 +1155,18 @@ fn spawn_new_mail_watch(
     ui_events: mpsc::Sender<ImapEvent>,
     imap_tx: mpsc::Sender<ImapCommand>,
     ctx: egui::Context,
+    mut idle_wake: mpsc::Receiver<idle_watch::MailboxChanged>,
 ) {
     tokio::spawn(async move {
         let mut connected = false;
         let mut watermark: Option<notify::MailWatermark> = None;
         let mut poll_interval = tokio::time::interval(NEW_MAIL_POLL_INTERVAL);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Disabled once `idle_wake` closes (which nothing currently does --
+        // `idle_watch::spawn`'s task loops forever -- but a channel that
+        // keeps returning `None` would otherwise busy-loop this `select!`)
+        // so the timer-only path keeps working even in that case.
+        let mut idle_wake_open = true;
 
         loop {
             tokio::select! {
@@ -1147,6 +1214,22 @@ fn spawn_new_mail_watch(
                     let _ = imap_tx.try_send(ImapCommand::PollMailbox {
                         mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
                     });
+                }
+                woke = idle_wake.recv(), if idle_wake_open => {
+                    match woke {
+                        Some(idle_watch::MailboxChanged) if connected => {
+                            let _ = imap_tx.try_send(ImapCommand::PollMailbox {
+                                mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
+                            });
+                        }
+                        Some(idle_watch::MailboxChanged) => {
+                            // A push arrived while `ImapActor`'s own session
+                            // is disconnected/reconnecting -- nothing to poll
+                            // with right now; the timer (once `connected`
+                            // again) or the next push will catch it.
+                        }
+                        None => idle_wake_open = false,
+                    }
                 }
             }
         }

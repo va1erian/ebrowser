@@ -6,37 +6,40 @@ repeat them.
 
 **Your next task is one of A6/A7/B8/B9** ([PLAN.md](PLAN.md), phase 7 — all
 independent of each other, pick whichever is most useful next). Phases 0-2,
-B1, and B5 are done. B2, B3, B4, B6, B7, and now A5 are each partially done —
-see their PLAN.md sections for exactly what landed vs. what's deliberately
-deferred. Most of those deferrals are the live-IMAP-facing half of a phase,
-since there is no real or mock IMAP server here to verify that kind of change
-against — B7's exceptions are IMAP `APPEND`/drafts, a real retry queue,
-rich-text composing, and recipient autocomplete; A5's is specifically the
-`Scroll::Delta`→`Wheel` API migration, held back over a sign-convention flip
-that needs a live app to watch scroll direction on, which this environment
-can't do (screenshots are passive, no synthetic input dispatch) — IME/cursor/
-clipboard in A5 are separate, smaller, still-open items. None of this blocks
-phase 7.
+B1, B5, B10, and now B11 (IMAP push, see below) are done. B2, B3, B4, B6, B7,
+and A5 are each partially done — see their PLAN.md sections for exactly what
+landed vs. what's deliberately deferred. Most of the remaining deferrals are
+still the live-IMAP-facing half of a phase — B7's exceptions are IMAP
+`APPEND`/drafts, a real retry queue, rich-text composing, and recipient
+autocomplete; A5's is specifically the `Scroll::Delta`→`Wheel` API migration,
+held back over a sign-convention flip that needs a live app to watch scroll
+direction on, which this environment can't do (screenshots are passive, no
+synthetic input dispatch) — IME/cursor/clipboard in A5 are separate, smaller,
+still-open items. None of this blocks phase 7.
 
-**A background agent is separately working on B10** (Windows toast
-notifications for new mail, not yet in PLAN.md's phase list) in its own
-worktree, redirected there after briefly landing in this one by mistake — if
-it hasn't reported back and merged by the time you read this, check whether
-its branch (`worktree-agent-abec5b022e3a42d7f` at the time of writing) has
-anything worth pulling in before starting new work in `main.rs`/`imap.rs`, to
-avoid rebasing around it later.
+**There is now a real (mock) IMAP + SMTP server to verify live-protocol
+code against** — `crates/mail-mock-server`, merged in from a separate branch
+(see §5's table). This is what unblocked B11 (IMAP `IDLE`/push) landing here
+without the "no server to verify this against" caveat every other live-IMAP
+deferral above still carries. If you pick up any of those next — B2's
+session-pool split, B3's incremental-UID-fetch half, B4's server-side
+`UID SEARCH`, B6's lazy `BODY.PEEK[n]`, B7's `APPEND`/drafts — this is the
+tool to verify them with; see `crates/mail-mock-server/README.md` for how to
+trust its test CA locally (already done once in this worktree) and
+`crates/esmail/tests/imap_smtp_integration.rs` for the pattern to follow
+(drive `ImapActor`/`SmtpActor`/`idle_watch` directly against a freshly seeded
+in-process server, no live account needed).
 
-**B10 (new-mail notifications, Windows only) is also done** — see
-[PLAN.md](PLAN.md) §B10. It was developed in a separate worktree/branch off
-the same base as this one (another session was mid-way through B7 in *this*
-worktree at the same time), so it isn't part of this branch's own commit
-history and will need merging in rather than showing up here automatically.
-It touches `imap.rs` (new commands/events, a small refactor) and `main.rs`
-(new fields on `EsMailApp`, the event-forwarding bridge task in `new()`, an
-`eframe::App::logic` override) — the same files B7 is actively changing —
-so expect to resolve a real merge, not just concatenate the two, when
-bringing it in. It does not touch `db.rs`, `config.rs`, `render.rs`, or
-`search_query.rs` at all.
+**B10 (new-mail notifications, Windows only) and B11 (IMAP push) are both
+done** — see [PLAN.md](PLAN.md) §B10/§B11. B10 was developed in a separate
+worktree/branch and merged in as commit `988beb9`; B11 (this worktree) adds
+`idle_watch.rs`, a dedicated `IDLE` connection whose pushes make B10's
+`spawn_new_mail_watch` check for new mail immediately instead of waiting for
+its 60-second poll timer — the timer still runs unconditionally as a
+fallback, so nothing regresses on a server without `IDLE` support. B11 also
+added `IDLE` support to `mail-mock-server` itself (`Store::notify`, a
+`tokio::sync::broadcast` fed on every delivery; `imap_server.rs`'s `IDLE`
+handler subscribes to it while a client is idling).
 
 ---
 
@@ -48,24 +51,34 @@ Work in the worktree, never `cd` to the parent repo:
 C:\Users\hadri\Documents\repos\ebrowser\src\.claude\worktrees\imap-mail-client-egui-736b94
 ```
 
-Branch `claude/imap-mail-client-egui-736b94`. The layout:
+Branch `claude/esmail-implementation-plan-a05e38` (this worktree's own —
+`imap-mail-client-egui-736b94`, named in the rest of this section's original
+text, was an earlier worktree whose work is long since merged). The layout:
 
 ```
 Cargo.toml                            workspace root
-crates/egui-servo-webview/src/lib.rs  the widget  (833 lines, incl. tests)
+crates/egui-servo-webview/src/lib.rs  the widget
 crates/esmail/src/main.rs             the app
 crates/esmail/src/imap.rs             IMAP actor
+crates/esmail/src/idle_watch.rs       dedicated IMAP IDLE connection (B11)
 crates/esmail/src/db.rs               SQLite actor
 crates/esmail/src/screenshot.rs       screenshot dumps
+crates/mail-mock-server/              in-process IMAP+SMTP server for tests
+crates/esmail/tests/imap_smtp_integration.rs  drives the app against it
 ```
 
 Commands, with real timings on this machine:
 
 ```bash
 cargo check --workspace          # ~2s warm, ~2min cold
-cargo test -p egui-servo-webview # ~15s warm; 13 tests, all must pass
+cargo test --workspace           # ~5s warm; run this, not just the widget's own tests
 cargo build --bin esmail         # ~25s warm, ~3min cold
 ```
+
+`cargo test --workspace` needs `mail-mock-server`'s test CA trusted once per
+machine and `ESMAIL_TEST_CA_TRUSTED=1` set to actually run the integration
+suite against it rather than skip with a note — see
+`crates/mail-mock-server/README.md`; already done in this worktree.
 
 A cold build compiles Servo and takes minutes. Run long builds in the
 background rather than blocking on them.
@@ -272,10 +285,15 @@ the `glow` renderer. That is §A6.
 | `85f7d05` | **B5** — `render.rs`'s parse→sanitize→resolve-`cid:` pipeline (`ammonia`, 9 tests), replacing the duplicated `find_html`/`find_text` in `imap.rs` and the unescaped `format!("<pre>{}</pre>", text)` fallback. `egui-servo-webview`'s `WebViewHandler::intercept` gained a real `Block` outcome (it could only Allow/Serve before — a gap A3 left, closed here); `MessageViewHandler` in `main.rs` uses it to block remote `http(s)` requests by default, with a "Load remote images" button per message. Per-sender allowlist not done — see PLAN.md §B5. |
 | `7199ea3` | **B6 (partial)** — `render::extract_attachments` (6 tests), a chip row (filename/MIME/size) with `Save…` (`rfd`)/`Open` (temp file + `opener`) per attachment. Only wired for direct message opens, not cached search results; lazy `BODY.PEEK[n]` fetch not done — see PLAN.md §B6. Self-review before committing caught `open_attachment` joining the message's own (attacker-controlled) filename onto a path unsanitized — a crafted `"../../../x"` could write outside the temp dir; fixed with `safe_attachment_filename` (4 tests) before this landed. |
 | `785c2da` | **B7 (partial)** — `smtp.rs` (`SmtpActor` + `lettre`) sends plain-text mail, with attachments as `multipart/mixed`; `compose.rs` derives Reply/Reply All/Forward (subject prefixing, `In-Reply-To`/`References` from a new `MailHeader.message_id`, plain-text quoting) — 9+9 unit tests. Compose window, Reply/Reply All/Forward buttons, and SMTP Host/Port login fields wired into `main.rs`. IMAP `APPEND` to Sent/Drafts, a real retry queue, rich-text composing, and recipient autocomplete not done — see PLAN.md §B7. Caught in self-review: `messages.message_id`'s `CREATE TABLE IF NOT EXISTS` migration would have silently no-opped against this session's own pre-B7 local `mails.db`, breaking `index_mail` at runtime; fixed with an idempotent `ALTER TABLE` step (2 tests) before this landed. |
-| *(this branch)* | **A5 (partial)** — real character input (`text_to_keyboard_events` from `egui::Event::Text`, replacing the lowercase-only guess from `egui::Key`), focus now via `request_focus`/`has_focus` instead of hover, `MouseLeftViewport` on pointer exit, right/middle mouse buttons. `Scroll::Delta`→`Wheel` migration deliberately held back — see PLAN.md §A5 on the sign-convention risk. IME/cursor/clipboard not done. |
+| `a54653e` | **A5 (partial)** — real character input (`text_to_keyboard_events` from `egui::Event::Text`, replacing the lowercase-only guess from `egui::Key`), focus now via `request_focus`/`has_focus` instead of hover, `MouseLeftViewport` on pointer exit, right/middle mouse buttons. `Scroll::Delta`→`Wheel` migration deliberately held back — see PLAN.md §A5 on the sign-convention risk. IME/cursor/clipboard not done. |
+| `7599249`, merged as `988beb9` | **B10** — Windows tray icon + toast notifications for new mail (a background agent's work, merged into this branch). `notify.rs` (pure watermark/toast-text logic), `tray.rs` (Windows-only), `imap.rs`'s `PollMailbox`/`FetchNewHeaders`, `spawn_new_mail_watch` polling INBOX every 60s, minimize-to-tray. See PLAN.md §B10 for the full scope and what didn't land. |
+| `e590d59`, `ec7bdf4` (merged from another branch/PR) | **`crates/mail-mock-server`** — an in-process IMAP4rev1 + SMTP server (`LOGIN`/`LIST`/`EXAMINE`/`FETCH`/`UID FETCH`/`LOGOUT`, plaintext SMTP with `AUTH PLAIN`), a committed throwaway TLS test CA, seed fixtures, and `crates/esmail/tests/imap_smtp_integration.rs` driving `ImapActor`/`SmtpActor` against it. `esmail` gained a `lib.rs` so the integration test crate can import it. Also fixed: `safe_attachment_filename` (B6) now splits on `/`/`\` manually instead of `std::path::Path`, since `Path`'s separator handling is host-OS-dependent and silently failed to strip a Windows-style path on Linux. This is what unblocked B11. |
+| *(this branch)* | **B11** — IMAP `IDLE`/push (see PLAN.md §B11). `idle_watch.rs`: a dedicated always-on IDLE connection, independent of `ImapActor`'s session, that sends a wake signal on any server push; wired into `main.rs` so `spawn_new_mail_watch` (B10) polls immediately on a push instead of waiting for its 60s timer, which keeps running as a fallback. Added `IDLE` support to `mail-mock-server` itself (`Store::notify` broadcast channel, `imap_server.rs`'s `IDLE` handler) plus an integration test proving a push arrives in low single-digit seconds. |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` 100 passing, app
-builds, runs, screenshots and exits cleanly.
+State: `cargo check --workspace` clean, `cargo test --workspace` all passing
+(unit tests across every crate plus the `mail-mock-server`-backed integration
+suite, run with `ESMAIL_TEST_CA_TRUSTED=1`), app builds, runs, screenshots and
+exits cleanly.
 
 ---
 
@@ -295,8 +313,8 @@ builds, runs, screenshots and exits cleanly.
 
 ## 7. One loose end
 
-The user's `mail` checkout still has the same WIP uncommitted that is now
-committed here as `0bbfd2d`, plus the manifest fix applied directly to it. Once
-this branch is accepted, that working tree should be reset rather than
-hand-merged — otherwise the two diverge in `lib.rs`, `imap.rs` and `main.rs`.
-Confirm with the user before touching their checkout.
+None currently open. (This section previously tracked resetting the user's
+`mail` checkout against an early WIP commit — resolved long ago; both that
+branch and the later `mail-mock-server` branch are merged into `origin/main`.
+Kept as a placeholder section number since §6 and this file's cross-references
+assume it.)
