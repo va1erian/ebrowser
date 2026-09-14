@@ -146,6 +146,7 @@ mod tests {
             to: "me@example.com".to_string(),
             date: "2026-01-01".to_string(),
             message_id: "<test@example.com>".to_string(),
+            flags: Vec::new(),
         }
     }
 

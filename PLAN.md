@@ -950,13 +950,177 @@ would need, but nothing calls it for that purpose yet.
   what that limitation looks like, documented in `compose.rs` rather than
   silently under-delivering.
 
-### B8. Flags and the rest of the reading experience
+### B8. Flags and the rest of the reading experience — **PARTIALLY DONE**
 `\Seen` on open (with a mark-as-read delay), star/flag toggle, delete → Trash
 (move, with `\Deleted` + `EXPUNGE` fallback), archive, mark-unread, multi-select
 with shift/ctrl. Unread counts per mailbox. Render the flat `LIST` output
 ([src/imap.rs:135](src/imap.rs:135)) as a tree by splitting on the server's
 delimiter, special-use folders sorted first. IDLE on the selected mailbox for
 new-mail push. Keyboard shortcuts (j/k, Enter, r, a, f, Del, Ctrl+F, Ctrl+N).
+
+**What landed:** everything in this section's first sentence through
+"multi-select with shift/ctrl", plus unread counts and the mailbox tree,
+verified against `mail-mock-server` (extended for this phase — see below) the
+same way B2/B3/B7/B11 verified their own live-IMAP halves.
+
+- **Flags.** `imap.rs` gained `ImapCommand::StoreFlags`/`ImapEvent::
+  FlagsUpdated`/`FlagsUpdateFailed` (`ImapActor::store_flags`: `SELECT`s the
+  mailbox — `STORE` needs write access, unlike the `EXAMINE` every read-only
+  fetch uses — then issues `UID STORE +FLAGS`/`-FLAGS`, one round trip per
+  non-empty side since IMAP has no single verb that both adds and removes
+  different flags at once). `MailHeader` gained a `flags: Vec<String>` field
+  (plus `is_seen()`/`is_flagged()`) populated by adding `FLAGS` to every
+  envelope fetch's item list (`fetch_headers`/`fetch_new_headers`/
+  `bulk_download`) — this is the column `db.rs`'s schema has carried since B3
+  ("unpopulated until B7/B8 need them") and now actually writes, in both
+  `index_mail` and the new `DbCommand::UpdateFlags` (fired once a `StoreFlags`
+  is server-confirmed, so the cache doesn't wait for a full re-fetch).
+  `\Seen` on open uses a real delay (`MARK_SEEN_DELAY`, 1.2s): `open_message`
+  records `(uid, Instant::now())` in `pending_mark_seen`, and
+  `handle_mark_seen_delay` (checked once per frame) only fires the `StoreFlags`
+  once that's elapsed *and* the same message is still open — arrowing past
+  several messages with `j`/`k` faster than that never marks any of them read.
+  Star toggle and mark-unread are both `StoreFlags` calls with the flag
+  flipped (`\Flagged`/`\Seen` respectively), available both per-message (in
+  the open message's own toolbar) and as bulk actions.
+- **Delete → Trash / Archive.** `ImapCommand::MoveMessage`/`ImapActor::
+  move_message`: `SELECT`s the mailbox, tries the real `MOVE` extension
+  (`Session::uid_mv`) first, and on any failure falls back to `COPY` +
+  `STORE +FLAGS.SILENT \Deleted` + a bare `EXPUNGE` — the same three steps
+  `MOVE` is defined to be equivalent to. **Only the fallback path is verified
+  against `mail-mock-server`**, since this mock has no `MOVE` at all (real
+  `uid_mv` against it always fails, exercising exactly the fallback branch) —
+  a server that *does* support `MOVE` takes the untested-here direct path,
+  trusted on the strength of `async_imap`'s own implementation rather than
+  this project's own testing. The fallback's `EXPUNGE` is unscoped (not
+  `UID EXPUNGE <uid>`, which needs the `UIDPLUS` extension this client
+  doesn't check for) — safe under this client's own usage (nothing else here
+  marks a message `\Deleted` without immediately expunging it) but would
+  expunge *every* `\Deleted` message in the mailbox on a server where some
+  other client left one lying around, a real edge case worth naming.
+- **Mailbox tree.** `imap::MailboxInfo` (name, delimiter, a best-effort
+  `SpecialUse` — from LIST's RFC 6154 attributes when the server advertises
+  them, else a name-based fallback for `INBOX`/`Sent`/`Drafts`/`Trash`/
+  `Archive`/`Junk`, the same "hardcoded name, documented gap" trade
+  `SENT_MAILBOX` already made in B7) replaces the bare `Vec<String>`
+  `ImapEvent::Mailboxes` used to carry. `imap::mailbox_tree` (pure, 6 unit
+  tests) splits each name on its delimiter and sorts INBOX first, then
+  Sent/Drafts/Archive/Junk/Trash, then everything else alphabetically;
+  `imap::flatten_tree` turns that into an owned, depth-tagged `Vec` for the
+  left panel's immediate-mode list (indented by depth, a plain label for a
+  hierarchy node that exists only because a deeper mailbox implies it and
+  nothing ever `LIST`ed it directly). `mail-mock-server`'s `LIST` handler now
+  advertises `\Sent`/`\Drafts`/`\Trash`/`\Archive`/`\Junk` for its well-known
+  mailbox names, so the attribute path (not just the name fallback) has real
+  coverage (`connect_and_fetch_mailboxes`, extended).
+- **Unread counts.** `ImapCommand::FetchUnreadCounts`/`ImapEvent::
+  UnreadCounts`: one `STATUS (UNSEEN)` per mailbox, sent right after every
+  `Mailboxes` reply, shown as `"Name  (N)"` in the tree. Kept fresh
+  incrementally after that — a `FlagsUpdated`/`Moved` event adjusts the
+  affected mailbox's count in place (±1) rather than waiting for the next
+  full `FetchUnreadCounts` round trip. Needed `STATUS` support added to
+  `mail-mock-server` (it had none), backed by a new `Mailbox::unseen_count`
+  on the store side.
+- **Multi-select with shift/ctrl.** `selected_uids: BTreeSet<u32>` +
+  `select_anchor: Option<u32>` on `EsMailApp`. Plain click replaces the
+  selection; ctrl/cmd-click toggles one UID in/out of it (seeding it from the
+  previously-single-selected message on the first ctrl-click, so it doesn't
+  silently start empty); shift-click extends it to every message between the
+  anchor and the click, via a pure `select_range` helper (position-based
+  over the currently displayed list, so it degrades to `{uid}` rather than
+  panicking if the anchor scrolled off a page that's no longer loaded).
+  Every bulk action (Mark read/unread, Star/Unstar, Archive, Delete) reads
+  `action_targets()`: the multi-selection when non-empty, else the single
+  open message.
+- **Keyboard shortcuts.** `handle_keyboard_shortcuts`, called once per frame
+  when connected: `j`/`k` move the selection and open it (see below for why
+  this folds `Enter`'s job in), `Enter` re-opens the current selection,
+  `r` replies to it, `a`/`Del`/`Backspace` archive/delete it (or the whole
+  multi-selection), `f` toggles star, `Ctrl+F` focuses the search box
+  (`request_focus` on its id, captured where the box is drawn — egui ids are
+  scoped to their enclosing panel, so a shortcut handler outside that closure
+  needs the actual `Id`, not a freshly-hashed guess at one), `Ctrl+N` opens
+  compose. Disabled while the compose window is open or the search box has
+  focus, so its own text fields get every keystroke.
+
+**One deliberate simplification from the literal wording above:** `j`/`k`
+both move *and* open (fetch) the target message immediately, rather than
+moving a lightweight "cursor" that `Enter` then commits to opening. That
+makes `Enter` mostly redundant (it just re-opens whatever's already open) —
+named directly rather than silently dropped, since the section explicitly
+lists `Enter` as its own shortcut. A real move/open split would need a
+second, visually-distinct "keyboard cursor" state independent of
+`selected_uid`/`selected_uids`, which felt like scope creep for what this
+phase needed to prove; left as real, cheap follow-on work if a fetch-per-
+keystroke ever turns out to be too chatty in practice.
+
+**What did not land, and why:**
+- **IDLE tied to the *selected* mailbox**, as this section's literal wording
+  asks for. B11's `idle_watch` already gives push-based new-mail detection —
+  but scoped to a single hardcoded mailbox (`NEW_MAIL_POLL_MAILBOX`,
+  `"INBOX"`), feeding B10's toast/watermark logic, not "refresh whatever
+  mailbox the user currently has open." Making IDLE follow mailbox selection
+  would mean tearing down and respawning `idle_watch`'s connection on every
+  mailbox switch (a second, independent connection lifecycle beyond what
+  `idle_watch::spawn`'s single call site in `main.rs` manages today) and
+  deciding what a push to a *non-INBOX* mailbox should even do in the UI —
+  auto-refresh the header list the user is looking at, most likely, which is
+  a real, separate feature (live list updates) beyond this phase's flags/
+  tree/select/shortcuts scope. Judged already-substantially-covered for the
+  "new-mail push" half of B8's wording (that's what B11 *is*), with the
+  "on the selected mailbox" half named here as the real, unclosed gap.
+- **`\Sent`/Trash/Archive special-use discovery wired into where mail
+  actually gets sent/moved.** The infrastructure this phase built
+  (`imap::SpecialUse`, populated from real `LIST` attributes) is exactly
+  what B7 named as its own missing piece ("`\Sent` special-use-flag
+  discovery" — see §B7) — but `main.rs`'s `SENT_MAILBOX`/`TRASH_MAILBOX`/
+  `ARCHIVE_MAILBOX` are still the same hardcoded-name constants B7 left
+  behind, not yet reading `self.mailbox_rows`' `special_use` field to pick a
+  real target. Wiring them up is now mechanical (the data is there) but
+  needs a documented fallback for the moment before `FetchMailboxes`' first
+  reply arrives (nothing to look up yet) and wasn't attempted here to avoid
+  touching B7's already-shipped Sent-on-send path under this phase's own
+  time budget.
+- **A real recursive/collapsible tree widget.** The left panel renders
+  `flatten_tree`'s output as an always-fully-expanded indented list, not a
+  `CollapsingHeader`-per-node tree a user could fold shut. Fine for the
+  handful of levels a typical account has; a deep, wide hierarchy would want
+  real collapse state.
+- **Local/offline unread counts.** `FetchUnreadCounts` is a live `STATUS`
+  round trip; nothing reads `messages.flags` from the cache to compute a
+  count while offline, even though the data (now populated) would support
+  it.
+- **`is:unread` in search** still doesn't filter (§B4's gap, unchanged) —
+  `messages.flags` existing now makes this mechanical, but wiring
+  `search_query.rs`'s parsed `is:unread` term into `db.rs::search`'s SQL is a
+  B4-shaped change this phase didn't reach into.
+- **Confirmation before Delete.** Clicking Delete (or pressing `Del`) moves
+  straight to Trash with no "are you sure" — matches most real mail clients
+  (Trash is itself the undo), but worth naming since nothing here prompts.
+- **Cancelling an in-flight fetch on mailbox change** — still the same gap
+  §B2 already documents (no `stop()`-equivalent on the primary IMAP session);
+  unrelated to this phase specifically, not attempted here either.
+- **Visual verification.** HANDOFF.md §2's screenshot workflow only exercises
+  the no-account `ESMAIL_PREVIEW=demo` page (a login screen doesn't even draw
+  the webview) — it was re-run to confirm nothing about B8's `main.rs`
+  changes broke that baseline, but the actual mailbox tree/unread badges/
+  multi-select rows/keyboard shortcuts, which only exist behind a live
+  account, have no headless way to be screenshotted in this environment
+  (same limitation B10 names for its tray icon and toasts). Verified instead
+  by `cargo check --workspace`, `cargo test --workspace`, and new integration
+  tests against `mail-mock-server` (`store_flags_adds_and_removes_in_one_call`,
+  `move_message_falls_back_to_copy_store_expunge_and_the_message_relocates`,
+  `fetch_unread_counts_reflects_seen_flags`) that exercise the exact command/
+  event pairs `main.rs` sends and consumes.
+
+**Mock server extensions this phase needed** (following the pattern B3/B7/B11
+each established): `STORE`/`UID STORE` (mutating a new `StoredMessage::flags`
+field via `Mailbox::store_flags`, returning `FETCH (FLAGS (...))`), `COPY`/
+`UID COPY` (`Store::copy_message`), `EXPUNGE`/`UID EXPUNGE` (`Mailbox::
+expunge`, dropping `\Deleted`-flagged messages), `STATUS` (`Mailbox::
+unseen_count`), `FLAGS` added to every `ENVELOPE` fetch response, and RFC
+6154 special-use attributes on `LIST` for the well-known mailbox names
+`Store::add_user` seeds.
 
 ### B9. Polish — **PARTIALLY DONE**
 Error banners instead of a status string ([src/main.rs:88](src/main.rs:88)),
@@ -1389,7 +1553,7 @@ to verify against.
 | 4 | B3 **partially done** (incremental fetch now acted on; UID-based cache paging still not, see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | 6 | B7 **partially done** (APPEND to Sent now lands; special-use discovery/drafts/retry-queue/rich-text still deferred, see §B7) | — |
-| 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); A6 **partially done** (see §A6), A7 landed (see §A7); B9 **partially done** (error banners, theme, window geometry, provider-table wizard land; per-operation progress deferred, see §B9); **B8 — start here** | — |
+| 7 | ~~A5~~ **DONE** (Wheel migration, IME, cursor, clipboard all landed, see §A5); ~~A7~~ **DONE**, A6 **partially done** (see §A6); B8 **partially done** (flags/mailbox-tree/unread-counts/multi-select/shortcuts landed, IDLE-on-selected-mailbox and special-use-flag wiring for Sent/Trash/Archive deferred, see §B8); B9 **partially done** (error banners, theme, window geometry, provider-table wizard land; per-operation progress deferred, see §B9) — phase 7 is now essentially complete; remaining work is the small follow-ups named in HANDOFF.md | — |
 | *(unordered)* | ~~B10~~ **DONE** (Windows only; INBOX-only polling, see §B10) — independent of B7/A5/B8/B9, landed out of sequence alongside whichever of those another session was mid-way through | — |
 | *(unordered)* | ~~B11~~ **DONE** (IMAP `IDLE`/push, augments B10's poll timer rather than replacing it, see §B11) — depended on `mail-mock-server` existing, independent of everything else in this table | — |
 
