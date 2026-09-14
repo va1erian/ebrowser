@@ -11,6 +11,18 @@ deferred (in every case, the live-IMAP-facing half, since there is no real or
 mock IMAP server here to verify that kind of change against). None of it
 blocks B7.
 
+**B10 (new-mail notifications, Windows only) is also done** — see
+[PLAN.md](PLAN.md) §B10. It was developed in a separate worktree/branch off
+the same base as this one (another session was mid-way through B7 in *this*
+worktree at the same time), so it isn't part of this branch's own commit
+history and will need merging in rather than showing up here automatically.
+It touches `imap.rs` (new commands/events, a small refactor) and `main.rs`
+(new fields on `EsMailApp`, the event-forwarding bridge task in `new()`, an
+`eframe::App::logic` override) — the same files B7 is actively changing —
+so expect to resolve a real merge, not just concatenate the two, when
+bringing it in. It does not touch `db.rs`, `config.rs`, `render.rs`, or
+`search_query.rs` at all.
+
 ---
 
 ## 1. The environment

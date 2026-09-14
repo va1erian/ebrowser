@@ -39,3 +39,9 @@ url.workspace = true
 log.workspace = true
 env_logger.workspace = true
 image.workspace = true
+
+# Tray icon + Windows toast notifications (B10). Windows-only: neither crate
+# is even compiled on other platforms, let alone linked.
+[target.'cfg(windows)'.dependencies]
+tray-icon.workspace = true
+winrt-notification.workspace = true

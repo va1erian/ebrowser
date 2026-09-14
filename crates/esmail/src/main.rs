@@ -5,6 +5,12 @@ mod config;
 mod secrets;
 mod search_query;
 mod render;
+mod notify;
+/// Tray icon + Windows toast notifications (B10). Windows-only: see
+/// notify.rs's module doc for why the pure detection logic lives separately
+/// and builds everywhere.
+#[cfg(target_os = "windows")]
+mod tray;
 
 use egui_servo_webview::{
     InterceptOutcome, NavigationPolicy, WebResourceRequest, WebView, WebViewConfig, WebViewHandler,
@@ -110,6 +116,20 @@ struct EsMailApp {
     search_query: String,
     search_results: Option<Vec<MailHeader>>,
     download_progress: Option<(u32, u32)>,
+
+    /// The tray icon (B10), or `None` if either it couldn't be created (see
+    /// `tray::TrayState::new`'s doc) or this is a preview/screenshot run,
+    /// where a tray icon would be unwanted background noise for what's
+    /// meant to be a one-shot, no-account render. Window-close falls back to
+    /// exiting normally whenever this is `None`, rather than hiding a window
+    /// with no way to bring it back.
+    #[cfg(target_os = "windows")]
+    tray: Option<tray::TrayState>,
+    /// Set by the tray's "Quit" action; the next close-request is then
+    /// allowed to actually close the app instead of being redirected to
+    /// "hide to tray". See `EsMailApp::logic`.
+    #[cfg(target_os = "windows")]
+    exit_requested: bool,
 }
 
 impl EsMailApp {
@@ -124,15 +144,17 @@ impl EsMailApp {
 
         let egui_ctx = cc.egui_ctx.clone();
         
-        // Wrap IMAP events
-        let (tx, mut rx) = mpsc::channel(32);
-        let ctx_clone = egui_ctx.clone();
-        tokio::spawn(async move {
-            while let Some(evt) = rx.recv().await {
-                let _ = imap_evt_tx.send(evt).await;
-                ctx_clone.request_repaint();
-            }
-        });
+        // Wrap IMAP events: forward every event to the UI channel (bumping a
+        // repaint), same as before B10 existed. `spawn_new_mail_watch` also
+        // watches this same stream for the new-mail signal (B10) and turns
+        // it into a background poll timer + a toast -- as a plain tokio
+        // task, not anything hung off `EsMailApp::ui`/`logic`, it keeps
+        // running (and can keep showing toasts) for as long as the process
+        // is alive, independent of whether the main window is visible. See
+        // its doc comment and tray.rs for how the window survives being
+        // "closed".
+        let (tx, rx) = mpsc::channel(32);
+        spawn_new_mail_watch(rx, imap_evt_tx, imap_cmd_tx.clone(), egui_ctx.clone());
         ImapActor::spawn(imap_cmd_rx, tx);
 
         // Wrap DB events
@@ -194,6 +216,27 @@ impl EsMailApp {
             WebViewConfig::new(source).with_handler(message_view_handler.clone()),
         );
 
+        // Skipped in preview/screenshot mode: HANDOFF.md's automated
+        // screenshot verification runs a one-shot, no-account render and
+        // exits on its own -- a tray icon there would be unwanted
+        // background noise (and a needless dependency on the tray shell
+        // being available) for a run nothing ever clicks on.
+        #[cfg(target_os = "windows")]
+        let tray = if preview.is_none() {
+            match tray::TrayState::new() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    log::warn!(
+                        "could not create the system tray icon; closing the window will exit \
+                         esMail normally instead of minimizing it: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             web_view_host,
             web_view,
@@ -224,6 +267,10 @@ impl EsMailApp {
             search_query: String::new(),
             search_results: None,
             download_progress: None,
+            #[cfg(target_os = "windows")]
+            tray,
+            #[cfg(target_os = "windows")]
+            exit_requested: false,
         }
     }
 
@@ -290,6 +337,19 @@ impl EsMailApp {
                         header,
                         body,
                     });
+                }
+                ImapEvent::MailboxPolled { .. } | ImapEvent::NewHeaders { .. } => {
+                    // B10's new-mail signal: already consumed by
+                    // `spawn_new_mail_watch` before this event reached the
+                    // UI channel at all (it decides whether to poll again /
+                    // fetch new envelopes / show a toast). Nothing left here
+                    // for the UI to do with either variant.
+                }
+                ImapEvent::PollFailed(e) => {
+                    // Deliberately not `self.status` -- see the variant's
+                    // doc in imap.rs: a background poll failing every 60s
+                    // shouldn't overwrite whatever the user is looking at.
+                    log::warn!("background new-mail poll failed: {e}");
                 }
             }
         }
@@ -384,7 +444,65 @@ impl EsMailApp {
     }
 }
 
+/// Windows only (B10): tray icon polling + minimize-to-tray. Kept in its own
+/// `impl` block, called only from `EsMailApp::logic`, so the cfg-gating
+/// needed to keep this out of non-Windows builds stays contained to one
+/// place instead of scattered through the main `ui()`/`impl EsMailApp` code.
+#[cfg(target_os = "windows")]
+impl EsMailApp {
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+
+        for action in tray.poll_actions() {
+            match action {
+                tray::TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayAction::Quit => {
+                    self.exit_requested = true;
+                    // Hidden windows don't organically generate another
+                    // close-request -- nothing is clicking their (invisible)
+                    // close button -- so ask for one explicitly. The check
+                    // below sees `exit_requested` and lets it through rather
+                    // than redirecting it to "hide to tray" again.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // The redirect: a first close-request (the user clicked the window's
+        // own close button) is canceled and turned into "hide instead",
+        // *unless* it was `self.exit_requested` that triggered this request
+        // (tray Quit), in which case letting it proceed is the point.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.exit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // `logic()` (unlike `ui()`) keeps running while the window is
+        // hidden, but only when something requests a repaint -- nothing
+        // does that for us just because a tray click landed in `tray-icon`'s
+        // own event channel, so ask again here to keep polling it promptly.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+}
+
 impl eframe::App for EsMailApp {
+    /// Called every frame `ui()` is, *and* while the window is hidden as
+    /// long as a repaint keeps getting requested (see `handle_tray`'s last
+    /// line) -- unlike `ui()`, which eframe skips entirely while hidden.
+    /// That's the whole mechanism B10's tray support depends on: draining
+    /// tray-icon/menu clicks and the close-to-tray redirect both need to
+    /// keep working after the main window is gone, so they live here rather
+    /// than in `ui()`. New-mail polling and toast notifications do *not*
+    /// need to be here -- see `spawn_new_mail_watch`, a plain tokio task
+    /// that runs independent of both `logic()` and `ui()`.
+    #[cfg(target_os = "windows")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_tray(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Drive Servo once per frame, independent of how many views are drawn.
         self.web_view_host.spin();
@@ -694,6 +812,125 @@ impl eframe::App for EsMailApp {
                 }
             });
         }
+    }
+}
+
+/// Mailbox `spawn_new_mail_watch` polls (B10). Hardcoded rather than
+/// following `selected_mailbox`: watching whatever mailbox happens to be
+/// selected would mean a background task's behavior silently changes based
+/// on what the user last clicked in the UI, and would poll nothing at all
+/// for a user who is reading a different folder. INBOX is the one mailbox
+/// every account has and the one "new mail" conventionally means; see
+/// PLAN.md §B10 for the fuller reasoning and what a per-mailbox version
+/// would need.
+const NEW_MAIL_POLL_MAILBOX: &str = "INBOX";
+/// How often `spawn_new_mail_watch` asks `ImapActor` to check
+/// [`NEW_MAIL_POLL_MAILBOX`] for new mail.
+const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Background watcher for B10 (new-mail notifications). Forwards every
+/// `ImapEvent` from `ImapActor` to the UI channel (bumping a repaint) --
+/// exactly what the bridging task this replaced did -- while additionally:
+///
+/// - tracking whether the account is currently connected (from `Connected`/
+///   `Disconnected`, which pass through this same stream already),
+/// - asking for a [`ImapCommand::PollMailbox`] on [`NEW_MAIL_POLL_INTERVAL`]
+///   whenever connected,
+/// - folding each [`ImapEvent::MailboxPolled`] into `notify::update_watermark`
+///   and, on a `NewMail` verdict, requesting the envelopes that describe it,
+/// - turning the resulting [`ImapEvent::NewHeaders`] into a toast via
+///   `notify::build_notification` + [`notify_new_mail`].
+///
+/// This is a plain tokio task, not anything driven by `EsMailApp::logic`/
+/// `ui`, so it keeps running -- and can keep showing toasts -- for as long
+/// as the process is alive, independent of whether the main window is
+/// visible. That's what "notifications work even with the window closed"
+/// means in practice here: the process (and this task) survives a window
+/// close because `tray.rs` turns that close into hide-to-tray instead of
+/// exit; nothing about *this* function knows or cares whether the window is
+/// visible.
+///
+/// The in-memory UID watermark this keeps is deliberately not `db.rs`'s
+/// `sync_decision`/cache -- see `notify.rs`'s module doc for why -- and is
+/// deliberately not a field on `EsMailApp`: keeping it as a local in this
+/// task's own async block means no other code can accidentally read or
+/// reset it, and it needs no `Send`/lock story since it never leaves this
+/// task.
+fn spawn_new_mail_watch(
+    mut actor_events: mpsc::Receiver<ImapEvent>,
+    ui_events: mpsc::Sender<ImapEvent>,
+    imap_tx: mpsc::Sender<ImapCommand>,
+    ctx: egui::Context,
+) {
+    tokio::spawn(async move {
+        let mut connected = false;
+        let mut watermark: Option<notify::MailWatermark> = None;
+        let mut poll_interval = tokio::time::interval(NEW_MAIL_POLL_INTERVAL);
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                evt = actor_events.recv() => {
+                    let Some(evt) = evt else { break };
+                    match &evt {
+                        ImapEvent::Connected => {
+                            connected = true;
+                            // A fresh connection (or reconnection) starts a
+                            // new baseline -- see `notify::update_watermark`'s
+                            // doc for why the first observation after one
+                            // must never itself be reported as "new mail".
+                            watermark = None;
+                        }
+                        ImapEvent::Disconnected => connected = false,
+                        ImapEvent::MailboxPolled { mailbox, state } if mailbox == NEW_MAIL_POLL_MAILBOX => {
+                            let (next, update) = notify::update_watermark(
+                                watermark,
+                                notify::MailWatermark {
+                                    uid_validity: state.uid_validity,
+                                    uid_next: state.uid_next,
+                                },
+                            );
+                            watermark = Some(next);
+                            if let notify::WatermarkUpdate::NewMail { first_new_uid, .. } = update {
+                                let _ = imap_tx.try_send(ImapCommand::FetchNewHeaders {
+                                    mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
+                                    first_uid: first_new_uid,
+                                });
+                            }
+                        }
+                        ImapEvent::NewHeaders { mailbox, headers } if mailbox == NEW_MAIL_POLL_MAILBOX => {
+                            if let Some((title, body)) = notify::build_notification(headers) {
+                                notify_new_mail(&title, &body);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if ui_events.send(evt).await.is_err() {
+                        break; // EsMailApp is gone; nothing left to forward to.
+                    }
+                    ctx.request_repaint();
+                }
+                _ = poll_interval.tick(), if connected => {
+                    let _ = imap_tx.try_send(ImapCommand::PollMailbox {
+                        mailbox: NEW_MAIL_POLL_MAILBOX.to_string(),
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Show a new-mail toast on Windows; elsewhere, just log it. B10 is
+/// Windows-only (see PLAN.md §B10) -- this is the one place that
+/// distinction is made, so `spawn_new_mail_watch` above doesn't need its own
+/// `#[cfg]`.
+fn notify_new_mail(title: &str, body: &str) {
+    #[cfg(target_os = "windows")]
+    tray::show_new_mail_toast(title, body);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, body);
+        log::info!("new mail: {title} -- {body} (desktop notifications are Windows-only, see PLAN.md §B10)");
     }
 }
 

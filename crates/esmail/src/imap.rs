@@ -61,6 +61,23 @@ pub enum ImapCommand {
     /// See `FetchHeaders`; echoed on [`ImapEvent::Body`].
     FetchBody { mailbox: String, uid: u32, req_id: u64 },
     BulkDownload { mailbox: String },
+    /// Lightweight new-mail poll (B10): re-`EXAMINE`s `mailbox` to read the
+    /// fresh UIDVALIDITY/UIDNEXT off the untagged response -- the same free
+    /// ride `fetch_headers` already takes, just without the ENVELOPE fetch
+    /// that pulls the actual header list. Silently dropped if there is no
+    /// live session: unlike every other command here, this deliberately
+    /// does *not* call `ensure_connected` and retry with backoff -- a
+    /// background poll on a timer should never itself trigger a reconnect
+    /// storm while the user is offline. The next real user action still
+    /// reconnects normally.
+    PollMailbox { mailbox: String },
+    /// Fetch just the envelopes for UIDs `first_uid..` in `mailbox`, to
+    /// build a new-mail notification (B10). Unlike `FetchHeaders`, this is
+    /// not paged and not `req_id`-tracked: it never feeds the visible
+    /// message list, only `notify::build_notification`. Same "no
+    /// `ensure_connected`" reasoning as `PollMailbox` -- this only ever
+    /// follows a `PollMailbox` that just proved there's a live session.
+    FetchNewHeaders { mailbox: String, first_uid: u32 },
 }
 
 pub enum ImapEvent {
@@ -75,6 +92,17 @@ pub enum ImapEvent {
     Body { uid: u32, html: String, attachments: Vec<crate::render::Attachment>, req_id: u64 },
     DownloadProgress { current: u32, total: u32 },
     MailData { mailbox: String, header: MailHeader, body: String },
+    /// Reply to `PollMailbox` (B10).
+    MailboxPolled { mailbox: String, state: MailboxState },
+    /// Reply to `FetchNewHeaders` (B10).
+    NewHeaders { mailbox: String, headers: Vec<MailHeader> },
+    /// `PollMailbox`/`FetchNewHeaders` failed. Deliberately a separate
+    /// variant from `Error` rather than reusing it: those two commands are
+    /// background/best-effort (see their docs), and `main.rs` logs this
+    /// instead of overwriting `self.status` with it, so a transient blip on
+    /// a 60-second timer never stomps on whatever the user is actually
+    /// looking at.
+    PollFailed(String),
 }
 
 pub struct ImapActor {
@@ -179,6 +207,40 @@ impl ImapActor {
                         let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                     }
                 }
+                ImapCommand::PollMailbox { mailbox } => {
+                    // No `ensure_connected` here on purpose -- see the
+                    // command's doc. Nothing to poll if there's no session.
+                    let Some(session) = self.session.as_mut() else {
+                        continue;
+                    };
+                    match session.examine(&mailbox).await {
+                        Ok(mb) => {
+                            let state = MailboxState {
+                                uid_validity: mb.uid_validity.unwrap_or(0),
+                                uid_next: mb.uid_next.unwrap_or(0),
+                            };
+                            let _ = self.event_tx.send(ImapEvent::MailboxPolled { mailbox, state }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::PollFailed(e.to_string())).await;
+                        }
+                    }
+                }
+                ImapCommand::FetchNewHeaders { mailbox, first_uid } => {
+                    let Some(session) = self.session.as_mut() else {
+                        continue;
+                    };
+                    match Self::fetch_new_headers(session, &mailbox, first_uid).await {
+                        Ok(headers) => {
+                            let _ = self.event_tx.send(ImapEvent::NewHeaders { mailbox, headers }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::PollFailed(e.to_string())).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -263,6 +325,33 @@ impl ImapActor {
         }
     }
 
+    /// Turn one fetched UID + its IMAP `ENVELOPE` into a [`MailHeader`].
+    /// Factored out of `fetch_headers`/`bulk_download`, which each built
+    /// this by hand before B10 needed a third copy for `fetch_new_headers` --
+    /// three near-identical copies was the point at which "just duplicate it
+    /// again" stopped being the lower-risk option.
+    fn parse_envelope_header(uid: u32, envelope: &async_imap::imap_proto::Envelope<'_>) -> MailHeader {
+        let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
+
+        let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
+            addrs.and_then(|f| f.first()).map(|addr| {
+                let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
+                let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
+                let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
+                match name {
+                    Some(n) => format!("{} <{}@{}>", n, mailbox, host),
+                    None => format!("{}@{}", mailbox, host),
+                }
+            }).unwrap_or_default()
+        };
+
+        let from = format_address(envelope.from.as_deref());
+        let to = format_address(envelope.to.as_deref());
+        let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
+
+        MailHeader { uid, subject, from, to, date }
+    }
+
     async fn fetch_headers(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32, MailboxState)> {
         let mailbox = session.examine(mailbox_name).await?;
         // `examine` already gets these off the server's untagged response —
@@ -295,28 +384,9 @@ impl ImapActor {
             let msg = msg?;
             let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
             let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
-            
-            let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
-            
-            let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
-                addrs.and_then(|f| f.first()).map(|addr| {
-                    let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
-                    let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
-                    let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
-                    match name {
-                        Some(n) => format!("{} <{}@{}>", n, mailbox, host),
-                        None => format!("{}@{}", mailbox, host),
-                    }
-                }).unwrap_or_default()
-            };
-            
-            let from = format_address(envelope.from.as_deref());
-            let to = format_address(envelope.to.as_deref());
-            let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
-
-            headers.push(MailHeader { uid, subject, from, to, date });
+            headers.push(Self::parse_envelope_header(uid, envelope));
         }
-        
+
         headers.reverse(); // Newest first
         Ok((headers, total_pages, mailbox_state))
     }
@@ -335,6 +405,31 @@ impl ImapActor {
         }
 
         Err(anyhow!("Message not found or no body"))
+    }
+
+    /// Fetch envelopes for every UID from `first_uid` onward (B10). Same
+    /// `EXAMINE` + `UID FETCH ... (UID ENVELOPE)` shape as `fetch_headers`,
+    /// minus the paging -- this always wants everything from `first_uid` to
+    /// the end, since it exists to describe exactly the messages a
+    /// `notify::WatermarkUpdate::NewMail` just reported as new.
+    async fn fetch_new_headers(
+        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        mailbox_name: &str,
+        first_uid: u32,
+    ) -> anyhow::Result<Vec<MailHeader>> {
+        session.examine(mailbox_name).await?;
+        let query = format!("{}:*", first_uid);
+        let fetches = session.uid_fetch(query, "(UID ENVELOPE)").await?;
+        let messages = fetches.collect::<Vec<_>>().await;
+
+        let mut headers = Vec::new();
+        for msg in messages {
+            let msg = msg?;
+            let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
+            let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
+            headers.push(Self::parse_envelope_header(uid, envelope));
+        }
+        Ok(headers)
     }
 
     async fn bulk_download(
@@ -359,26 +454,7 @@ impl ImapActor {
             let msg = msg?;
             let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
             let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
-
-            let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
-            
-            let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
-                addrs.and_then(|f| f.first()).map(|addr| {
-                    let name = addr.name.as_ref().map(|n| Self::decode_rfc2047(n));
-                    let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
-                    let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h).to_string()).unwrap_or_default();
-                    match name {
-                        Some(n) => format!("{} <{}@{}>", n, mailbox, host),
-                        None => format!("{}@{}", mailbox, host),
-                    }
-                }).unwrap_or_default()
-            };
-            
-            let from = format_address(envelope.from.as_deref());
-            let to = format_address(envelope.to.as_deref());
-            let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
-
-            let header = MailHeader { uid, subject, from, to, date };
+            let header = Self::parse_envelope_header(uid, envelope);
 
             // Now fetch body for this UID
             let body_query = format!("{}", uid);

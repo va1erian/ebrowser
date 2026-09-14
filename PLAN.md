@@ -630,6 +630,179 @@ guesses IMAP/SMTP settings from the email domain via a small built-in provider
 table. OAuth2 is explicitly out of scope for v1 — note in the README that Gmail
 and Outlook therefore need app passwords.
 
+### B10. New-mail notifications — **DONE** (Windows only; scoped as below)
+A new phase, not in the original plan wording above. Windows system-toast
+notifications for new mail, landed as a bounded subset rather than the full
+"watch every mailbox" feature, for the same reason B2/B3/B4/B6's live-IMAP
+halves waited: there is no real or mock IMAP server in this environment to
+verify a bigger change against, and this codebase's established pattern (see
+those sections) is to ship the safely-scoped part and say plainly what's
+left rather than land something unverified.
+
+**The "window closed" problem.** esMail is a plain native eframe/winit app,
+not Tauri — there is no framework-level "run in background" mode. A normal
+window close ends the process, and a process that no longer exists cannot
+show a toast five minutes later. The fix is minimize-to-tray: closing the
+window is intercepted and turned into hiding it, with a tray icon (`tray-
+icon` crate) offering "Show esMail" and "Quit" so the user can still get the
+window back or actually exit. "Notifications work even with the window
+closed" therefore really means: the *process* survives a window close (only
+the window hides), and the polling/toast machinery is a plain tokio task
+independent of whether any window is visible — see the mechanism below.
+
+**Why `tray-icon` + `winrt-notification`, not the other candidates:**
+- **`tray-icon`** talks to the OS tray directly (no winit coupling needed —
+  it registers its own hidden window and pumps Win32 messages off the same
+  thread's event loop that winit already runs), which is exactly the "works
+  with eframe's winit loop without fighting it" property the task needed.
+  Built with `default-features = false` to drop the Linux-only `gtk`/
+  `libxdo` pulls, which are dead weight on a Windows-only feature.
+- **`winrt-notification`**, not `notify-rust`: checked first, and as
+  published on crates.io `notify-rust` no longer has a Windows backend at
+  all (dbus/linux, bsd, mac only) — despite older docs and its own crate
+  description implying otherwise. `winrt-notification` is a thin, Windows-
+  only wrapper over the real WinRT toast API, and — checked by reading its
+  source, not assumed — its `title()`/`text1()` builders run content through
+  `xml::escape::escape_str_attribute` before splicing it into the toast's
+  XML, so a crafted `Subject`/`From` header can't break out of the markup.
+  It's old (pinned to `windows` 0.24.0) but built and worked without
+  incident here; `windows` isn't a `links = "sqlite3"`-style singleton
+  dependency, so an older pinned copy coexisting with whatever `windows`
+  version anything else in the graph wants is not the hazard rusqlite would
+  be (see PLAN.md's rusqlite note and HANDOFF.md §3.7).
+- **Window-close interception**: `eframe::App` in 0.34.1 has no
+  `on_close_event` hook (checked against the vendored source — that method
+  doesn't exist on this version's `App` trait). The real, version-verified
+  mechanism: check `ctx.input(|i| i.viewport().close_requested())` and, to
+  cancel it, send `ViewportCommand::CancelClose` followed by
+  `ViewportCommand::Visible(false)` — confirmed by reading
+  `eframe-0.34.1/src/native/epi_integration.rs`, which checks exactly that
+  command in the full-output it collects right after the frame callback
+  runs. Tray "Quit" reverses this: set a flag and send
+  `ViewportCommand::Close` again, this time *not* followed by
+  `CancelClose`, letting the close proceed and the process exit normally
+  through `eframe::run_native`'s return.
+- **Keeping the tray responsive while hidden**: `eframe::App::logic()` is a
+  real, documented trait method — "called once before each call to `Self::
+  ui`, and additionally also called when the UI is hidden, but
+  `egui::Context::request_repaint` was called" (its own doc comment, and
+  confirmed against `glow_integration.rs`: `update()`/`ui()` are skipped
+  when a viewport isn't visible, but the frame callback that eventually
+  calls `logic()` is not). `EsMailApp::logic` (Windows-only) is where tray-
+  click draining and the close-to-tray redirect live, specifically *because*
+  it still runs when the window is hidden; it also calls
+  `request_repaint_after(250ms)` on itself so it keeps getting invoked
+  promptly instead of waiting for some unrelated event to wake the app up.
+
+**Detection: polling, not IDLE.** IDLE is explicitly out of scope here (see
+§B2) — this uses the `ImapActor`/`EsMailApp` pattern already established,
+not a new protocol path. A background tokio task (`spawn_new_mail_watch` in
+main.rs) sends `ImapCommand::PollMailbox { mailbox: "INBOX" }` on a 60-second
+timer whenever connected. `PollMailbox` does a bare `EXAMINE` — the same
+free ride `fetch_headers` already takes to read UIDVALIDITY/UIDNEXT off the
+untagged response, just without the `(UID ENVELOPE)` fetch that pulls actual
+headers — so a poll costs one round trip and no bandwidth for the header
+list. **Scoped to INBOX only**, not every mailbox: watching N mailboxes on a
+timer is N times the traffic and needs per-mailbox watermark state; INBOX is
+the one folder every account has and the one "new mail" conventionally
+means. Extending this to other mailboxes (or a user-configurable watch list)
+is real follow-on work, not attempted here.
+
+The poll result feeds `notify::update_watermark` — a pure function,
+deliberately independent of `db.rs`'s own `sync_decision`/`SyncPlan`: that
+machinery drives the SQLite cache and wipes it on a UIDVALIDITY change,
+which is a different concern with a different failure mode than "should a
+toast pop up," and a lightweight poll for notifications has no reason to
+touch the DbActor at all. The watermark is kept in memory only, as a local
+inside `spawn_new_mail_watch`'s own task (not a field on `EsMailApp`, not
+persisted) — reset to a fresh baseline on every `Connected`/reconnect, which
+is what stops a first login (or any reconnect) from "discovering" the whole
+mailbox as new mail and firing a toast per message already sitting in the
+inbox. Only a UIDNEXT advance under an *unchanged* UIDVALIDITY counts as new
+mail; a UIDVALIDITY change resets the baseline instead of computing a
+meaningless UID delta across two different numbering schemes.
+
+On a `NewMail` verdict, `ImapCommand::FetchNewHeaders` fetches envelopes for
+just the new UID range (`UID FETCH first_new_uid:* (UID ENVELOPE)`) to name
+the sender/subject in the toast rather than showing a bare "you have new
+mail." `notify::build_notification` turns that into a title/body: one
+message names the sender and shows the subject, more than one collapses to
+a count rather than naming every sender. Both `notify::update_watermark` and
+`notify::build_notification` are pure and unit tested (12 tests) without a
+live server, a Windows toast API, or a GUI — `imap.rs` gained a third
+duplicate of the envelope-parsing block this needed (`fetch_headers`,
+`bulk_download`, and now `fetch_new_headers` all built a `MailHeader` from
+an IMAP envelope by hand); three copies was the point at which duplicating
+it again stopped being the lower-risk option, so it's factored into
+`ImapActor::parse_envelope_header` now, with no behavior change to the two
+existing call sites.
+
+**Self-review caught before landing:** a crafted `Subject`/`From` header is
+attacker-controlled (the sender's own mail) and ends up verbatim in the
+toast. `winrt-notification`'s XML escaping (see above) handles markup
+injection, but not *content* — a header containing literal newlines/control
+bytes could still display as extra toast lines or otherwise fight the
+layout even once safely escaped. `notify::sanitize_toast_field` collapses
+control characters (including `\n`/`\r`) to spaces, folds repeated
+whitespace, and truncates to 120 characters with an ellipsis before a
+subject/sender ever reaches `tray.rs` — covered by a regression test
+(`newlines_and_control_characters_collapse_to_a_single_line`) using a
+subject engineered to look like a second, fake toast line.
+
+**What landed:** `notify.rs` (pure watermark + toast-text logic, 12 tests),
+`tray.rs` (Windows-only: tray icon/menu, toast sending), `imap.rs`'s
+`PollMailbox`/`FetchNewHeaders` commands and `MailboxPolled`/`NewHeaders`/
+`PollFailed` events plus the `parse_envelope_header` refactor,
+`spawn_new_mail_watch` (replacing the old event-forwarding bridge task in
+`EsMailApp::new` with the same forwarding behavior plus the watch logic),
+minimize-to-tray via `EsMailApp::logic`/`handle_tray`, and the `tray-icon`/
+`winrt-notification` workspace dependencies (Windows-only in
+`crates/esmail/Cargo.toml`, via `[target.'cfg(windows)'.dependencies]`, so
+neither is even compiled on Linux — this repo builds and ships on both, see
+`.github/workflows/build.yml`).
+
+**What did not land:**
+- **Watching more than INBOX.** See above — a real gap for anyone whose new
+  mail lands somewhere else (a filter rule into a different folder, say).
+- **The lazy `BODY.PEEK[n]`-style targeted fetch B6 also deferred** doesn't
+  apply here since `FetchNewHeaders` only ever fetches envelopes, never
+  bodies — but the same "no `BODYSTRUCTURE`-driven partial fetch" limitation
+  applies in spirit: there's no way to ask for just-the-fields-a-toast-needs
+  more cheaply than `(UID ENVELOPE)` already is.
+- **Clicking a toast to open the message.** `winrt-notification` 0.5.1 has
+  no activation/click-handling API (its own module doc lists "Actions" as a
+  todo) — a toast here is informational only. Getting click-to-open would
+  mean a lower-level WinRT toast API (`ToastNotificationManager` +
+  activation callbacks) that this crate doesn't expose, a bigger change than
+  this phase's scope.
+- **A real AppUserModelID.** Toasts show under
+  `winrt_notification::Toast::POWERSHELL_APP_ID` (that crate's own
+  documented workaround for an app with no installer/Start-menu shortcut),
+  so Windows attributes them to "Windows PowerShell" — wrong icon, wrong
+  name in Focus Assist / Notification settings. Fixing this needs an
+  installer that registers a real AUMID + shortcut, which is B9-adjacent
+  packaging work, not part of this phase.
+- **Per-viewer notification settings** (quiet hours, disabling toasts,
+  choosing which mailboxes to watch) — no UI for any of this yet; the poll
+  interval and mailbox are compile-time constants (`NEW_MAIL_POLL_INTERVAL`/
+  `NEW_MAIL_POLL_MAILBOX` in main.rs).
+
+**Verified:** `cargo check --workspace` clean (including the Windows-only
+dependency edge — `tray-icon`/`winrt-notification` resolve and build
+without conflict alongside the rest of the graph), all unit tests passing
+(counted in HANDOFF.md's running total). **Not verified — needs a real
+Windows machine:** the tray icon actually appearing and being clickable, a
+toast actually appearing and looking right, and the close-to-tray/Quit
+round trip end to end. This environment has no way to screenshot a native
+Windows toast or interact with a live system tray (unlike the webview,
+which HANDOFF.md §2's `ESMAIL_SCREENSHOT` mechanism can capture headlessly
+— there is no equivalent for OS-chrome UI). A human should click through:
+close the window (does it disappear instead of exiting, and does a tray
+icon appear?), "Show esMail" from the tray menu (does the window come
+back?), leave it running with new mail arriving in INBOX (does a toast show
+up within ~60s, with the right sender/subject?), and "Quit" from the tray
+(does the process actually exit?).
+
 ---
 
 ## Sequencing
@@ -644,6 +817,7 @@ and Outlook therefore need app passwords.
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | **6** | **B7 — start here** | — |
 | 7 | A5, A6, A7, B8, B9 | — |
+| *(unordered)* | ~~B10~~ **DONE** (Windows only; INBOX-only polling, see §B10) — independent of B7/B8/B9, landed out of sequence alongside whichever of those another session was mid-way through | — |
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.
