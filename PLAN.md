@@ -366,7 +366,7 @@ clipboard shortcuts (`Ctrl/Cmd+X/C/V` → `InputEvent::EditingAction`) — all
 real, scoped-out for size rather than risk; PLAN.md still describes exactly
 what each needs.
 
-### A6. Rendering path
+### A6. Rendering path — **PARTIALLY DONE**
 **The zero-copy path exists and we are already on the backend it needs.**
 servoshell does not read pixels back to the CPU at all; it registers an
 `egui::PaintCallback` and lets Servo blit its framebuffer straight into egui's
@@ -394,6 +394,72 @@ and reused rather than reallocated per frame.)
 Still worth doing on the fallback path: only re-read when
 `notify_new_frame_ready` has fired since the last blit, rather than
 unconditionally every `show()`.
+
+**PARTIALLY DONE — the zero-copy GL blit was attempted and reverted; the
+CPU-path re-read gating landed.** This is exactly the class of change
+`HANDOFF.md` §2 warns about ("compiled clean, passed every test, silently
+broke rendering"), and the screenshot workflow it insists on is what caught
+it here too.
+
+**What was tried:** register an `egui::PaintCallback` (via
+`egui_glow::CallbackFn`, the type the `glow` backend downcasts to) whose body
+calls `OffscreenRenderingContext::render_to_parent_callback()`'s closure.
+Getting it to *compile* required fixing one real thing the plan above got
+wrong: it says `painter.gl()` (`egui_glow::Painter::gl()`) "hands us exactly
+that" `glow::Context`. It does not — `servo-paint-api` and `egui_glow` pin two
+different major versions of the `glow` crate (0.16 vs 0.17, visible in
+`Cargo.lock`), so the `&glow::Context` the callback wants is a different Rust
+type than what `Painter::gl()` returns. The fix was
+`OffscreenRenderingContext::glow_gl_api()` (via the already-imported
+`RenderingContext` trait), which hands back servo-paint-api's own `Arc<glow::Context>`
+(the 0.16 one), built by loading GL function pointers against whatever GL
+context is current at the time. That part worked: it compiled, and `cargo
+test -p egui-servo-webview` still passed (18 tests, none of which exercise
+`show()` itself — see the note at the top of the test module on why).
+
+**Why it was reverted anyway:** the screenshot workflow HANDOFF.md §2
+describes (`ESMAIL_PREVIEW=demo` + `ESMAIL_SCREENSHOT`) came back a uniform,
+near-black fill — no heading, no table, no link, no input box, nothing the
+demo page renders. Root cause: `WebViewHost::new` builds Servo's
+`WindowRenderingContext` with its own call to surfman
+(`WindowRenderingContext::new`), which creates a **new, independent native GL
+context** bound to the window handle -- it is never shared with the GL
+context `eframe`/`glutin` already created for that same window, the one
+`egui_glow`'s `Painter` actually compositing into. `glow_gl_api()` loading
+function pointers against "whatever context is current" doesn't fix this: at
+the moment our `PaintCallback` runs, the current context is `egui_glow`'s, but
+`render_to_parent_callback`'s closure was built to blit **Servo's own**
+framebuffer object id into **Servo's own** `parent_context`'s framebuffer
+(`self.parent_context.surfman_context.framebuffer()`) — a framebuffer object
+that lives in Servo's context, not egui_glow's. Framebuffer objects (unlike
+textures/buffers) are never shared between GL contexts even when the contexts
+share other resources, so binding Servo's FBO id while egui_glow's context is
+current either errors or aliases onto whatever unrelated object shares that
+numeric id there — consistent with rendering nothing.
+
+This is a real architecture mismatch, not a coding slip: `render_to_parent_callback`
+is designed for a caller like servoshell, where Servo's own
+`WindowRenderingContext` *is* the window's one and only rendering context and
+does the actual `present()`/swap itself. This crate instead sits Servo
+underneath `eframe`, which already owns the real window and its GL context;
+`WebViewHost`'s `WindowRenderingContext` only exists to be the parent for each
+view's *offscreen* context, and was never meant to touch the screen directly.
+Making the zero-copy path work for real would mean sharing GL objects between
+Servo's context and eframe's `glutin` context at context-creation time (an
+explicit share-list, set up before either context exists) — real, deep
+surgery on both `WebViewHost::new` and the app's `eframe::NativeOptions`
+setup, well past a "safely-scoped subset" for one phase. Left for whoever
+picks this up next; the closing paragraph below is what actually landed
+instead.
+
+**What landed:** the CPU `read_to_image` path is now gated on a
+`frame_dirty: Rc<Cell<bool>>` shared with the `Delegate`, set by
+`notify_new_frame_ready` and cleared once the framebuffer has been re-read;
+when not dirty, `show()` repaints the existing texture rather than
+re-reading, so a `show()` with nothing new costs a texture upload's worth of
+GPU work, not a full-surface CPU readback. Screenshot re-verified after the
+revert: the demo page (heading, accented text, link, table, text input, tall
+scrollable block) renders correctly, matching the pre-A6 baseline.
 
 ### A7. Packaging *(internal — not published)*
 The crate stays in this repo; **crates.io publication is explicitly out of
