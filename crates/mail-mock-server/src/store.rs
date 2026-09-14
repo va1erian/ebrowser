@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use tokio::sync::broadcast;
+
 /// One stored message: the raw RFC822 bytes (source of truth, what
 /// `UID FETCH ... RFC822` returns) plus the envelope fields extracted once
 /// so `FETCH (UID ENVELOPE)` doesn't reparse on every request.
@@ -51,11 +53,20 @@ impl Mailbox {
 pub struct Store {
     pub users: HashMap<String, String>,
     pub mailboxes: HashMap<String, Mailbox>,
+    /// Broadcasts the name of any mailbox a delivery just landed in, so an
+    /// `IDLE` connection selected on that mailbox can push an untagged
+    /// `EXISTS` instead of the client having to poll (see `imap_server.rs`'s
+    /// `IDLE` handling). A plain `Mutex`-guarded field rather than something
+    /// fancier: `broadcast` already handles the "zero or many idling
+    /// connections care about this" fan-out, and `send` on no subscribers is
+    /// just a no-op `Err` every `deliver` call already ignores.
+    pub notify: broadcast::Sender<String>,
 }
 
 impl Store {
     pub fn new() -> Self {
-        Store { users: HashMap::new(), mailboxes: HashMap::new() }
+        let (notify, _) = broadcast::channel(32);
+        Store { users: HashMap::new(), mailboxes: HashMap::new(), notify }
     }
 
     pub fn add_user(&mut self, username: &str, password: &str) {
@@ -92,7 +103,9 @@ impl Store {
             .mailboxes
             .entry(recipient_mailbox.to_string())
             .or_insert_with(|| Mailbox::new(recipient_mailbox, 1));
-        mailbox.append(raw, envelope)
+        let uid = mailbox.append(raw, envelope);
+        let _ = self.notify.send(recipient_mailbox.to_string());
+        uid
     }
 }
 

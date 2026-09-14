@@ -1,6 +1,18 @@
 //! A minimal IMAP4rev1 server -- just enough of the protocol for esmail's
 //! `imap.rs` to drive: `LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
-//! `UID FETCH RFC822`, `LOGOUT`. Nothing else esmail sends is implemented.
+//! `UID FETCH RFC822`, `IDLE`, `LOGOUT`. Nothing else esmail sends is
+//! implemented.
+//!
+//! `IDLE` (RFC 2177) pushes an untagged `* N EXISTS` as soon as
+//! `Store::deliver` lands a message in the selected mailbox, by subscribing
+//! to `store.notify` (a `tokio::sync::broadcast` fed on every delivery) for
+//! as long as the client is idling. This is deliberately the *only* signal
+//! IDLE reports here -- no `EXPUNGE`, no flag-change `FETCH` -- since
+//! nothing in this server ever removes a message or changes a flag; a real
+//! server's IDLE can report either, and `esmail::idle_watch`'s client-side
+//! handling treats any push as "something changed, go re-`EXAMINE`" rather
+//! than trying to parse which kind, so this narrower mock is still a
+//! faithful test of that contract.
 //!
 //! Every response that carries a string uses IMAP's `{n}\r\n<bytes>` literal
 //! syntax instead of quoted strings. Literals need no escaping for any
@@ -247,8 +259,60 @@ where
                 return Ok(());
             }
             "CAPABILITY" => {
-                write_half.write_all(b"* CAPABILITY IMAP4rev1\r\n").await?;
+                write_half.write_all(b"* CAPABILITY IMAP4rev1 IDLE\r\n").await?;
                 write_half.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes()).await?;
+            }
+            "IDLE" => {
+                if authenticated_user.is_none() {
+                    write_half.write_all(format!("{tag} NO not authenticated\r\n").as_bytes()).await?;
+                    continue;
+                }
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                write_half.write_all(b"+ idling\r\n").await?;
+                let mut changes = store.lock().unwrap().notify.subscribe();
+                // A fresh `String` rather than reusing the outer `line`: the
+                // outer loop's `line` gets shadowed to `&str` a few lines up
+                // (`let line = line.trim_end_matches(...)`), so that binding
+                // isn't a `String` (with `.clear()`/`read_line`'s `&mut
+                // String`) in this scope any more.
+                let mut idle_line = String::new();
+                loop {
+                    idle_line.clear();
+                    tokio::select! {
+                        n = reader.read_line(&mut idle_line) => {
+                            let n = n?;
+                            if n == 0 {
+                                return Ok(()); // client closed the connection mid-IDLE
+                            }
+                            if idle_line.trim_end_matches(['\r', '\n']).eq_ignore_ascii_case("DONE") {
+                                write_half.write_all(format!("{tag} OK IDLE terminated\r\n").as_bytes()).await?;
+                                break;
+                            }
+                            // RFC 2177 only expects DONE while idling; anything
+                            // else is silently ignored rather than treated as a
+                            // new command, matching real servers' behavior.
+                        }
+                        changed = changes.recv() => {
+                            // `Lagged` (a burst of deliveries overran the
+                            // channel's buffer) and `Closed` both just mean
+                            // "keep idling" here -- a lagged receiver still
+                            // gets the *next* delivery, and closed can't
+                            // happen while `store` (which owns the sender)
+                            // outlives every connection.
+                            if let Ok(mailbox) = changed {
+                                if mailbox == mailbox_name {
+                                    let exists = store.lock().unwrap().mailbox(&mailbox_name).map(|mb| mb.messages.len());
+                                    if let Some(exists) = exists {
+                                        write_half.write_all(format!("* {exists} EXISTS\r\n").as_bytes()).await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "NOOP" => {
                 write_half.write_all(format!("{tag} OK NOOP completed\r\n").as_bytes()).await?;

@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use esmail::compose::ComposeState;
+use esmail::idle_watch;
 use esmail::imap::{ImapActor, ImapCommand, ImapEvent};
 use esmail::smtp::{SmtpAccount, SmtpActor, SmtpCommand, SmtpEvent};
 use secrecy::SecretString;
@@ -259,6 +260,58 @@ async fn disconnected_session_reconnects_and_serves_the_next_request() {
         }
     }
     assert!(saw_disconnected);
+}
+
+/// `idle_watch`'s reason to exist: a push should arrive close to
+/// instantly, well inside `RECV_TIMEOUT`, rather than needing
+/// `spawn_new_mail_watch`'s 60-second poll timer to notice. This is the one
+/// test in this file for `mail-mock-server`'s `IDLE` handling too --
+/// `imap_server.rs`'s untagged-`EXISTS`-on-delivery push and `idle_watch`'s
+/// client side are really one feature, verified together.
+#[tokio::test]
+async fn idle_push_notifies_of_new_mail_without_polling() {
+    skip_unless_ca_trusted!();
+    let h = start_harness(0).await; // 2 fixtures already in INBOX
+
+    let (wake_tx, mut wake_rx) = mpsc::channel(4);
+    idle_watch::spawn(
+        "localhost".to_string(),
+        h.server.imap_addr.port(),
+        TEST_USER.to_string(),
+        SecretString::from(TEST_PASSWORD),
+        "INBOX".to_string(),
+        wake_tx,
+    );
+
+    // `idle_watch::spawn`'s connect+login+EXAMINE+IDLE-init round trip
+    // (three real TCP/TLS exchanges) has no observable "now idling" signal
+    // from outside the module -- deliberately: adding one would mean
+    // production code carrying a test-only hook. A push landing before the
+    // client has actually started idling is silently missed by design (RFC
+    // 2177 IDLE, like this mock's implementation of it, only pushes to
+    // connections already idling), so instead of guessing a delay, retry
+    // delivery every 500ms until a push arrives or the outer timeout gives
+    // up -- once the connection *is* idling, the very next delivery is
+    // always seen.
+    let deliver = || {
+        let mut store = h.server.store.lock().unwrap();
+        store.deliver(
+            "INBOX",
+            b"From: bob@example.com\r\nTo: alice@example.com\r\nSubject: pushed\r\n\r\nhi\r\n".to_vec(),
+        );
+    };
+
+    let result = timeout(RECV_TIMEOUT, async {
+        loop {
+            deliver();
+            if let Ok(Some(idle_watch::MailboxChanged)) = timeout(Duration::from_millis(500), wake_rx.recv()).await {
+                return;
+            }
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "expected a MailboxChanged push within {RECV_TIMEOUT:?} of repeated deliveries (is the test CA actually trusted?)");
 }
 
 mod stress {
