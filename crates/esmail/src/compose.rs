@@ -143,6 +143,7 @@ mod tests {
             to: "Bob <bob@example.com>".to_string(),
             date: "Mon, 1 Jan 2026 12:00:00 +0000".to_string(),
             message_id: "<abc123@example.com>".to_string(),
+            flags: Vec::new(),
         }
     }
 

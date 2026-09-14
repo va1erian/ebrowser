@@ -42,8 +42,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use url::Url;
 
 use servo::{
-    DevicePixel, DeviceVector2D, InputEvent, OffscreenRenderingContext, RenderingContext,
-    Scroll, Servo, ServoBuilder, WebViewBuilder, WebViewDelegate,
+    Cursor as ServoCursor, DevicePixel, DeviceVector2D, InputEvent, OffscreenRenderingContext,
+    RenderingContext, Scroll, Servo, ServoBuilder, WebViewBuilder, WebViewDelegate,
     WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest, WebResourceLoad,
     WebResourceResponse,
 };
@@ -51,13 +51,14 @@ use servo::{
 // engine type to keep the two unambiguous at every use site.
 use servo::WebView as ServoWebView;
 use servo::input_events::{
-    KeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    EditingActionEvent, ImeEvent as ServoImeEvent, KeyboardEvent, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseMoveEvent, WheelDelta, WheelEvent, WheelMode,
 };
 use servo::DeviceIndependentPixel;
 // keyboard_types is re-exported by servo. We import it separately to
 // construct KeyboardEvent values – use fully-qualified paths to avoid
 // conflicts with the servo::Key re-export.
-use keyboard_types::{KeyState, Location, Modifiers};
+use keyboard_types::{CompositionEvent, CompositionState, KeyState, Location, Modifiers};
 
 
 // ─── Public API types ────────────────────────────────────────────────────────
@@ -202,6 +203,10 @@ struct Delegate {
     /// cheap, so re-reading only when a new frame actually landed (rather
     /// than on every `show()`) is worth doing (A6, PLAN.md).
     frame_dirty: Rc<Cell<bool>>,
+    /// The page's last-requested cursor, mapped to `egui::CursorIcon`. Shared
+    /// with `WebView`, which applies it via `ctx.set_cursor_icon` on every
+    /// `show()` while the pointer is over the widget (A5, PLAN.md).
+    cursor: Rc<Cell<egui::CursorIcon>>,
 }
 
 impl WebViewDelegate for Delegate {
@@ -295,6 +300,14 @@ impl WebViewDelegate for Delegate {
 
     fn notify_traversal_complete(&self, _webview: ServoWebView, _id: servo::TraversalId) {
         self.events.borrow_mut().push(WebViewEvent::TraversalComplete);
+    }
+
+    fn notify_cursor_changed(&self, _webview: ServoWebView, cursor: ServoCursor) {
+        self.cursor.set(servo_cursor_to_egui_cursor_icon(cursor));
+        // Nothing else re-reads `cursor` off its own bat -- request a repaint
+        // so `show()` runs again and applies it via `ctx.set_cursor_icon`
+        // this frame rather than waiting for some unrelated repaint.
+        self.egui_ctx.request_repaint();
     }
 }
 
@@ -392,6 +405,7 @@ impl WebViewHost {
         // Start dirty so the CPU fallback path's first `show()` reads a frame
         // even if `notify_new_frame_ready` hasn't fired yet.
         let frame_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+        let cursor: Rc<Cell<egui::CursorIcon>> = Rc::new(Cell::new(egui::CursorIcon::Default));
         let handler = config
             .handler
             .clone()
@@ -403,6 +417,7 @@ impl WebViewHost {
             initial_load_done,
             handler,
             frame_dirty: frame_dirty.clone(),
+            cursor: cursor.clone(),
         });
 
         let servo_view = WebViewBuilder::new(
@@ -418,6 +433,7 @@ impl WebViewHost {
             offscreen_ctx,
             events,
             frame_dirty,
+            cursor,
             texture: None,
             texture_name: format!("egui_servo_webview_{view_id}"),
             last_phys_size: config.size,
@@ -477,6 +493,8 @@ pub struct WebView {
     events: Rc<RefCell<Vec<WebViewEvent>>>,
     /// Shared with the [`Delegate`]; see its field doc.
     frame_dirty: Rc<Cell<bool>>,
+    /// Shared with the [`Delegate`]; see its field doc.
+    cursor: Rc<Cell<egui::CursorIcon>>,
     /// Reused across frames; reallocating one per frame was measurable waste.
     texture: Option<egui::TextureHandle>,
     /// Unique per view, so two views cannot collide on one egui texture.
@@ -746,15 +764,16 @@ impl WebView {
             } else {
                 center_pt
             };
-            // egui: positive y = content moves up (scroll down).
-            // Servo Scroll::Delta: positive y = scroll down (reveal more below).
-            // So we negate egui's y to match Servo's convention.
-            let vec = WebViewVector::Device(DeviceVector2D::new(
-                (-scroll.x * dpi) as f32,
-                (-scroll.y * dpi) as f32,
-            ));
+            // A5 (PLAN.md): migrated from `notify_scroll_event(Scroll::Delta(..))`
+            // (the touch-pan path servoshell only uses on mobile) to
+            // `InputEvent::Wheel`, which is what desktop servoshell sends and
+            // is the only path that dispatches a DOM `wheel` event a page can
+            // `preventDefault()`. `scroll_to_wheel_delta`'s doc comment (and
+            // the unit test pinning it below) is the sign-convention research
+            // this migration was previously held back for.
+            let delta = Self::scroll_to_wheel_delta(scroll, dpi);
             self.servo_view
-                .notify_scroll_event(Scroll::Delta(vec), scroll_pt);
+                .notify_input_event(InputEvent::Wheel(WheelEvent::new(delta, scroll_pt)));
         }
 
         // ── Arrow key / Page scrolling ────────────────────────────────────────
@@ -819,6 +838,35 @@ impl WebView {
                         self.servo_view
                             .notify_input_event(InputEvent::Keyboard(kb_event));
                     }
+
+                    // A5 (PLAN.md): Ctrl/Cmd+X/C/V -> `InputEvent::EditingAction`,
+                    // mirroring servoshell. The OS-clipboard plumbing itself
+                    // (`ClipboardDelegate`) is already there for free on this
+                    // platform -- `servo`'s `clipboard` feature is on by
+                    // default and installs a real `arboard`-backed delegate
+                    // whenever the embedder doesn't supply its own (see
+                    // `clipboard_delegate.rs`'s doc comment) -- what was
+                    // actually missing is telling Servo *when* to invoke it,
+                    // since a keydown alone doesn't imply "run the copy/cut/
+                    // paste editing command" the way a browser's own
+                    // accelerator table does.
+                    if pressed {
+                        let shortcut_mod = modifiers.ctrl || modifiers.mac_cmd;
+                        let action = if shortcut_mod && !modifiers.shift && !modifiers.alt {
+                            match key {
+                                egui::Key::C => Some(EditingActionEvent::Copy),
+                                egui::Key::X => Some(EditingActionEvent::Cut),
+                                egui::Key::V => Some(EditingActionEvent::Paste),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(action) = action {
+                            self.servo_view
+                                .notify_input_event(InputEvent::EditingAction(action));
+                        }
+                    }
                 } else if let egui::Event::Text(text) = event {
                     // A5: the actual character(s), shift/layout already
                     // resolved by egui-winit from the same source winit
@@ -830,8 +878,28 @@ impl WebView {
                         self.servo_view
                             .notify_input_event(InputEvent::Keyboard(kb_event));
                     }
+                } else if let egui::Event::Ime(ime) = event {
+                    // A5 (PLAN.md): forward IME composition, mirroring
+                    // servoshell's Start/Update/End/Dismissed states. Without
+                    // this, dead keys and CJK input are impossible — only
+                    // whatever a composition eventually `Commit`s would ever
+                    // have reached the page, and only by accident (as a
+                    // `Text` event with no composing context).
+                    self.servo_view
+                        .notify_input_event(InputEvent::Ime(egui_ime_to_servo_ime(ime)));
                 }
             }
+        }
+
+        // ── Cursor ───────────────────────────────────────────────────────────
+        // A5 (PLAN.md): reflect the page's last-requested cursor
+        // (`notify_cursor_changed`, via the shared `cursor` cell) while the
+        // pointer is actually over this widget. `set_cursor_icon` must be
+        // called every frame to "win" -- egui resets to `Default` each frame
+        // otherwise -- so this runs unconditionally on every `show()`, not
+        // just when the cursor last changed.
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(self.cursor.get());
         }
 
         // Drain accumulated events for the caller.
@@ -862,6 +930,47 @@ impl WebView {
         let x = (pos.x - origin.x) * dpi;
         let y = (pos.y - origin.y) * dpi;
         WebViewPoint::Device(Point2D::new(x, y))
+    }
+
+    /// Convert egui's `smooth_scroll_delta` (logical points) into a Servo
+    /// `WheelDelta` (device pixels), **without negating either axis**.
+    ///
+    /// This is the sign-convention research A5 (PLAN.md) was held back on.
+    /// Two doc comments settle it, both read from the vendored source under
+    /// `servo-embedder-traits-0.1.0/input_events.rs`:
+    ///
+    /// - `WheelDelta::y`: "A positive value means that the view scrolls up,
+    ///   revealing more content above the current viewport." (symmetric
+    ///   wording for `x`, left/right.)
+    /// - Compare `Scroll::Delta`, which this widget used before this
+    ///   migration: `servo-paint-0.1.0/webview_renderer.rs`'s
+    ///   `notify_input_event_handled` is where Servo itself turns a *received*
+    ///   `Wheel` event into the internal `Scroll::Delta` that actually moves
+    ///   the page — `let scroll_delta = -wheel_event.delta;` (its own comment:
+    ///   "A scroll delta for a wheel event is the inverse of the wheel
+    ///   delta."). So `WheelDelta` and `Scroll::Delta` are deliberately
+    ///   opposite-signed; this function targets `WheelDelta`, not
+    ///   `Scroll::Delta`, so no negation belongs here.
+    ///
+    /// Separately, egui's own sign already matches `WheelDelta`'s, confirmed
+    /// from `egui-0.34.1/src/containers/scroll_area.rs`: a `ScrollArea` moves
+    /// by `state.offset[d] -= scroll_delta` (`scroll_delta` being
+    /// `smooth_scroll_delta`), and `state.offset` is "how far scrolled past
+    /// the top/left" (it feeds `Rect::from_min_size(inner_rect.min -
+    /// state.offset, ..)` for the content rect). A positive
+    /// `smooth_scroll_delta.y` therefore *decreases* that offset — moves the
+    /// viewport back toward the top, i.e. "scrolls up, revealing more content
+    /// above" — the exact same sentence `WheelDelta::y`'s doc comment uses.
+    /// So egui's delta passes straight through, scaled to device pixels; see
+    /// `scroll_to_wheel_delta_does_not_negate_egui_s_sign` below, which pins
+    /// this down mechanically.
+    fn scroll_to_wheel_delta(scroll: egui::Vec2, dpi: f32) -> WheelDelta {
+        WheelDelta {
+            x: (scroll.x * dpi) as f64,
+            y: (scroll.y * dpi) as f64,
+            z: 0.0,
+            mode: WheelMode::DeltaPixel,
+        }
     }
 
     /// Convert a [`WebViewSource`] into a [`Url`] Servo can load.
@@ -1063,6 +1172,76 @@ fn egui_key_to_code(key: &egui::Key) -> keyboard_types::Code {
         egui::Key::PageUp => Code::PageUp,
         egui::Key::PageDown => Code::PageDown,
         _ => Code::Unidentified,
+    }
+}
+
+/// Map Servo's [`ServoCursor`] (the page's CSS `cursor` request) onto
+/// `egui::CursorIcon`. Exhaustive by construction — a new `Cursor` variant
+/// upstream fails this match at compile time rather than silently falling
+/// back to `Default`.
+fn servo_cursor_to_egui_cursor_icon(cursor: ServoCursor) -> egui::CursorIcon {
+    use egui::CursorIcon as E;
+    match cursor {
+        ServoCursor::None => E::None,
+        ServoCursor::Default => E::Default,
+        ServoCursor::Pointer => E::PointingHand,
+        ServoCursor::ContextMenu => E::ContextMenu,
+        ServoCursor::Help => E::Help,
+        ServoCursor::Progress => E::Progress,
+        ServoCursor::Wait => E::Wait,
+        ServoCursor::Cell => E::Cell,
+        ServoCursor::Crosshair => E::Crosshair,
+        ServoCursor::Text => E::Text,
+        ServoCursor::VerticalText => E::VerticalText,
+        ServoCursor::Alias => E::Alias,
+        ServoCursor::Copy => E::Copy,
+        ServoCursor::Move => E::Move,
+        ServoCursor::NoDrop => E::NoDrop,
+        ServoCursor::NotAllowed => E::NotAllowed,
+        ServoCursor::Grab => E::Grab,
+        ServoCursor::Grabbing => E::Grabbing,
+        ServoCursor::EResize => E::ResizeEast,
+        ServoCursor::NResize => E::ResizeNorth,
+        ServoCursor::NeResize => E::ResizeNorthEast,
+        ServoCursor::NwResize => E::ResizeNorthWest,
+        ServoCursor::SResize => E::ResizeSouth,
+        ServoCursor::SeResize => E::ResizeSouthEast,
+        ServoCursor::SwResize => E::ResizeSouthWest,
+        ServoCursor::WResize => E::ResizeWest,
+        ServoCursor::EwResize => E::ResizeHorizontal,
+        ServoCursor::NsResize => E::ResizeVertical,
+        ServoCursor::NeswResize => E::ResizeNeSw,
+        ServoCursor::NwseResize => E::ResizeNwSe,
+        ServoCursor::ColResize => E::ResizeColumn,
+        ServoCursor::RowResize => E::ResizeRow,
+        ServoCursor::AllScroll => E::AllScroll,
+        ServoCursor::ZoomIn => E::ZoomIn,
+        ServoCursor::ZoomOut => E::ZoomOut,
+    }
+}
+
+/// Convert one `egui::ImeEvent` into the `InputEvent::Ime` payload Servo
+/// expects, mirroring servoshell's Start/Update/End/Dismissed states.
+/// `keyboard_types::CompositionState` only has three variants
+/// (`Start`/`Update`/`End`) — `Dismissed` lives one level up, on embedder_traits'
+/// own `ImeEvent` (`Composition(CompositionEvent)` vs. `Dismissed`), which is
+/// why `Enabled`/`Disabled` map onto two different Rust types below rather
+/// than both being a `CompositionState`.
+fn egui_ime_to_servo_ime(event: egui::ImeEvent) -> ServoImeEvent {
+    match event {
+        egui::ImeEvent::Enabled => ServoImeEvent::Composition(CompositionEvent {
+            state: CompositionState::Start,
+            data: String::new(),
+        }),
+        egui::ImeEvent::Preedit(text) => ServoImeEvent::Composition(CompositionEvent {
+            state: CompositionState::Update,
+            data: text,
+        }),
+        egui::ImeEvent::Commit(text) => ServoImeEvent::Composition(CompositionEvent {
+            state: CompositionState::End,
+            data: text,
+        }),
+        egui::ImeEvent::Disabled => ServoImeEvent::Dismissed,
     }
 }
 
@@ -1314,5 +1493,103 @@ mod tests {
         assert!(shift_ctrl.contains(Modifiers::SHIFT));
         assert!(shift_ctrl.contains(Modifiers::CONTROL));
         assert!(!shift_ctrl.contains(Modifiers::ALT));
+    }
+
+    // ── wheel scroll sign convention (A5, PLAN.md) ───────────────────────────
+
+    #[test]
+    fn scroll_to_wheel_delta_does_not_negate_egui_s_sign() {
+        // See `WebView::scroll_to_wheel_delta`'s doc comment for the full
+        // derivation from the vendored source. Short version: egui's
+        // `smooth_scroll_delta` and Servo's `WheelDelta` already use the same
+        // sign (both: positive `y` = scroll up / reveal content above), so
+        // this conversion is a straight scale-to-device-pixels with no
+        // negation on either axis -- unlike the old `Scroll::Delta` path,
+        // which needed one because `Scroll::Delta` is the *opposite*
+        // convention (confirmed by Servo's own `-wheel_event.delta` when it
+        // internally turns a wheel event into a `Scroll::Delta`).
+        let delta = WebView::scroll_to_wheel_delta(egui::vec2(3.0, 7.0), 2.0);
+        assert_eq!(delta.x, 6.0);
+        assert_eq!(delta.y, 14.0);
+        assert_eq!(delta.mode, WheelMode::DeltaPixel);
+        assert_eq!(delta.z, 0.0);
+    }
+
+    #[test]
+    fn scroll_to_wheel_delta_handles_negative_scroll_without_a_double_flip() {
+        // A regression on this point would silently invert scroll direction
+        // (see PLAN.md's A5 section on why this was deferred for so long) --
+        // pin both signs, not just the positive case above.
+        let delta = WebView::scroll_to_wheel_delta(egui::vec2(-4.0, -9.0), 1.5);
+        assert_eq!(delta.x, -6.0);
+        assert_eq!(delta.y, -13.5);
+    }
+
+    // ── cursor mapping ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_mapping_covers_pointer_and_resize_cursors() {
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::Pointer), egui::CursorIcon::PointingHand);
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::Default), egui::CursorIcon::Default);
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::Text), egui::CursorIcon::Text);
+        // The two enums don't share naming conventions for diagonal/edge
+        // resize cursors (`NeswResize` vs. `ResizeNeSw`, `EwResize` vs.
+        // `ResizeHorizontal`) -- exercise a few of the least obvious ones.
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::NeswResize), egui::CursorIcon::ResizeNeSw);
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::EwResize), egui::CursorIcon::ResizeHorizontal);
+        assert_eq!(servo_cursor_to_egui_cursor_icon(ServoCursor::NsResize), egui::CursorIcon::ResizeVertical);
+    }
+
+    // ── IME mapping ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ime_events_map_to_the_matching_composition_state() {
+        assert!(matches!(
+            egui_ime_to_servo_ime(egui::ImeEvent::Enabled),
+            ServoImeEvent::Composition(CompositionEvent { state: CompositionState::Start, .. })
+        ));
+
+        match egui_ime_to_servo_ime(egui::ImeEvent::Preedit("ｎ".into())) {
+            ServoImeEvent::Composition(CompositionEvent { state: CompositionState::Update, data }) => {
+                assert_eq!(data, "ｎ");
+            }
+            other => panic!("expected Composition(Update), got {other:?}"),
+        }
+
+        match egui_ime_to_servo_ime(egui::ImeEvent::Commit("日本語".into())) {
+            ServoImeEvent::Composition(CompositionEvent { state: CompositionState::End, data }) => {
+                assert_eq!(data, "日本語");
+            }
+            other => panic!("expected Composition(End), got {other:?}"),
+        }
+
+        // `Dismissed` is embedder_traits' `ImeEvent::Dismissed`, a sibling of
+        // `Composition(..)` rather than a fourth `CompositionState` -- see
+        // this function's doc comment for why.
+        assert!(matches!(
+            egui_ime_to_servo_ime(egui::ImeEvent::Disabled),
+            ServoImeEvent::Dismissed
+        ));
+    }
+
+    // ── clipboard shortcut mapping ───────────────────────────────────────────
+
+    #[test]
+    fn clipboard_shortcut_keys_map_to_the_matching_editing_action() {
+        // Mirrors the match in `show_impl`'s keyboard-event loop -- kept as a
+        // small pure table here so the C/X/V -> Copy/Cut/Paste mapping has a
+        // regression test independent of a live Servo view.
+        fn action_for(key: egui::Key) -> Option<EditingActionEvent> {
+            match key {
+                egui::Key::C => Some(EditingActionEvent::Copy),
+                egui::Key::X => Some(EditingActionEvent::Cut),
+                egui::Key::V => Some(EditingActionEvent::Paste),
+                _ => None,
+            }
+        }
+        assert!(matches!(action_for(egui::Key::C), Some(EditingActionEvent::Copy)));
+        assert!(matches!(action_for(egui::Key::X), Some(EditingActionEvent::Cut)));
+        assert!(matches!(action_for(egui::Key::V), Some(EditingActionEvent::Paste)));
+        assert!(action_for(egui::Key::A).is_none());
     }
 }

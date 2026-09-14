@@ -57,6 +57,94 @@ impl AccountConfig {
     }
 }
 
+/// IMAP/SMTP settings for one known provider, looked up by email domain
+/// (B9's first-run wizard). Unlike [`derive_smtp_host`] — a mechanical
+/// `imap.` → `smtp.` string transform applied to a host the user already
+/// typed — this goes the other way: from just the domain half of an email
+/// address to a complete guess at both hosts, ports and TLS modes, for
+/// providers where the mechanical convention doesn't hold (`gmail.com`'s
+/// mail lives at `imap.gmail.com`, not `imap.gmail.com` derived from
+/// `gmail.com` by any string rule; Outlook's consumer and Yahoo's IMAP host
+/// names aren't `imap.<domain>` either).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProviderSettings {
+    pub imap_host: &'static str,
+    pub imap_port: u16,
+    pub smtp_host: &'static str,
+    pub smtp_port: u16,
+}
+
+/// A small built-in table of well-known consumer providers, keyed by the
+/// domain half of an email address (lowercased). Deliberately short — this
+/// is a convenience for the common case, not an attempt at the exhaustive
+/// provider databases Thunderbird/Outlook ship; anything not listed here
+/// falls back to [`derive_smtp_host`]'s mechanical guess once the user types
+/// an IMAP host directly. OAuth2 is out of scope for v1 (see README), so
+/// Gmail and Outlook accounts still need an app password even though their
+/// connection settings are guessed correctly here.
+const PROVIDERS: &[(&str, ProviderSettings)] = &[
+    (
+        "gmail.com",
+        ProviderSettings { imap_host: "imap.gmail.com", imap_port: 993, smtp_host: "smtp.gmail.com", smtp_port: 465 },
+    ),
+    (
+        "googlemail.com",
+        ProviderSettings { imap_host: "imap.gmail.com", imap_port: 993, smtp_host: "smtp.gmail.com", smtp_port: 465 },
+    ),
+    (
+        "outlook.com",
+        ProviderSettings { imap_host: "outlook.office365.com", imap_port: 993, smtp_host: "smtp.office365.com", smtp_port: 587 },
+    ),
+    (
+        "hotmail.com",
+        ProviderSettings { imap_host: "outlook.office365.com", imap_port: 993, smtp_host: "smtp.office365.com", smtp_port: 587 },
+    ),
+    (
+        "live.com",
+        ProviderSettings { imap_host: "outlook.office365.com", imap_port: 993, smtp_host: "smtp.office365.com", smtp_port: 587 },
+    ),
+    (
+        "yahoo.com",
+        ProviderSettings { imap_host: "imap.mail.yahoo.com", imap_port: 993, smtp_host: "smtp.mail.yahoo.com", smtp_port: 465 },
+    ),
+    (
+        "icloud.com",
+        ProviderSettings { imap_host: "imap.mail.me.com", imap_port: 993, smtp_host: "smtp.mail.me.com", smtp_port: 587 },
+    ),
+    (
+        "me.com",
+        ProviderSettings { imap_host: "imap.mail.me.com", imap_port: 993, smtp_host: "smtp.mail.me.com", smtp_port: 587 },
+    ),
+    (
+        "fastmail.com",
+        ProviderSettings { imap_host: "imap.fastmail.com", imap_port: 993, smtp_host: "smtp.fastmail.com", smtp_port: 465 },
+    ),
+    (
+        "gmx.com",
+        ProviderSettings { imap_host: "imap.gmx.com", imap_port: 993, smtp_host: "smtp.gmx.com", smtp_port: 465 },
+    ),
+    (
+        "zoho.com",
+        ProviderSettings { imap_host: "imap.zoho.com", imap_port: 993, smtp_host: "smtp.zoho.com", smtp_port: 465 },
+    ),
+];
+
+/// Look up known settings for `email`'s domain, case-insensitively. Returns
+/// `None` for an address with no `@`, an empty domain, or a domain not in
+/// [`PROVIDERS`] — the caller (the login screen) falls back to letting the
+/// user type the IMAP host directly, from which [`derive_smtp_host`] takes
+/// over.
+pub fn provider_for_email(email: &str) -> Option<ProviderSettings> {
+    let domain = email.rsplit_once('@')?.1.trim().to_ascii_lowercase();
+    if domain.is_empty() {
+        return None;
+    }
+    PROVIDERS
+        .iter()
+        .find(|(d, _)| *d == domain)
+        .map(|(_, settings)| *settings)
+}
+
 /// Guess an SMTP host from an IMAP one, using the common `imap.` → `smtp.`
 /// naming convention (e.g. `imap.gmail.com` → `smtp.gmail.com`). Falls back
 /// to prefixing `smtp.` when the IMAP host doesn't start with `imap.` (e.g.
@@ -71,12 +159,63 @@ fn derive_smtp_host(imap_host: &str) -> String {
     }
 }
 
+/// Light/dark theme preference (B9). Deliberately its own type rather than
+/// reusing `egui::ThemePreference` — `config.rs` otherwise has no dependency
+/// on egui, and keeping it that way means these variants (and their `serde`
+/// round-trip, tested below) don't depend on egui's own `serde` feature flag
+/// being enabled. `main.rs` converts to/from `egui::ThemePreference` at the
+/// one call site that needs it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+    #[default]
+    System,
+}
+
+impl ThemeMode {
+    /// Cycle Dark -> Light -> System -> Dark, for a single toggle button
+    /// rather than a picker with three separate options.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::System,
+            Self::System => Self::Dark,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::System => "System",
+        }
+    }
+}
+
+/// Saved window position/size (B9), in the same "monitor space, ui points"
+/// units `egui::ViewportInfo::outer_rect` reports them in. `f32` (not a
+/// screen-pixel integer type) to match that directly with no conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// All configured accounts. Serialized as TOML to
 /// `<config dir>/esmail/config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub theme: ThemeMode,
+    /// `None` until a window has actually been closed once — the very first
+    /// run uses eframe's own built-in default size instead of forcing one.
+    #[serde(default)]
+    pub window: Option<WindowGeometry>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -279,5 +418,81 @@ mod tests {
         assert!(!config.migrate_legacy_content("only one line"));
         assert!(!config.migrate_legacy_content("\n993\nalice")); // empty host
         assert_eq!(config.accounts.len(), 0);
+    }
+
+    // ── theme ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn theme_mode_defaults_to_system() {
+        assert_eq!(ThemeMode::default(), ThemeMode::System);
+    }
+
+    #[test]
+    fn theme_mode_cycles_dark_light_system() {
+        assert_eq!(ThemeMode::Dark.next(), ThemeMode::Light);
+        assert_eq!(ThemeMode::Light.next(), ThemeMode::System);
+        assert_eq!(ThemeMode::System.next(), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn config_with_theme_and_window_round_trips_through_toml() {
+        let config = Config {
+            accounts: vec![],
+            theme: ThemeMode::Dark,
+            window: Some(WindowGeometry { x: 10.0, y: 20.0, width: 800.0, height: 600.0 }),
+        };
+        let toml = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    /// An old `config.toml` written before B9 added `theme`/`window` has
+    /// neither field; `#[serde(default)]` must still parse it rather than
+    /// erroring the whole file out (which would silently drop every saved
+    /// account, per `Config::load`'s fallback).
+    #[test]
+    fn config_without_theme_or_window_fields_still_parses() {
+        let toml = "accounts = []\n";
+        let parsed: Config = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.theme, ThemeMode::System);
+        assert_eq!(parsed.window, None);
+    }
+
+    // ── provider_for_email ──────────────────────────────────────────────────
+
+    #[test]
+    fn provider_for_email_finds_gmail() {
+        let settings = provider_for_email("alice@gmail.com").unwrap();
+        assert_eq!(settings.imap_host, "imap.gmail.com");
+        assert_eq!(settings.smtp_host, "smtp.gmail.com");
+        assert_eq!(settings.smtp_port, 465);
+    }
+
+    #[test]
+    fn provider_for_email_is_case_insensitive_on_the_domain() {
+        let settings = provider_for_email("Alice@GMAIL.COM").unwrap();
+        assert_eq!(settings.imap_host, "imap.gmail.com");
+    }
+
+    #[test]
+    fn provider_for_email_finds_outlook_with_starttls() {
+        let settings = provider_for_email("bob@outlook.com").unwrap();
+        assert_eq!(settings.imap_host, "outlook.office365.com");
+        assert_eq!(settings.smtp_port, 587);
+    }
+
+    #[test]
+    fn provider_for_email_returns_none_for_unknown_domains() {
+        assert_eq!(provider_for_email("alice@my-own-mail-server.example"), None);
+    }
+
+    #[test]
+    fn provider_for_email_returns_none_without_an_at_sign() {
+        assert_eq!(provider_for_email("not-an-email"), None);
+    }
+
+    #[test]
+    fn provider_for_email_returns_none_for_an_empty_domain() {
+        assert_eq!(provider_for_email("alice@"), None);
     }
 }

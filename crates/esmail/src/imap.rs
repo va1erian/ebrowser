@@ -36,6 +36,202 @@ pub struct MailHeader {
     /// included (that's how `In-Reply-To`/`References` expect it). Empty
     /// when the server's ENVELOPE didn't include one — rare, but legal.
     pub message_id: String,
+    /// Raw IMAP flags (e.g. `"\Seen"`, `"\Flagged"`, `"\Deleted"`) as of the
+    /// most recent fetch (B8) -- every header/envelope fetch now asks for
+    /// `FLAGS` alongside `ENVELOPE`, since the header list needs it for
+    /// unread/star rendering. Empty for a header built somewhere that never
+    /// had flags to report (e.g. `compose.rs`'s reply/forward derivation,
+    /// which fabricates a `MailHeader` from the message being replied to).
+    pub flags: Vec<String>,
+}
+
+impl MailHeader {
+    pub fn is_seen(&self) -> bool {
+        self.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"))
+    }
+
+    pub fn is_flagged(&self) -> bool {
+        self.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Flagged"))
+    }
+}
+
+/// Well-known IMAP flag names as `main.rs`/`imap.rs` construct `STORE`
+/// queries with them -- kept as constants rather than repeated string
+/// literals so a typo in one call site doesn't silently create a flag no
+/// server recognizes.
+pub const FLAG_SEEN: &str = "\\Seen";
+pub const FLAG_FLAGGED: &str = "\\Flagged";
+pub const FLAG_DELETED: &str = "\\Deleted";
+
+/// One mailbox as reported by `LIST` (B8): its full name, the server's
+/// hierarchy delimiter (so `main.rs` can split `"Work/Invoices"` into a
+/// tree), and a best-effort special-use classification for sorting
+/// well-known folders first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxInfo {
+    pub name: String,
+    pub delimiter: Option<String>,
+    pub special_use: Option<SpecialUse>,
+}
+
+/// RFC 6154 special-use roles this cares about sorting specially, plus a
+/// synthetic `Inbox` variant (RFC 6154 has no `\Inbox` attribute -- `INBOX`
+/// is special by name, not by attribute, in every real server) so the tree
+/// builder has one enum to sort all of "the folders every account has" by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpecialUse {
+    Inbox,
+    Sent,
+    Drafts,
+    Trash,
+    Archive,
+    Junk,
+}
+
+impl SpecialUse {
+    /// From a `LIST` response's name attributes, when the server advertises
+    /// RFC 6154 special-use.
+    fn from_attribute(attr: &async_imap::imap_proto::types::NameAttribute<'_>) -> Option<Self> {
+        use async_imap::imap_proto::types::NameAttribute;
+        match attr {
+            NameAttribute::Sent => Some(SpecialUse::Sent),
+            NameAttribute::Drafts => Some(SpecialUse::Drafts),
+            NameAttribute::Trash => Some(SpecialUse::Trash),
+            NameAttribute::Archive => Some(SpecialUse::Archive),
+            NameAttribute::Junk => Some(SpecialUse::Junk),
+            _ => None,
+        }
+    }
+
+    /// Name-based fallback for a server that doesn't advertise RFC 6154
+    /// special-use attributes (many don't) -- the same "hardcoded name,
+    /// documented gap" tradeoff `main.rs::SENT_MAILBOX` already makes for
+    /// picking a Sent folder to `APPEND` to (B7). Case-insensitive exact
+    /// match only, not a substring search, so a mailbox that merely
+    /// contains "sent" in a longer name (a filter folder called "Sent to
+    /// Boss", say) isn't misclassified.
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "inbox" => Some(SpecialUse::Inbox),
+            "sent" | "sent items" | "sent mail" => Some(SpecialUse::Sent),
+            "drafts" => Some(SpecialUse::Drafts),
+            "trash" | "deleted items" => Some(SpecialUse::Trash),
+            "archive" => Some(SpecialUse::Archive),
+            "junk" | "spam" | "junk e-mail" => Some(SpecialUse::Junk),
+            _ => None,
+        }
+    }
+}
+
+/// One node of the tree `mailbox_tree` builds from `LIST`'s flat output
+/// (B8), by splitting each mailbox's full name on the server's delimiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxNode {
+    /// This node's own path segment, e.g. `"Invoices"` for `"Work/Invoices"`.
+    pub label: String,
+    /// The full name to send back to the server (`EXAMINE`/`SELECT`/etc.) --
+    /// `None` for a hierarchy node that exists only because a deeper mailbox
+    /// implies it (e.g. `LIST` returned `"Work/Invoices"` but never
+    /// `"Work"` itself; real servers usually also return the intermediate
+    /// node, but nothing here assumes they do).
+    pub full_name: Option<String>,
+    pub special_use: Option<SpecialUse>,
+    pub children: Vec<MailboxNode>,
+}
+
+/// Turns `LIST`'s flat mailbox names into a tree by splitting each on its
+/// reported delimiter, sorting special-use folders (`INBOX` first, then
+/// `Sent`/`Drafts`/`Archive`/`Junk`/`Trash` in that fixed order) ahead of
+/// everything else, which sorts alphabetically. Pure and unit-tested without
+/// any server — see the tests below.
+pub fn mailbox_tree(mailboxes: &[MailboxInfo]) -> Vec<MailboxNode> {
+    let mut roots: Vec<MailboxNode> = Vec::new();
+
+    for mb in mailboxes {
+        let delimiter = mb.delimiter.as_deref().filter(|d| !d.is_empty());
+        let segments: Vec<&str> = match delimiter {
+            Some(d) => mb.name.split(d).filter(|s| !s.is_empty()).collect(),
+            None => vec![mb.name.as_str()],
+        };
+        insert_path(&mut roots, &segments, &mb.name, mb.special_use);
+    }
+
+    sort_tree(&mut roots);
+    roots
+}
+
+fn insert_path(nodes: &mut Vec<MailboxNode>, segments: &[&str], full_name: &str, special_use: Option<SpecialUse>) {
+    let Some((first, rest)) = segments.split_first() else { return };
+    let is_leaf = rest.is_empty();
+
+    let existing = nodes.iter_mut().find(|n| n.label == *first);
+    let node = match existing {
+        Some(n) => n,
+        None => {
+            nodes.push(MailboxNode { label: first.to_string(), full_name: None, special_use: None, children: Vec::new() });
+            nodes.last_mut().expect("just pushed")
+        }
+    };
+
+    if is_leaf {
+        node.full_name = Some(full_name.to_string());
+        node.special_use = special_use;
+    } else {
+        insert_path(&mut node.children, rest, full_name, special_use);
+    }
+}
+
+fn sort_tree(nodes: &mut [MailboxNode]) {
+    nodes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    for node in nodes.iter_mut() {
+        sort_tree(&mut node.children);
+    }
+}
+
+/// One row of a `mailbox_tree` flattened for a plain top-down list UI
+/// (`main.rs`'s mailbox panel isn't a real recursive tree widget --
+/// egui/immediate-mode makes an owned, borrow-free flat list far simpler to
+/// render with indentation than juggling `&mut self` through recursive
+/// closures).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxRow {
+    pub depth: usize,
+    pub label: String,
+    /// `None` for a hierarchy node with no mailbox of its own (see
+    /// `MailboxNode::full_name`) -- not selectable/clickable.
+    pub full_name: Option<String>,
+    pub special_use: Option<SpecialUse>,
+}
+
+/// Depth-first flatten of [`mailbox_tree`]'s output, in the same order the
+/// tree is already sorted in.
+pub fn flatten_tree(nodes: &[MailboxNode]) -> Vec<MailboxRow> {
+    let mut rows = Vec::new();
+    flatten_into(nodes, 0, &mut rows);
+    rows
+}
+
+fn flatten_into(nodes: &[MailboxNode], depth: usize, rows: &mut Vec<MailboxRow>) {
+    for node in nodes {
+        rows.push(MailboxRow { depth, label: node.label.clone(), full_name: node.full_name.clone(), special_use: node.special_use });
+        flatten_into(&node.children, depth + 1, rows);
+    }
+}
+
+/// `(special-use rank, label)`, so every `SpecialUse` variant sorts ahead of
+/// `None` (folders with no special role), and ties within each group sort
+/// alphabetically.
+fn sort_key(node: &MailboxNode) -> (u8, String) {
+    let rank = match node.special_use {
+        Some(SpecialUse::Inbox) => 0,
+        Some(SpecialUse::Sent) => 1,
+        Some(SpecialUse::Drafts) => 2,
+        Some(SpecialUse::Archive) => 3,
+        Some(SpecialUse::Junk) => 4,
+        Some(SpecialUse::Trash) => 5,
+        None => 6,
+    };
+    (rank, node.label.to_ascii_lowercase())
 }
 
 /// UIDVALIDITY/UIDNEXT as of the most recent `EXAMINE`/`SELECT`, read off
@@ -109,6 +305,28 @@ pub enum ImapCommand {
     /// name-based fallback, which PLAN.md §B7 still lists as a real,
     /// separate gap.
     Append { mailbox: String, raw: Vec<u8> },
+    /// Add/remove flags on one message (B8) -- `\Seen` on open (with a
+    /// mark-as-read delay), the star/flag toggle (`\Flagged`), and
+    /// mark-unread (`-\Seen`) all go through this one command. `req_id`
+    /// mirrors `FetchHeaders`/`FetchBody`'s staleness-guard pattern: a
+    /// mark-as-read timer that fires after the user already moved to a
+    /// different message shouldn't apply to the new one.
+    StoreFlags { mailbox: String, uid: u32, add: Vec<String>, remove: Vec<String>, req_id: u64 },
+    /// Move one message to `dest` (B8's delete-to-Trash and archive). Tries
+    /// the real `MOVE` extension first; if the server doesn't support it (or
+    /// the attempt otherwise fails), falls back to `COPY` + `STORE
+    /// +FLAGS.SILENT \Deleted` + `EXPUNGE`, mechanically what `MOVE` is
+    /// defined to do anyway (see `async_imap::Session::mv`'s own doc). See
+    /// `ImapActor::move_message`.
+    MoveMessage { mailbox: String, uid: u32, dest: String, req_id: u64 },
+    /// `STATUS <mailbox> (UNSEEN)` for each name in `mailboxes` (B8), to show
+    /// an unread count next to each mailbox in the tree. Issued as one
+    /// command per mailbox on `ImapActor`'s own session (not paged/batched)
+    /// -- real servers commonly support pipelining `STATUS`, but this client
+    /// doesn't attempt it; see `ImapActor::fetch_unread_counts`'s doc for why
+    /// that's an acceptable, if not optimal, trade for the size of an
+    /// account's mailbox list.
+    FetchUnreadCounts { mailboxes: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -119,7 +337,9 @@ pub enum ImapEvent {
     /// succeeds, or an `Error` once it exhausts its attempts.
     Disconnected,
     Error(String),
-    Mailboxes(Vec<String>),
+    /// B8: each entry carries the delimiter/special-use info `main.rs`'s
+    /// `mailbox_tree` needs, not just a bare name -- see `MailboxInfo`.
+    Mailboxes(Vec<MailboxInfo>),
     Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64, mailbox_state: MailboxState },
     Body { uid: u32, html: String, attachments: Vec<crate::render::Attachment>, req_id: u64 },
     DownloadProgress { current: u32, total: u32 },
@@ -145,6 +365,23 @@ pub enum ImapEvent {
     /// a 60-second timer never stomps on whatever the user is actually
     /// looking at.
     PollFailed(String),
+    /// Reply to `StoreFlags` (B8): the message's resulting flag list.
+    FlagsUpdated { mailbox: String, uid: u32, flags: Vec<String>, req_id: u64 },
+    /// `StoreFlags` failed. Separate from `Error` so a failed flag toggle
+    /// (e.g. clicking the star while offline) can be reported/rolled back
+    /// against the specific message it was for, the same reasoning
+    /// `AppendFailed`/`PollFailed` already document for their own commands.
+    FlagsUpdateFailed { mailbox: String, uid: u32, error: String, req_id: u64 },
+    /// Reply to `MoveMessage` (B8): `uid` no longer exists in `mailbox`; it
+    /// now lives in `dest`.
+    Moved { mailbox: String, uid: u32, dest: String, req_id: u64 },
+    /// `MoveMessage` failed (including its COPY+STORE+EXPUNGE fallback).
+    MoveFailed { mailbox: String, uid: u32, error: String, req_id: u64 },
+    /// Reply to `FetchUnreadCounts` (B8): one entry per mailbox that
+    /// answered `STATUS` successfully -- a mailbox that failed (e.g.
+    /// deleted between `FetchMailboxes` and this call) is simply missing
+    /// from the map rather than failing the whole batch.
+    UnreadCounts(std::collections::HashMap<String, u32>),
 }
 
 pub struct ImapActor {
@@ -329,6 +566,51 @@ impl ImapActor {
                         }
                     }
                 }
+                ImapCommand::StoreFlags { mailbox, uid, add, remove, req_id } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::FlagsUpdateFailed { mailbox, uid, error: e.to_string(), req_id }).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::store_flags(session, &mailbox, uid, &add, &remove).await {
+                        Ok(flags) => {
+                            let _ = self.event_tx.send(ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::FlagsUpdateFailed { mailbox, uid, error: e.to_string(), req_id }).await;
+                        }
+                    }
+                }
+                ImapCommand::MoveMessage { mailbox, uid, dest, req_id } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::MoveFailed { mailbox, uid, error: e.to_string(), req_id }).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::move_message(session, &mailbox, uid, &dest).await {
+                        Ok(()) => {
+                            let _ = self.event_tx.send(ImapEvent::Moved { mailbox, uid, dest, req_id }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::MoveFailed { mailbox, uid, error: e.to_string(), req_id }).await;
+                        }
+                    }
+                }
+                ImapCommand::FetchUnreadCounts { mailboxes } => {
+                    if self.ensure_connected().await.is_err() {
+                        // Best-effort/background, same reasoning as
+                        // `PollMailbox` -- an unread-count refresh failing
+                        // silently is preferable to it triggering a
+                        // reconnect storm or an error banner over a UI
+                        // element nobody explicitly asked to refresh.
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    let counts = Self::fetch_unread_counts(session, &mailboxes).await;
+                    let _ = self.event_tx.send(ImapEvent::UnreadCounts(counts)).await;
+                }
             }
         }
     }
@@ -386,12 +668,21 @@ impl ImapActor {
         Ok(())
     }
 
-    async fn fetch_mailboxes(session: &mut async_imap::Session<TlsStream<TcpStream>>) -> anyhow::Result<Vec<String>> {
+    async fn fetch_mailboxes(session: &mut async_imap::Session<TlsStream<TcpStream>>) -> anyhow::Result<Vec<MailboxInfo>> {
         let mut mailboxes = Vec::new();
         let mut fetches = session.list(Some(""), Some("*")).await?;
         while let Some(name) = fetches.next().await {
             if let Ok(name) = name {
-                mailboxes.push(name.name().to_string());
+                let special_use = name
+                    .attributes()
+                    .iter()
+                    .find_map(SpecialUse::from_attribute)
+                    .or_else(|| SpecialUse::from_name(name.name()));
+                mailboxes.push(MailboxInfo {
+                    name: name.name().to_string(),
+                    delimiter: name.delimiter().map(|d| d.to_string()),
+                    special_use,
+                });
             }
         }
         Ok(mailboxes)
@@ -413,7 +704,7 @@ impl ImapActor {
     /// this by hand before B10 needed a third copy for `fetch_new_headers` --
     /// three near-identical copies was the point at which "just duplicate it
     /// again" stopped being the lower-risk option.
-    fn parse_envelope_header(uid: u32, envelope: &async_imap::imap_proto::Envelope<'_>) -> MailHeader {
+    fn parse_envelope_header(uid: u32, envelope: &async_imap::imap_proto::Envelope<'_>, flags: Vec<String>) -> MailHeader {
         let subject = envelope.subject.as_ref().map(|s| Self::decode_rfc2047(s)).unwrap_or_default();
 
         let format_address = |addrs: Option<&[async_imap::imap_proto::Address<'_>]>| -> String {
@@ -433,7 +724,14 @@ impl ImapActor {
         let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
         let message_id = envelope.message_id.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
 
-        MailHeader { uid, subject, from, to, date, message_id }
+        MailHeader { uid, subject, from, to, date, message_id, flags }
+    }
+
+    /// A `Fetch`'s IMAP flags (e.g. `\Seen`, `\Flagged`) as the raw strings
+    /// `MailHeader::flags`/`STORE` queries use -- `flag_to_str` handles the
+    /// mapping since `async_imap::types::Flag` has no `Display`.
+    fn fetch_flags(msg: &async_imap::types::Fetch) -> Vec<String> {
+        msg.flags().map(|f| flag_to_str(&f)).collect()
     }
 
     async fn fetch_headers(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, page: u32) -> anyhow::Result<(Vec<MailHeader>, u32, MailboxState)> {
@@ -460,15 +758,16 @@ impl ImapActor {
         let start = end.saturating_sub(per_page - 1).max(1);
 
         let query = format!("{}:{}", start, end);
-        let fetches = session.fetch(query, "(UID ENVELOPE)").await?;
+        let fetches = session.fetch(query, "(UID ENVELOPE FLAGS)").await?;
         let messages = fetches.collect::<Vec<_>>().await;
-        
+
         let mut headers = Vec::new();
         for msg in messages {
             let msg = msg?;
             let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
             let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
-            headers.push(Self::parse_envelope_header(uid, envelope));
+            let flags = Self::fetch_flags(&msg);
+            headers.push(Self::parse_envelope_header(uid, envelope, flags));
         }
 
         headers.reverse(); // Newest first
@@ -503,7 +802,7 @@ impl ImapActor {
     ) -> anyhow::Result<Vec<MailHeader>> {
         session.examine(mailbox_name).await?;
         let query = format!("{}:*", first_uid);
-        let fetches = session.uid_fetch(query, "(UID ENVELOPE)").await?;
+        let fetches = session.uid_fetch(query, "(UID ENVELOPE FLAGS)").await?;
         let messages = fetches.collect::<Vec<_>>().await;
 
         let mut headers = Vec::new();
@@ -511,7 +810,8 @@ impl ImapActor {
             let msg = msg?;
             let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
             let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
-            headers.push(Self::parse_envelope_header(uid, envelope));
+            let flags = Self::fetch_flags(&msg);
+            headers.push(Self::parse_envelope_header(uid, envelope, flags));
         }
         Ok(headers)
     }
@@ -531,14 +831,15 @@ impl ImapActor {
 
         // Fetch all UIDs and Envelopes first to get metadata
         let query = format!("1:{}", total);
-        let fetches = session.fetch(query, "(UID ENVELOPE)").await?;
+        let fetches = session.fetch(query, "(UID ENVELOPE FLAGS)").await?;
         let messages = fetches.collect::<Vec<_>>().await;
 
         for (i, msg) in messages.into_iter().enumerate() {
             let msg = msg?;
             let uid = msg.uid.ok_or_else(|| anyhow!("No UID"))?;
             let envelope = msg.envelope().ok_or_else(|| anyhow!("No envelope"))?;
-            let header = Self::parse_envelope_header(uid, envelope);
+            let flags = Self::fetch_flags(&msg);
+            let header = Self::parse_envelope_header(uid, envelope, flags);
 
             // Now fetch body for this UID
             let body_query = format!("{}", uid);
@@ -564,6 +865,121 @@ impl ImapActor {
         }
 
         Ok(())
+    }
+
+    /// Add/remove flags on one message (B8): `SELECT`s `mailbox_name` (not
+    /// `EXAMINE` -- `STORE` needs write access) then issues one `UID STORE`
+    /// per non-empty side (`+FLAGS`/`-FLAGS`), returning the resulting flag
+    /// list from whichever `STORE` ran last. Two round trips when both `add`
+    /// and `remove` are non-empty rather than one combined command -- IMAP
+    /// has no single `STORE` verb that both adds and removes different flags
+    /// in the same call, only replaces the whole set (`FLAGS`, which risks
+    /// clobbering a flag set by something else between the read and the
+    /// write) or adds/removes one set at a time.
+    async fn store_flags(
+        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        mailbox_name: &str,
+        uid: u32,
+        add: &[String],
+        remove: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        session.select(mailbox_name).await?;
+        let mut last_flags: Option<Vec<String>> = None;
+
+        if !add.is_empty() {
+            let query = format!("+FLAGS ({})", add.join(" "));
+            let mut stream = session.uid_store(uid.to_string(), query).await?;
+            while let Some(msg) = stream.next().await {
+                last_flags = Some(Self::fetch_flags(&msg?));
+            }
+        }
+        if !remove.is_empty() {
+            let query = format!("-FLAGS ({})", remove.join(" "));
+            let mut stream = session.uid_store(uid.to_string(), query).await?;
+            while let Some(msg) = stream.next().await {
+                last_flags = Some(Self::fetch_flags(&msg?));
+            }
+        }
+
+        last_flags.ok_or_else(|| anyhow!("STORE completed but the server reported no resulting flags for UID {uid}"))
+    }
+
+    /// Move one message to `dest` (B8's delete-to-Trash/archive): `SELECT`s
+    /// `mailbox_name`, tries the real `MOVE` extension
+    /// (`async_imap::Session::uid_mv`), and if that fails for any reason
+    /// (server doesn't support it, or the attempt itself errors) falls back
+    /// to `COPY` + `STORE +FLAGS.SILENT \Deleted` + `EXPUNGE` -- the same
+    /// three steps `MOVE` is defined to be equivalent to (see `uid_mv`'s own
+    /// doc comment). The fallback's `EXPUNGE` is a bare, mailbox-wide
+    /// `EXPUNGE` rather than `UID EXPUNGE <uid>` (which needs the `UIDPLUS`
+    /// extension this client doesn't check for) -- safe here because nothing
+    /// else in this client's own flow marks a message `\Deleted` without
+    /// immediately expunging it, so the only `\Deleted` message in the
+    /// mailbox at that point is this one.
+    async fn move_message(
+        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        mailbox_name: &str,
+        uid: u32,
+        dest: &str,
+    ) -> anyhow::Result<()> {
+        session.select(mailbox_name).await?;
+
+        if session.uid_mv(uid.to_string(), dest).await.is_ok() {
+            return Ok(());
+        }
+
+        // Fallback: COPY, mark \Deleted, EXPUNGE.
+        session.uid_copy(uid.to_string(), dest).await?;
+        let mut stream = session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)").await?;
+        while let Some(msg) = stream.next().await {
+            msg?;
+        }
+        drop(stream);
+        session.expunge().await?.collect::<Vec<_>>().await;
+        Ok(())
+    }
+
+    /// `STATUS (UNSEEN)` for each of `mailboxes` (B8), sequentially on this
+    /// one session -- issued right after `FetchMailboxes`, whose reply names
+    /// every mailbox to ask about. A mailbox whose `STATUS` errors (e.g. it
+    /// was renamed/removed between the two calls) is silently skipped rather
+    /// than failing the whole batch, since one stale/missing count shouldn't
+    /// hide every other mailbox's. Sequential, one round trip per mailbox,
+    /// rather than pipelined: acceptable for the handful of mailboxes a
+    /// typical account has, and pipelining `STATUS` would need queuing
+    /// several commands ahead of their responses, which this client's
+    /// request/response session wrapper isn't set up to do anywhere else
+    /// either.
+    async fn fetch_unread_counts(
+        session: &mut async_imap::Session<TlsStream<TcpStream>>,
+        mailboxes: &[String],
+    ) -> std::collections::HashMap<String, u32> {
+        let mut counts = std::collections::HashMap::new();
+        for mailbox in mailboxes {
+            if let Ok(status) = session.status(mailbox, "(UNSEEN)").await {
+                counts.insert(mailbox.clone(), status.unseen.unwrap_or(0));
+            }
+        }
+        counts
+    }
+}
+
+/// Maps an `async_imap`/`imap-proto` [`async_imap::types::Flag`] to the raw
+/// IMAP flag string it came from (e.g. `Flag::Seen` -> `"\Seen"`). Needed
+/// because that type has no `Display` impl; the reverse direction (building
+/// a `STORE` query from a flag string) needs no such mapping since `STORE`'s
+/// argument is just a string already.
+fn flag_to_str(flag: &async_imap::types::Flag<'_>) -> String {
+    use async_imap::types::Flag;
+    match flag {
+        Flag::Seen => "\\Seen".to_string(),
+        Flag::Answered => "\\Answered".to_string(),
+        Flag::Flagged => "\\Flagged".to_string(),
+        Flag::Deleted => "\\Deleted".to_string(),
+        Flag::Draft => "\\Draft".to_string(),
+        Flag::Recent => "\\Recent".to_string(),
+        Flag::MayCreate => "\\*".to_string(),
+        Flag::Custom(s) => s.to_string(),
     }
 }
 
@@ -684,4 +1100,127 @@ async fn ensure_worker_connected(credentials: &Credentials) -> anyhow::Result<as
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mb(name: &str, delimiter: &str, special_use: Option<SpecialUse>) -> MailboxInfo {
+        MailboxInfo { name: name.to_string(), delimiter: Some(delimiter.to_string()), special_use }
+    }
+
+    // ── MailHeader::is_seen / is_flagged ─────────────────────────────────────
+
+    #[test]
+    fn is_seen_and_is_flagged_read_the_flags_list() {
+        let mut h = MailHeader {
+            uid: 1,
+            subject: String::new(),
+            from: String::new(),
+            to: String::new(),
+            date: String::new(),
+            message_id: String::new(),
+            flags: vec![],
+        };
+        assert!(!h.is_seen());
+        assert!(!h.is_flagged());
+
+        h.flags = vec!["\\Seen".to_string(), "\\Flagged".to_string()];
+        assert!(h.is_seen());
+        assert!(h.is_flagged());
+    }
+
+    // ── SpecialUse::from_name ─────────────────────────────────────────────────
+
+    #[test]
+    fn special_use_from_name_recognizes_well_known_folders_case_insensitively() {
+        assert_eq!(SpecialUse::from_name("INBOX"), Some(SpecialUse::Inbox));
+        assert_eq!(SpecialUse::from_name("sent"), Some(SpecialUse::Sent));
+        assert_eq!(SpecialUse::from_name("Trash"), Some(SpecialUse::Trash));
+        assert_eq!(SpecialUse::from_name("Work"), None);
+    }
+
+    #[test]
+    fn special_use_from_name_does_not_match_a_substring() {
+        // A folder that merely contains "sent" in a longer name must not be
+        // misclassified as the Sent special-use folder.
+        assert_eq!(SpecialUse::from_name("Sent to Boss"), None);
+    }
+
+    // ── mailbox_tree ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mailbox_tree_puts_flat_mailboxes_at_the_root() {
+        let mailboxes = vec![mb("INBOX", "/", Some(SpecialUse::Inbox)), mb("Archive", "/", Some(SpecialUse::Archive))];
+        let tree = mailbox_tree(&mailboxes);
+        let labels: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
+        // INBOX ranks ahead of Archive regardless of alphabetical order.
+        assert_eq!(labels, vec!["INBOX", "Archive"]);
+    }
+
+    #[test]
+    fn mailbox_tree_splits_on_the_delimiter_into_a_hierarchy() {
+        let mailboxes = vec![mb("Work/Invoices", "/", None), mb("Work/Receipts", "/", None)];
+        let tree = mailbox_tree(&mailboxes);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].label, "Work");
+        assert_eq!(tree[0].full_name, None, "Work itself was never listed, only its children");
+        let child_labels: Vec<&str> = tree[0].children.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(child_labels, vec!["Invoices", "Receipts"]);
+        assert_eq!(tree[0].children[0].full_name.as_deref(), Some("Work/Invoices"));
+    }
+
+    #[test]
+    fn mailbox_tree_sorts_special_use_folders_first_in_a_fixed_order() {
+        let mailboxes = vec![
+            mb("Zzz", "/", None),
+            mb("Trash", "/", Some(SpecialUse::Trash)),
+            mb("INBOX", "/", Some(SpecialUse::Inbox)),
+            mb("Aaa", "/", None),
+            mb("Sent", "/", Some(SpecialUse::Sent)),
+        ];
+        let tree = mailbox_tree(&mailboxes);
+        let labels: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, vec!["INBOX", "Sent", "Trash", "Aaa", "Zzz"]);
+    }
+
+    #[test]
+    fn mailbox_tree_treats_an_empty_delimiter_as_no_hierarchy() {
+        // A server with no hierarchy (delimiter NIL, `MailboxInfo::delimiter`
+        // as `None`) must not be split at all, even if a mailbox name
+        // happens to contain a `/`.
+        let mailboxes = vec![MailboxInfo { name: "A/B".to_string(), delimiter: None, special_use: None }];
+        let tree = mailbox_tree(&mailboxes);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].label, "A/B");
+        assert_eq!(tree[0].full_name.as_deref(), Some("A/B"));
+        assert!(tree[0].children.is_empty());
+    }
+
+    #[test]
+    fn flatten_tree_preserves_depth_and_order() {
+        let mailboxes = vec![mb("INBOX", "/", Some(SpecialUse::Inbox)), mb("Work/Invoices", "/", None)];
+        let rows = flatten_tree(&mailbox_tree(&mailboxes));
+        assert_eq!(rows.len(), 3); // INBOX, Work, Work/Invoices
+        assert_eq!((rows[0].depth, rows[0].label.as_str(), rows[0].full_name.as_deref()), (0, "INBOX", Some("INBOX")));
+        assert_eq!((rows[1].depth, rows[1].label.as_str(), rows[1].full_name.as_deref()), (0, "Work", None));
+        assert_eq!((rows[2].depth, rows[2].label.as_str(), rows[2].full_name.as_deref()), (1, "Invoices", Some("Work/Invoices")));
+    }
+
+    // ── flag_to_str ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn flag_to_str_maps_system_flags() {
+        use async_imap::types::Flag;
+        assert_eq!(flag_to_str(&Flag::Seen), "\\Seen");
+        assert_eq!(flag_to_str(&Flag::Flagged), "\\Flagged");
+        assert_eq!(flag_to_str(&Flag::Deleted), "\\Deleted");
+    }
+
+    #[test]
+    fn flag_to_str_passes_a_custom_flag_through_verbatim() {
+        use async_imap::types::Flag;
+        assert_eq!(flag_to_str(&Flag::Custom("$MyLabel".into())), "$MyLabel");
+    }
 }

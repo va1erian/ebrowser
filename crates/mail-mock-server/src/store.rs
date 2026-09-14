@@ -16,6 +16,11 @@ pub struct StoredMessage {
     pub uid: u32,
     pub raw: Vec<u8>,
     pub envelope: Envelope,
+    /// IMAP flags on this message (e.g. `"\Seen"`, `"\Flagged"`, `"\Deleted"`),
+    /// mutated by `STORE`/`UID STORE` (B8) and consulted by `EXPUNGE`/`STATUS
+    /// (UNSEEN)`. Empty for a freshly delivered message -- nothing marks
+    /// anything `\Seen` on arrival, matching a real server.
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,8 +50,52 @@ impl Mailbox {
     pub fn append(&mut self, raw: Vec<u8>, envelope: Envelope) -> u32 {
         let uid = self.uid_next;
         self.uid_next += 1;
-        self.messages.push(StoredMessage { uid, raw, envelope });
+        self.messages.push(StoredMessage { uid, raw, envelope, flags: Vec::new() });
         uid
+    }
+
+    /// Messages with no `\Seen` flag -- what `STATUS (UNSEEN)` (B8) counts.
+    pub fn unseen_count(&self) -> u32 {
+        self.messages.iter().filter(|m| !m.flags.iter().any(|f| f == "\\Seen")).count() as u32
+    }
+
+    /// Applies `add`/`remove` to the flags of the message with the given
+    /// `uid`, returning its resulting flag list. `None` if no message in
+    /// this mailbox has that UID.
+    pub fn store_flags(&mut self, uid: u32, add: &[String], remove: &[String]) -> Option<Vec<String>> {
+        let msg = self.messages.iter_mut().find(|m| m.uid == uid)?;
+        // Remove before add: a plain (replace-the-whole-set) STORE is
+        // modeled by the caller as "remove every known system flag, then
+        // add the new set" (imap_server.rs), so `remove` and `add` can
+        // legitimately share members there. Removing first means a flag
+        // that's in both ends up present, matching "replace with this set"
+        // -- doing it the other way around (as this used to) would add the
+        // new flags and then immediately strip them again via the wildcard
+        // remove list, leaving every replace-mode STORE with an empty flag
+        // set. The +FLAGS/-FLAGS cases (where `add`/`remove` are always
+        // disjoint, one of them empty) are unaffected by the order.
+        msg.flags.retain(|f| !remove.iter().any(|r| r.eq_ignore_ascii_case(f)));
+        for flag in add {
+            if !msg.flags.iter().any(|f| f.eq_ignore_ascii_case(flag)) {
+                msg.flags.push(flag.clone());
+            }
+        }
+        Some(msg.flags.clone())
+    }
+
+    /// Removes every message flagged `\Deleted` from this mailbox (`EXPUNGE`,
+    /// B8) -- the fallback path `imap.rs::move_message` uses when a server
+    /// doesn't support `MOVE`. Returns the removed UIDs.
+    pub fn expunge(&mut self) -> Vec<u32> {
+        let mut removed = Vec::new();
+        self.messages.retain(|m| {
+            let deleted = m.flags.iter().any(|f| f == "\\Deleted");
+            if deleted {
+                removed.push(m.uid);
+            }
+            !deleted
+        });
+        removed
     }
 }
 
@@ -107,6 +156,22 @@ impl Store {
         let _ = self.notify.send(recipient_mailbox.to_string());
         uid
     }
+
+    /// `COPY`/`UID COPY` (B8): duplicates the message `uid` from `src` into
+    /// `dest` (creating `dest` if it doesn't exist yet, same as `deliver`),
+    /// with a fresh UID and its flags carried over. Used by
+    /// `imap.rs::move_message`'s COPY+STORE+EXPUNGE fallback for servers
+    /// without `MOVE`. Returns the new UID, or `None` if `src`/`uid` doesn't
+    /// exist.
+    pub fn copy_message(&mut self, src: &str, uid: u32, dest: &str) -> Option<u32> {
+        let msg = self.mailboxes.get(src)?.messages.iter().find(|m| m.uid == uid)?.clone();
+        let dest_mailbox = self.mailboxes.entry(dest.to_string()).or_insert_with(|| Mailbox::new(dest, 1));
+        let new_uid = dest_mailbox.uid_next;
+        dest_mailbox.uid_next += 1;
+        dest_mailbox.messages.push(StoredMessage { uid: new_uid, flags: msg.flags.clone(), ..msg });
+        let _ = self.notify.send(dest.to_string());
+        Some(new_uid)
+    }
 }
 
 /// Extracts the handful of headers `FETCH ENVELOPE` needs from a raw
@@ -141,6 +206,41 @@ pub fn parse_envelope(raw: &[u8]) -> Envelope {
         from: address("From"),
         to: address("To"),
         message_id: header("Message-ID"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_flags_replace_mode_keeps_the_new_set_instead_of_ending_up_empty() {
+        // Regression test for a real bug: imap_server.rs models a plain
+        // (replace-the-whole-set) STORE as "remove every known system flag,
+        // then add the new set" -- calling store_flags with the new set as
+        // both members of `add` and (via the wildcard) `remove`. Applying
+        // `add` before `remove` (the original order) stripped the just-added
+        // flags right back out, so every replace-mode STORE ended up empty.
+        let mut mailbox = Mailbox::new("INBOX", 1);
+        let uid = mailbox.append(b"raw".to_vec(), Envelope::default());
+
+        let all_system_flags: Vec<String> =
+            ["\\Seen", "\\Flagged", "\\Deleted", "\\Answered", "\\Draft"].iter().map(|s| s.to_string()).collect();
+        let result = mailbox.store_flags(uid, &["\\Seen".to_string()], &all_system_flags);
+
+        assert_eq!(result, Some(vec!["\\Seen".to_string()]));
+    }
+
+    #[test]
+    fn store_flags_add_then_remove_are_unaffected_by_the_reordering() {
+        // The +FLAGS/-FLAGS cases always pass a disjoint, one-sided
+        // add/remove pair -- confirm the fix (remove-then-add) doesn't
+        // change their behavior.
+        let mut mailbox = Mailbox::new("INBOX", 1);
+        let uid = mailbox.append(b"raw".to_vec(), Envelope::default());
+
+        assert_eq!(mailbox.store_flags(uid, &["\\Seen".to_string()], &[]), Some(vec!["\\Seen".to_string()]));
+        assert_eq!(mailbox.store_flags(uid, &[], &["\\Seen".to_string()]), Some(vec![]));
     }
 }
 
