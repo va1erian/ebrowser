@@ -186,6 +186,48 @@ async fn bulk_download_streams_every_message_with_progress() {
     assert_eq!(final_progress, 12);
 }
 
+/// B2's whole reason to exist: before the session-pool split, `BulkDownload`
+/// and `FetchHeaders` shared one `ImapActor` session processed from a single
+/// command queue, so a `FetchHeaders` sent while a `BulkDownload` was
+/// running had to wait behind every one of its body fetches. Now
+/// `BulkDownload` is handed off to a dedicated worker connection
+/// (`imap.rs::spawn_body_worker`) the moment it's received, leaving the
+/// primary session free to answer `FetchHeaders` immediately.
+#[tokio::test]
+async fn bulk_download_does_not_block_a_concurrent_header_fetch() {
+    skip_unless_ca_trusted!();
+    // Enough messages that a fully-serialized implementation (one EXAMINE +
+    // one ENVELOPE fetch + 100 individual RFC822 fetches, each a real
+    // network round trip) would take noticeably longer than answering one
+    // FetchHeaders does -- large enough to make the race not-close, without
+    // being so large the test itself becomes slow.
+    let mut h = start_harness(100).await; // 2 fixtures + 100 = 102 total
+
+    h.imap_cmd.send(ImapCommand::BulkDownload { mailbox: "INBOX".to_string() }).await.unwrap();
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 42 }).await.unwrap();
+
+    let mut bulk_download_finished = false;
+    let headers_arrived_while_bulk_still_running = loop {
+        match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+            ImapEvent::Headers { req_id: 42, .. } => break !bulk_download_finished,
+            ImapEvent::DownloadProgress { current, total } => {
+                if current == total {
+                    bulk_download_finished = true;
+                }
+            }
+            ImapEvent::MailData { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+
+    assert!(
+        headers_arrived_while_bulk_still_running,
+        "FetchHeaders was only answered after BulkDownload finished (or never), \
+         suggesting they're still serialized on one connection rather than split \
+         across a primary session and a body worker"
+    );
+}
+
 /// The real round trip this whole server exists to make testable: esmail's
 /// `SmtpActor` sends a message, and esmail's `ImapActor` can then see it.
 #[tokio::test]

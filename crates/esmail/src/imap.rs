@@ -118,6 +118,11 @@ pub struct ImapActor {
     /// [`ImapActor::ensure_connected`] to reconnect without the user retyping
     /// their password.
     credentials: Option<Credentials>,
+    /// Where `FetchBody`/`BulkDownload` get routed once connected -- see
+    /// `spawn_body_worker`'s doc for why those two specifically live on a
+    /// second connection instead of this actor's own `session`. `None`
+    /// before the first successful `Connect`.
+    worker_tx: Option<mpsc::Sender<WorkerCommand>>,
 }
 
 impl ImapActor {
@@ -130,6 +135,7 @@ impl ImapActor {
             event_tx,
             session: None,
             credentials: None,
+            worker_tx: None,
         };
 
         tokio::spawn(async move {
@@ -145,7 +151,20 @@ impl ImapActor {
                         Ok(_) => {
                             // Remembered so `ensure_connected` can reconnect
                             // without the user retyping their password.
-                            self.credentials = Some(Credentials { host, port, username, password });
+                            let creds = Credentials { host, port, username, password };
+                            self.credentials = Some(creds.clone());
+                            // One worker per successful `Connect`, not one
+                            // per process: a second `Connect` (e.g. logging
+                            // into a different account without restarting)
+                            // should get a fresh worker on the new
+                            // credentials rather than silently keep feeding
+                            // `FetchBody`/`BulkDownload` to a worker still
+                            // logged into the old account. The old worker's
+                            // task simply ends once its `cmd_rx` (the
+                            // `Sender` half we're about to drop here) closes.
+                            let (worker_tx, worker_rx) = mpsc::channel(8);
+                            spawn_body_worker(worker_rx, self.event_tx.clone(), creds);
+                            self.worker_tx = Some(worker_tx);
                             let _ = self.event_tx.send(ImapEvent::Connected).await;
                         }
                         Err(e) => {
@@ -186,31 +205,26 @@ impl ImapActor {
                     }
                 }
                 ImapCommand::FetchBody { mailbox, uid, req_id } => {
-                    if let Err(e) = self.ensure_connected().await {
-                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                    // Routed to the body worker's own connection (see
+                    // `spawn_body_worker`) rather than handled here, so a
+                    // slow body fetch can't stall `FetchHeaders`/
+                    // `FetchMailboxes` waiting behind it in this actor's own
+                    // command queue.
+                    let Some(worker) = &self.worker_tx else {
+                        let _ = self.event_tx.send(ImapEvent::Error("not connected".to_string())).await;
                         continue;
-                    }
-                    let session = self.session.as_mut().expect("ensure_connected just verified this");
-                    match Self::fetch_body(session, &mailbox, uid).await {
-                        Ok((html, attachments)) => {
-                            let _ = self.event_tx.send(ImapEvent::Body { uid, html, attachments, req_id }).await;
-                        }
-                        Err(e) => {
-                            self.session = None;
-                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                        }
-                    }
+                    };
+                    let _ = worker.send(WorkerCommand::FetchBody { mailbox, uid, req_id }).await;
                 }
                 ImapCommand::BulkDownload { mailbox } => {
-                    if let Err(e) = self.ensure_connected().await {
-                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                    // Same reasoning as `FetchBody` above -- and doubly so
+                    // here, since a bulk download is the single slowest,
+                    // longest-running thing this actor ever does.
+                    let Some(worker) = &self.worker_tx else {
+                        let _ = self.event_tx.send(ImapEvent::Error("not connected".to_string())).await;
                         continue;
-                    }
-                    let session = self.session.as_mut().expect("ensure_connected just verified this");
-                    if let Err(e) = Self::bulk_download(session, &mailbox, &self.event_tx).await {
-                        self.session = None;
-                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
-                    }
+                    };
+                    let _ = worker.send(WorkerCommand::BulkDownload { mailbox }).await;
                 }
                 ImapCommand::PollMailbox { mailbox } => {
                     // No `ensure_connected` here on purpose -- see the
@@ -255,9 +269,14 @@ impl ImapActor {
     /// succeeded, or by a prior command failing and clearing `self.session`).
     /// A no-op — and free — when already connected.
     ///
-    /// This is the auto-reconnect half of B2; it does *not* attempt to keep a
-    /// separate control session alive for IDLE (there is no IDLE session yet
-    /// at all — see PLAN.md §B2's noted scope cut).
+    /// This only manages *this* actor's own session -- the one
+    /// `FetchMailboxes`/`FetchHeaders`/`PollMailbox`/`FetchNewHeaders` use.
+    /// It deliberately does not touch `self.worker_tx`: the body worker
+    /// (`spawn_body_worker`, B2's session-pool split) keeps its own
+    /// independent connection and reconnect loop, so a primary-session drop
+    /// and reconnect here has no effect on it, and vice versa. IDLE (B11)
+    /// is a third, still-separate connection (`idle_watch.rs`), managed
+    /// entirely outside this actor.
     async fn ensure_connected(&mut self) -> anyhow::Result<()> {
         if self.session.is_some() {
             return Ok(());
@@ -294,17 +313,7 @@ impl ImapActor {
     }
 
     async fn connect(&mut self, host: &str, port: u16, username: &str, password: &str) -> anyhow::Result<()> {
-        let tls_connector = TlsConnector::builder().build()?;
-        let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-
-        let stream = TcpStream::connect((host, port)).await?;
-        let tls_stream = tokio_tls_connector.connect(host, stream).await?;
-        let mut client = async_imap::Client::new(tls_stream);
-        let _ = client.read_response().await;
-
-        let session = client.login(username, password).await.map_err(|(e, _)| e)?;
-
-        self.session = Some(session);
+        self.session = Some(connect_session(host, port, username, password).await?);
         Ok(())
     }
 
@@ -487,4 +496,123 @@ impl ImapActor {
 
         Ok(())
     }
+}
+
+/// The TLS-connect-then-`LOGIN` sequence, shared by [`ImapActor::connect`]
+/// and [`spawn_body_worker`]'s own independent connection -- previously
+/// inlined once in each of `ImapActor`'s two (now three, counting the
+/// worker) call sites before B2's session-pool split gave it a second
+/// caller.
+async fn connect_session(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<async_imap::Session<TlsStream<TcpStream>>> {
+    let tls_connector = TlsConnector::builder().build()?;
+    let tokio_tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
+
+    let stream = TcpStream::connect((host, port)).await?;
+    let tls_stream = tokio_tls_connector.connect(host, stream).await?;
+    let mut client = async_imap::Client::new(tls_stream);
+    let _ = client.read_response().await;
+
+    let session = client.login(username, password).await.map_err(|(e, _)| e)?;
+    Ok(session)
+}
+
+/// Commands [`ImapActor`] hands off to [`spawn_body_worker`]'s dedicated
+/// connection rather than handling on its own `session`.
+enum WorkerCommand {
+    FetchBody { mailbox: String, uid: u32, req_id: u64 },
+    BulkDownload { mailbox: String },
+}
+
+/// B2's session-pool split: a second, independent IMAP connection that
+/// handles only [`ImapCommand::FetchBody`]/[`ImapCommand::BulkDownload`],
+/// so opening a message (or running a bulk download) never blocks
+/// `ImapActor`'s own session -- the one `FetchHeaders`/`FetchMailboxes` use
+/// to keep the header list and mailbox tree responsive. This was the one
+/// piece of B2 (PLAN.md's own wording: "one long-lived control session ...
+/// plus a worker session for fetches") that stayed undone through B7 for
+/// lack of anything to verify a live-IMAP-protocol rework against;
+/// `mail-mock-server` (added since) is what unblocks it now, the same way
+/// it unblocked B11's `IDLE` support.
+///
+/// Deliberately its own small connect/reconnect loop rather than sharing
+/// `ImapActor::ensure_connected`: that method emits `ImapEvent::Connected`/
+/// `Disconnected`, which the UI uses to gate the whole "are we logged in"
+/// state (`EsMailApp::is_connected`) and `spawn_new_mail_watch`'s poll
+/// gate. A worker reconnect blipping that global state on every dropped
+/// body fetch would be misleading -- the *account* is still connected as
+/// far as the user should see, only this one background connection needed
+/// to retry. So failures here are reported only on the specific request
+/// that hit them (`ImapEvent::Error`), and a successful reconnect is
+/// silent, exactly like a request that never needed to reconnect at all.
+fn spawn_body_worker(
+    mut cmd_rx: mpsc::Receiver<WorkerCommand>,
+    event_tx: mpsc::Sender<ImapEvent>,
+    credentials: Credentials,
+) {
+    tokio::spawn(async move {
+        let mut session: Option<async_imap::Session<TlsStream<TcpStream>>> = None;
+
+        while let Some(cmd) = cmd_rx.recv().await {
+            if session.is_none() {
+                match ensure_worker_connected(&credentials).await {
+                    Ok(s) => session = Some(s),
+                    Err(e) => {
+                        let _ = event_tx.send(ImapEvent::Error(format!("could not open a connection for this request: {e}"))).await;
+                        continue;
+                    }
+                }
+            }
+            let sess = session.as_mut().expect("just verified Some above");
+
+            match cmd {
+                WorkerCommand::FetchBody { mailbox, uid, req_id } => {
+                    match ImapActor::fetch_body(sess, &mailbox, uid).await {
+                        Ok((html, attachments)) => {
+                            let _ = event_tx.send(ImapEvent::Body { uid, html, attachments, req_id }).await;
+                        }
+                        Err(e) => {
+                            session = None; // let the next command's ensure_worker_connected retry
+                            let _ = event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        }
+                    }
+                }
+                WorkerCommand::BulkDownload { mailbox } => {
+                    if let Err(e) = ImapActor::bulk_download(sess, &mailbox, &event_tx).await {
+                        session = None;
+                        let _ = event_tx.send(ImapEvent::Error(e.to_string())).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Connect-with-backoff for [`spawn_body_worker`], mirroring
+/// [`ImapActor::ensure_connected`]'s retry shape (same attempt count and
+/// delay curve, see `MAX_RECONNECT_ATTEMPTS`/`MAX_RECONNECT_DELAY`) but
+/// returning the session instead of storing it on `self`, and never
+/// sending `Connected`/`Disconnected` -- see `spawn_body_worker`'s doc for
+/// why.
+async fn ensure_worker_connected(credentials: &Credentials) -> anyhow::Result<async_imap::Session<TlsStream<TcpStream>>> {
+    let mut delay = Duration::from_secs(1);
+    let mut last_err = None;
+    for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+        match connect_session(&credentials.host, credentials.port, &credentials.username, credentials.password.expose_secret()).await {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                log::warn!("body worker reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {e}");
+                last_err = Some(e);
+                if attempt < MAX_RECONNECT_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("reconnect failed")))
 }

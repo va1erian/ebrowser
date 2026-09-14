@@ -435,7 +435,7 @@ dead weight; add it when B7/OAuth needs to distinguish. `smtp_host`/`smtp_tls`
 are in the struct (defaulted) since B7 needs the field to exist, but nothing
 reads them yet.
 
-### B2. Session layer rework — **PARTIALLY DONE**
+### B2. Session layer rework — **PARTIALLY DONE** (session-pool split now landed)
 Split `ImapActor` into a small pool: one long-lived control session per account
 for IDLE and mailbox state, plus a worker session for fetches, so opening a large
 message — or running `BulkDownload` — never freezes the header list. Give every
@@ -452,28 +452,48 @@ reply, `EsMailApp` only applies the reply matching its
 retries a dropped connection (5 attempts, 1s→16s backoff) using remembered
 credentials before any command that needs a session.
 
-**The single-session/worker-pool split and IDLE did not land.** There is
-still exactly one `async_imap::Session`; a body fetch still blocks the header
-list, and `BulkDownload` still blocks everything else for its duration. This
-was cut deliberately rather than attempted blind: splitting into a
-control+worker pool and adding IDLE is a large, failure-prone rewrite of live
-network code, and this environment has no real IMAP server to test it
-against — landing it un-verified risked a subtly broken actor that looks fine
-in `cargo check`. "Cancellation of in-flight work on mailbox change" is
-covered only in the sense that a stale reply is now dropped by `req_id`, not
-in the stronger sense of interrupting an in-flight fetch (servo 0.1.0's
-webview has the same limit — no `stop()` — noted at A4). The session split
-is real, standalone work; pick it up as its own phase, ideally with a way to
-exercise it against a live or mock IMAP server.
+**The worker-session split landed once `mail-mock-server` existed to verify
+it against.** `ImapCommand::FetchBody`/`BulkDownload` are no longer handled
+on `ImapActor`'s own session at all — `spawn_body_worker` (`imap.rs`) owns a
+second, independent IMAP connection with its own connect/reconnect loop
+(`ensure_worker_connected`, mirroring `ensure_connected`'s backoff shape but
+reporting failures only on the specific request that hit them, not as a
+global `Disconnected`/`Connected` — see the function's doc for why), spawned
+fresh on every successful `Connect`. `ImapActor::run`'s own loop now just
+forwards those two command variants to the worker's channel and immediately
+goes back to `cmd_rx.recv()`, so `FetchHeaders`/`FetchMailboxes` never wait
+behind a body fetch or a bulk download again. Verified with a real
+concurrency test (`bulk_download_does_not_block_a_concurrent_header_fetch`
+in `imap_smtp_integration.rs`): a `FetchHeaders` sent right after a
+100-message `BulkDownload` is answered while the download is still in
+progress, not queued behind it. This is the piece of B2 that was
+specifically deferred through B7 and B11 for lack of anything to verify a
+live-IMAP-protocol rework against — `mail-mock-server` (added since) is what
+unblocked it, the same way it unblocked B11's `IDLE` support.
+
+**What's still not the full "one control session per account for IDLE"
+wording above:** B11 already gave IDLE its own dedicated connection
+(`idle_watch.rs`), separately from this worker split — so there are now
+*three* independent IMAP connections per account (primary/header session,
+body worker, IDLE watch) rather than the two ("control" + "worker") this
+section's original wording pictured. That turned out fine in practice (each
+solves a narrower problem than a shared "control" session would have), but
+it's worth naming as a divergence from the original plan text rather than
+silently different. "Cancellation of in-flight work on mailbox change" is
+still covered only in the sense that a stale reply is now dropped by
+`req_id`, not in the stronger sense of interrupting an in-flight fetch
+(servo 0.1.0's webview has the same limit — no `stop()` — noted at A4).
 
 **One more simplification worth knowing about:** any error from
-`fetch_mailboxes`/`fetch_headers`/`fetch_body`/`bulk_download` clears
-`self.session`, not just IO/TLS-level failures. There is no clean way to tell
-"the connection died" apart from "the server said no" once both have gone
-through `anyhow`'s `?` a few layers up, so this errs toward self-healing: a
-transient protocol error (e.g. a mailbox that no longer exists) now costs a
-full reconnect instead of just an error message, which is wasteful but never
-leaves the actor stuck. Worth revisiting once real error variants are threaded
+`fetch_mailboxes`/`fetch_headers` clears `ImapActor`'s own `self.session`
+(and, symmetrically, any error from `fetch_body`/`bulk_download` clears the
+body worker's local `session` variable — see `spawn_body_worker`), not just
+IO/TLS-level failures. There is no clean way to tell "the connection died"
+apart from "the server said no" once both have gone through `anyhow`'s `?` a
+few layers up, so this errs toward self-healing: a transient protocol error
+(e.g. a mailbox that no longer exists) now costs a full reconnect instead of
+just an error message, which is wasteful but never leaves the actor (or the
+worker) stuck. Worth revisiting once real error variants are threaded
 through instead of `anyhow::Error`.
 
 ### B3. Local cache — finish and harden `db.rs` — **PARTIALLY DONE**
@@ -1016,7 +1036,7 @@ to verify against.
 | ~~**0**~~ | ~~Manifest fix; clear 4 deprecations; commit `db.rs`~~ **DONE** | everything |
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
-| 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
+| 3 | ~~B1~~ **DONE**, B2 **partially done** (worker-session split now done; cancellation-of-in-flight-work still doesn't interrupt an active fetch, see §B2) | B3, B7 |
 | 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
