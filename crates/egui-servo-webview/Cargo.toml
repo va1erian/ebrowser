@@ -20,6 +20,15 @@ http.workspace = true
 # Optional: convenience constructor that takes an eframe CreationContext.
 eframe = { workspace = true, optional = true }
 
+[dev-dependencies]
+# examples/two_views.rs only -- a real eframe app, so it needs env_logger the
+# same way the esmail binary does.
+env_logger.workspace = true
+
 [features]
 default = ["eframe"]
 eframe = ["dep:eframe"]
+
+[[example]]
+name = "two_views"
+required-features = ["eframe"]

@@ -477,6 +477,27 @@ multi-instance work holds, and unit tests for the pure helpers (key mapping,
 the polished `examples/minimal.rs` browser and the `cargo doc` CI job — the
 mail client is the demo.
 
+**DONE.** `impl egui::Widget for &mut WebView` is a thin wrapper over a new
+private `show_impl` that both it and `WebView::show` call — `Widget::ui` can
+only return an `egui::Response`, so it has nowhere to put the
+`Vec<WebViewEvent>` `show` returns; that impl's doc comment says so and
+points callers who need events back to `show` directly. `#![warn(missing_docs)]`
+is on at the crate root and passes clean (no existing public item needed a
+comment added beyond what A2–A6 already wrote). `README.md` covers the
+`WebViewHost`/`WebView` split, the fail-open navigation/interception warning,
+the rendering path (including the reverted GL attempt from A6 above), and
+runtime setup (`libEGL.dll`/`libGLESv2.dll`, per `HANDOFF.md` §3.9).
+`examples/two_views.rs` creates one `WebViewHost` and two independent
+`WebView`s side by side, each on its own page, input, and scroll state, to
+prove the A2 split holds — it compiles (`cargo check --example two_views -p
+egui-servo-webview`) but was not run interactively in this environment (no
+display to watch it on, same constraint noted elsewhere in this file for
+input verification); the unit-test suite (18 tests, all pure helpers — key
+mapping, `source_to_url`, the coordinate transform, the navigation/
+interception default-policy test) already ran under `cargo test -p
+egui-servo-webview` and continues to pass, doc-test included. `cargo doc` CI
+and a polished `examples/minimal.rs` were not added, matching the plan.
+
 ---
 
 ## Track B — the mail client

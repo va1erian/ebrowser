@@ -19,6 +19,12 @@
 //! One [`WebViewHost`] owns the engine; it can produce any number of
 //! [`WebView`]s that share it.
 
+// A7 (PLAN.md): `warn`, not `deny` -- this crate is internal-only (never
+// published, see PLAN.md's A7 section), so there's no external consumer to
+// protect with a hard failure. `warn` still gets every public item reviewed
+// once and keeps new ones from silently going undocumented.
+#![warn(missing_docs)]
+
 // Re-exported so callers can name the types in this crate's signatures without
 // taking their own dependency on these crates (and risking a version skew).
 pub use dpi;
@@ -547,6 +553,13 @@ impl WebView {
     /// Call once per frame per view. The engine itself is driven separately by
     /// [`WebViewHost::spin`], which must be called once per frame overall.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
+        self.show_impl(ui).1
+    }
+
+    /// Shared implementation behind [`WebView::show`] and the
+    /// `egui::Widget for &mut WebView` impl below -- the two differ only in
+    /// which half of this they hand back to the caller.
+    fn show_impl(&mut self, ui: &mut egui::Ui) -> (egui::Response, Vec<WebViewEvent>) {
         let dpi = ui.ctx().pixels_per_point();
 
         // Claim the rect first, then size the engine to exactly what we claimed.
@@ -822,7 +835,8 @@ impl WebView {
         }
 
         // Drain accumulated events for the caller.
-        std::mem::take(&mut *self.events.borrow_mut())
+        let events = std::mem::take(&mut *self.events.borrow_mut());
+        (resp, events)
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
@@ -877,6 +891,21 @@ impl WebView {
         let b64 = general_purpose::STANDARD.encode(html.as_bytes());
         let s = format!("data:text/html;charset=utf-8;base64,{}", b64);
         Url::parse(&s).expect("data URL is always valid")
+    }
+}
+
+/// A convenience for embedding a view with `ui.add(&mut view)` instead of
+/// `view.show(ui)`.
+///
+/// This drops the [`WebViewEvent`]s [`WebView::show`] would have returned --
+/// `egui::Widget::ui` can only hand back a [`egui::Response`], with no room
+/// for a second value. Call [`WebView::show`] directly instead whenever the
+/// caller needs navigation/lifecycle events (link clicks, title changes,
+/// etc.); this impl exists for the common case of a view that's just being
+/// displayed.
+impl egui::Widget for &mut WebView {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        self.show_impl(ui).0
     }
 }
 
