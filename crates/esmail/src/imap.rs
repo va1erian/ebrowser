@@ -98,6 +98,17 @@ pub enum ImapCommand {
     /// there's no "don't start a reconnect storm while offline" concern to
     /// preserve.
     FetchHeadersFrom { mailbox: String, first_uid: u32 },
+    /// Save `raw` (a full RFC822 message) into `mailbox` via IMAP `APPEND`
+    /// (B7) -- `main.rs` sends this after a successful SMTP send, with
+    /// `raw` the exact bytes `smtp.rs` handed to the transport, to save a
+    /// copy in the account's Sent folder the way every other mail client
+    /// does (SMTP servers don't do this themselves; sending and saving are
+    /// two separate steps a client is responsible for both of). `mailbox`
+    /// is the caller's choice, not discovered here -- `main.rs` hardcodes
+    /// `"Sent"` rather than looking up the `\Sent` special-use flag with a
+    /// name-based fallback, which PLAN.md §B7 still lists as a real,
+    /// separate gap.
+    Append { mailbox: String, raw: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -119,6 +130,14 @@ pub enum ImapEvent {
     NewHeaders { mailbox: String, headers: Vec<MailHeader> },
     /// Reply to `FetchHeadersFrom` (B3).
     HeadersFrom { mailbox: String, headers: Vec<MailHeader> },
+    /// Reply to `Append` (B7): `raw` was saved into `mailbox`.
+    Appended { mailbox: String },
+    /// `Append` failed. A separate variant from `Error` for the same reason
+    /// `PollFailed` is: by the time this fires, the send it followed has
+    /// already succeeded and the UI has already shown "Message sent" --
+    /// routing this through `Error` would silently overwrite that with a
+    /// misleading "Error: ..." for a step the user never asked to watch.
+    AppendFailed { mailbox: String, error: String },
     /// `PollMailbox`/`FetchNewHeaders` failed. Deliberately a separate
     /// variant from `Error` rather than reusing it: those two commands are
     /// background/best-effort (see their docs), and `main.rs` logs this
@@ -291,6 +310,22 @@ impl ImapActor {
                         Err(e) => {
                             self.session = None;
                             let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        }
+                    }
+                }
+                ImapCommand::Append { mailbox, raw } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::AppendFailed { mailbox, error: e.to_string() }).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match session.append(&mailbox, &raw).await {
+                        Ok(()) => {
+                            let _ = self.event_tx.send(ImapEvent::Appended { mailbox }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::AppendFailed { mailbox, error: e.to_string() }).await;
                         }
                     }
                 }
