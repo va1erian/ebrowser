@@ -286,7 +286,7 @@ rather than faking it, and say so in the README.
 `WebViewSource::Html` gains an optional base URL — it currently always base64s
 into a `data:` URL, which makes every relative link dead.
 
-### A5. Input completeness
+### A5. Input completeness — **PARTIALLY DONE**
 Every item below was checked against servoshell — Servo's own egui-based
 browser — and against the vendored `InputEvent` enum, which has
 `Keyboard`, `Ime`, `MouseButton`, `MouseMove`, `MouseLeftViewport`, `Wheel`,
@@ -331,6 +331,40 @@ reads a raw winit event, egui has already translated the same thing for us.
   Ctrl/Cmd+X/C/V → `InputEvent::EditingAction(Cut/Copy/Paste)` shortcuts.
 - Also add right/middle buttons and double-click, which nothing upstream
   needed to teach us.
+
+**What landed:** text input (the item this section calls "the worst of
+it") — `egui_key_to_keyboard_types` no longer guesses a lowercase character
+for letter/digit keys (it returns `Unidentified`, same as any other unmapped
+key; `egui_key_to_code` is untouched, since physical `Code` was never
+case-ambiguous), and a new `text_to_keyboard_events` turns each
+`egui::Event::Text` into a Down/Up `KeyboardEvent` pair carrying the real,
+shift/layout-resolved character. Focus now follows `resp.request_focus()` on
+any button down and gates keyboard/text forwarding on `resp.has_focus()`,
+replacing the `hovered() || clicked()` approximation that leaked keystrokes
+into the page merely because the pointer rested over it. Pointer exit sends
+`InputEvent::MouseLeftViewport` so `:hover` state doesn't stick when the
+mouse leaves. Right and middle mouse buttons are forwarded alongside Primary
+(double-click needed no special handling — two ordinary click sequences in
+quick succession already reach the page exactly as two clicks did before,
+and page/engine-side double-click detection is not this widget's job). 4 new
+unit tests plus a rewrite of the one that documented the old lowercase-only
+behavior as a known defect.
+
+**Deliberately not done: the `Scroll::Delta` → `InputEvent::Wheel` switch.**
+This is the one item in this section with a real, unverifiable-here
+regression risk: `WheelDelta`'s doc comment describes the *opposite* sign
+convention from `Scroll::Delta`'s (positive `y` scrolls up/reveals content
+above, vs. `Scroll::Delta`'s positive-`y`-scrolls-down), so migrating
+requires also flipping the computed sign — and getting that wrong silently
+inverts scroll direction, which nothing in this environment (no synthetic
+input dispatch, only passive screenshot rendering) can catch. Landing the
+`preventDefault`-support fix at the cost of maybe shipping backwards
+scrolling seemed like the wrong trade; left for whoever can next scroll the
+real app and watch which way the page moves. **Also not done:** IME
+(`egui::Event::Ime` → `InputEvent::Ime`), the cursor-icon delegate hook, and
+clipboard shortcuts (`Ctrl/Cmd+X/C/V` → `InputEvent::EditingAction`) — all
+real, scoped-out for size rather than risk; PLAN.md still describes exactly
+what each needs.
 
 ### A6. Rendering path
 **The zero-copy path exists and we are already on the backend it needs.**
@@ -703,7 +737,7 @@ and Outlook therefore need app passwords.
 | 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
-| **7** | **A5, A6, A7, B8, B9 — start here** | — |
+| 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); **A6, A7, B8, B9 — start here** | — |
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.

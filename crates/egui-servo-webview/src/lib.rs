@@ -608,36 +608,55 @@ impl WebView {
         }
 
         // ── Input forwarding to Servo ─────────────────────────────────────────
+        // Buttons other than Primary added per A5 (PLAN.md) — nothing upstream
+        // needed to teach us those, servoshell just forwards all of winit's.
 
-        let mut primary_down = false;
-        let mut primary_up = false;
+        let mut buttons_down: Vec<(egui::PointerButton, MouseButton)> = Vec::new();
+        let mut buttons_up: Vec<(egui::PointerButton, MouseButton)> = Vec::new();
         let mut interact_pos = None;
         ui.input(|i| {
-            primary_down = i.pointer.button_pressed(egui::PointerButton::Primary);
-            primary_up = i.pointer.button_released(egui::PointerButton::Primary);
+            for (egui_button, servo_button) in [
+                (egui::PointerButton::Primary, MouseButton::Left),
+                (egui::PointerButton::Secondary, MouseButton::Right),
+                (egui::PointerButton::Middle, MouseButton::Middle),
+            ] {
+                if i.pointer.button_pressed(egui_button) {
+                    buttons_down.push((egui_button, servo_button));
+                }
+                if i.pointer.button_released(egui_button) {
+                    buttons_up.push((egui_button, servo_button));
+                }
+            }
             interact_pos = i.pointer.interact_pos().or(i.pointer.hover_pos());
         });
+        let primary_up = buttons_up.iter().any(|(b, _)| *b == egui::PointerButton::Primary);
 
         if let Some(pos) = interact_pos {
             // We only send clicks to servo if the mouse is over the webview
             if widget_rect.contains(pos) || resp.dragged() {
                 let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
-                
-                if primary_down {
+
+                if !buttons_down.is_empty() {
+                    // A5: focus follows any button, not just a completed
+                    // click — request_focus() here (rather than relying on
+                    // hover, the pre-A5 approximation) is also what lets the
+                    // `resp.has_focus()` gate below actually turn on.
                     self.servo_view.focus();
+                    resp.request_focus();
+                }
+                for (_, servo_button) in &buttons_down {
                     self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Down,
-                            MouseButton::Left,
+                            *servo_button,
                             dp,
                         )));
                 }
-                
-                if primary_up {
+                for (_, servo_button) in &buttons_up {
                     self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Up,
-                            MouseButton::Left,
+                            *servo_button,
                             dp,
                         )));
                 }
@@ -655,6 +674,12 @@ impl WebView {
                 }
             }
         } else {
+            // A5: tell the page the pointer left, so :hover state doesn't
+            // stay stuck the way it did when we merely stopped sending moves.
+            if self.last_mouse_pos.is_some() {
+                self.servo_view
+                    .notify_input_event(InputEvent::MouseLeftViewport(Default::default()));
+            }
             self.last_mouse_pos = None;
         }
 
@@ -685,8 +710,11 @@ impl WebView {
         }
 
         // ── Arrow key / Page scrolling ────────────────────────────────────────
-        // Only handle keys when the webview is focused (pointer inside or clicked).
-        let has_focus = resp.hovered() || resp.clicked() || resp.has_focus();
+        // A5: gated on real egui focus now, requested above on click, rather
+        // than on hover — hover alone meant typing into a sibling text field
+        // with the pointer merely resting over this widget leaked keystrokes
+        // into the page underneath it.
+        let has_focus = resp.has_focus();
         if has_focus {
             // Line-height in device pixels for arrow key steps.
             let line_px = (24.0 * dpi) as f32;
@@ -740,6 +768,17 @@ impl WebView {
                             repeat,
                             is_composing: false,
                         });
+                        self.servo_view
+                            .notify_input_event(InputEvent::Keyboard(kb_event));
+                    }
+                } else if let egui::Event::Text(text) = event {
+                    // A5: the actual character(s), shift/layout already
+                    // resolved by egui-winit from the same source winit
+                    // itself uses — see `text_to_keyboard_events`'s doc
+                    // comment for why `egui_key_to_keyboard_types` above no
+                    // longer tries to guess this from `egui::Key` alone.
+                    let modifiers = ui.input(|i| egui_modifiers_to_keyboard_types(&i.modifiers));
+                    for kb_event in text_to_keyboard_events(&text, modifiers) {
                         self.servo_view
                             .notify_input_event(InputEvent::Keyboard(kb_event));
                     }
@@ -837,45 +876,73 @@ fn egui_key_to_keyboard_types(key: &egui::Key) -> keyboard_types::Key {
         egui::Key::End         => Key::Named(NamedKey::End),
         egui::Key::PageUp      => Key::Named(NamedKey::PageUp),
         egui::Key::PageDown    => Key::Named(NamedKey::PageDown),
-        // Letter / digit keys (lowercase; browser handles Shift for uppercase)
-        egui::Key::A => Key::Character("a".into()),
-        egui::Key::B => Key::Character("b".into()),
-        egui::Key::C => Key::Character("c".into()),
-        egui::Key::D => Key::Character("d".into()),
-        egui::Key::E => Key::Character("e".into()),
-        egui::Key::F => Key::Character("f".into()),
-        egui::Key::G => Key::Character("g".into()),
-        egui::Key::H => Key::Character("h".into()),
-        egui::Key::I => Key::Character("i".into()),
-        egui::Key::J => Key::Character("j".into()),
-        egui::Key::K => Key::Character("k".into()),
-        egui::Key::L => Key::Character("l".into()),
-        egui::Key::M => Key::Character("m".into()),
-        egui::Key::N => Key::Character("n".into()),
-        egui::Key::O => Key::Character("o".into()),
-        egui::Key::P => Key::Character("p".into()),
-        egui::Key::Q => Key::Character("q".into()),
-        egui::Key::R => Key::Character("r".into()),
-        egui::Key::S => Key::Character("s".into()),
-        egui::Key::T => Key::Character("t".into()),
-        egui::Key::U => Key::Character("u".into()),
-        egui::Key::V => Key::Character("v".into()),
-        egui::Key::W => Key::Character("w".into()),
-        egui::Key::X => Key::Character("x".into()),
-        egui::Key::Y => Key::Character("y".into()),
-        egui::Key::Z => Key::Character("z".into()),
-        egui::Key::Num0 => Key::Character("0".into()),
-        egui::Key::Num1 => Key::Character("1".into()),
-        egui::Key::Num2 => Key::Character("2".into()),
-        egui::Key::Num3 => Key::Character("3".into()),
-        egui::Key::Num4 => Key::Character("4".into()),
-        egui::Key::Num5 => Key::Character("5".into()),
-        egui::Key::Num6 => Key::Character("6".into()),
-        egui::Key::Num7 => Key::Character("7".into()),
-        egui::Key::Num8 => Key::Character("8".into()),
-        egui::Key::Num9 => Key::Character("9".into()),
+        // Letter / digit keys carry no case or shift information here (A5 of
+        // PLAN.md) — `egui::Key` alone can't distinguish "a" from "A" or "2"
+        // from "@". Deliberately `Unidentified` rather than the guessed
+        // lowercase character this used to return: `show()` now forwards
+        // `egui::Event::Text` separately as `Key::Character`, which egui
+        // derives from the same fully layout- and shift-resolved source
+        // winit itself uses. `egui_key_to_code` below still maps these to
+        // real physical `Code`s, which carry no case ambiguity to begin with.
+        egui::Key::A
+        | egui::Key::B
+        | egui::Key::C
+        | egui::Key::D
+        | egui::Key::E
+        | egui::Key::F
+        | egui::Key::G
+        | egui::Key::H
+        | egui::Key::I
+        | egui::Key::J
+        | egui::Key::K
+        | egui::Key::L
+        | egui::Key::M
+        | egui::Key::N
+        | egui::Key::O
+        | egui::Key::P
+        | egui::Key::Q
+        | egui::Key::R
+        | egui::Key::S
+        | egui::Key::T
+        | egui::Key::U
+        | egui::Key::V
+        | egui::Key::W
+        | egui::Key::X
+        | egui::Key::Y
+        | egui::Key::Z
+        | egui::Key::Num0
+        | egui::Key::Num1
+        | egui::Key::Num2
+        | egui::Key::Num3
+        | egui::Key::Num4
+        | egui::Key::Num5
+        | egui::Key::Num6
+        | egui::Key::Num7
+        | egui::Key::Num8
+        | egui::Key::Num9 => Key::Named(NamedKey::Unidentified),
         _ => Key::Named(NamedKey::Unidentified),
     }
+}
+
+/// Turn one `egui::Event::Text` string into the Down/Up `KeyboardEvent` pair
+/// that represents typing it. `code` is `Unidentified`: a `Text` event
+/// doesn't carry which physical key produced it (it may not even correspond
+/// to one, e.g. IME commit or a pasted character), so there is nothing
+/// honest to put there — `key` (the actual character) is what page form
+/// handlers care about anyway.
+fn text_to_keyboard_events(text: &str, modifiers: Modifiers) -> [KeyboardEvent; 2] {
+    let make = |state: KeyState| {
+        KeyboardEvent::new(keyboard_types::KeyboardEvent {
+            state,
+            key: keyboard_types::Key::Character(text.to_string()),
+            code: keyboard_types::Code::Unidentified,
+            location: Location::Standard,
+            modifiers,
+            repeat: false,
+            is_composing: false,
+        })
+    };
+    [make(KeyState::Down), make(KeyState::Up)]
 }
 
 fn egui_key_to_code(key: &egui::Key) -> keyboard_types::Code {
@@ -1135,15 +1202,39 @@ mod tests {
         );
     }
 
-    /// Documents a known defect rather than asserting desirable behaviour.
-    /// `egui::Key` carries no case information, so this mapping can only ever
-    /// produce lowercase and can never produce a shifted symbol — typing "A" or
-    /// "@" into a page is impossible. A5 replaces it with `egui::Event::Text`;
-    /// delete this test when that lands.
+    /// A5 landed: letter/digit keys no longer guess a lowercase character —
+    /// `egui::Key` alone carries no case/shift information, so a real
+    /// character now comes from `egui::Event::Text` via
+    /// `text_to_keyboard_events` instead (tested below). This mapping's job
+    /// for these keys is just "no synthesized character", not "no key at
+    /// all" — `egui_key_to_code` still gives the real physical `Code`.
     #[test]
-    fn letter_keys_are_lowercase_only_which_a5_must_fix() {
-        use keyboard_types::Key;
-        assert_eq!(egui_key_to_keyboard_types(&egui::Key::A), Key::Character("a".into()));
+    fn letter_and_digit_keys_no_longer_synthesize_a_lowercase_character() {
+        use keyboard_types::{Key, NamedKey};
+        assert_eq!(egui_key_to_keyboard_types(&egui::Key::A), Key::Named(NamedKey::Unidentified));
+        assert_eq!(egui_key_to_keyboard_types(&egui::Key::Num2), Key::Named(NamedKey::Unidentified));
+        // Physical Code mapping is untouched -- letters/digits carry no case
+        // ambiguity there to begin with.
+        assert_eq!(egui_key_to_code(&egui::Key::A), keyboard_types::Code::KeyA);
+    }
+
+    #[test]
+    fn text_to_keyboard_events_produces_a_down_then_up_with_the_real_character() {
+        use keyboard_types::{Key, KeyState};
+        let [down, up] = text_to_keyboard_events("@", Modifiers::SHIFT);
+        assert_eq!(down.event.state, KeyState::Down);
+        assert_eq!(down.event.key, Key::Character("@".into()));
+        assert!(down.event.modifiers.contains(Modifiers::SHIFT));
+        assert_eq!(up.event.state, KeyState::Up);
+        assert_eq!(up.event.key, Key::Character("@".into()));
+    }
+
+    #[test]
+    fn text_to_keyboard_events_carries_multi_character_input_through_unsplit() {
+        // e.g. an IME commit or a paste landing as one Text event -- this
+        // isn't meant to split it into individual keystrokes.
+        let [down, _] = text_to_keyboard_events("café", Modifiers::empty());
+        assert_eq!(down.event.key, keyboard_types::Key::Character("café".into()));
     }
 
     #[test]
