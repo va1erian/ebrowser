@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+name = "esmail"
+path = "src/lib.rs"
+
 [[bin]]
 name = "esmail"
 path = "src/main.rs"
@@ -46,3 +50,6 @@ image.workspace = true
 [target.'cfg(windows)'.dependencies]
 tray-icon.workspace = true
 winrt-notification.workspace = true
+
+[dev-dependencies]
+mail-mock-server = { path = "../mail-mock-server" }

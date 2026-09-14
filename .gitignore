@@ -33,3 +33,7 @@ shot_*.png
 # esmail's local SQLite cache (db.rs) — a runtime artifact, not source; was
 # accidentally committed as an empty schema, see the B3 commit that untracked it.
 mails.db
+
+# mail-mock-server's CA cert, written out by `docker compose up mail-mock-server`
+# for a host TLS client to trust — see docker-compose.yml / CA_OUT.
+/tmp/mail-mock-server-ca/

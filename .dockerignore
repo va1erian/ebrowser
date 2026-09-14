@@ -1,0 +1,11 @@
+# Keeps the Docker build context small and fast. mail-mock-server's
+# Dockerfile does `COPY . .` from the repo root (it needs every workspace
+# member's Cargo.toml present to resolve the lockfile, even though it only
+# compiles the mail-mock-server package -- see that Dockerfile's comment),
+# so without this, Docker would copy the entire cargo `target/` directory
+# (which holds this workspace's full Servo build -- easily multiple
+# gigabytes) into the build context on every build.
+target/
+.git/
+tmp/
+*.db
