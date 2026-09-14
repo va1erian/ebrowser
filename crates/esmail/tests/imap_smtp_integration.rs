@@ -162,6 +162,36 @@ async fn fetch_body_decodes_an_rfc2047_encoded_unicode_subject() {
     assert!(unicode.subject.contains("日本語"), "subject was: {:?}", unicode.subject);
 }
 
+/// B3: the IMAP-side half of turning a `SyncPlan::FetchFrom` into an actual
+/// fetch. `ImapCommand::FetchHeadersFrom` reuses the same envelope-only,
+/// unpaged fetch `FetchNewHeaders` (B10) already exercises indirectly via
+/// the notify tests, but as its own command/event pair -- see its doc in
+/// imap.rs for why -- so it's worth its own direct coverage here rather
+/// than assuming the shared underlying fetch still behaves under a new
+/// entry point.
+#[tokio::test]
+async fn fetch_headers_from_returns_envelopes_from_the_given_uid_onward() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(5).await; // 2 fixtures + 5 = 7 total, UIDs 1..=7
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { mailbox_state, .. } => assert_eq!(mailbox_state.uid_next, 8),
+        other => panic!("expected Headers, got {other:?}"),
+    }
+
+    h.imap_cmd.send(ImapCommand::FetchHeadersFrom { mailbox: "INBOX".to_string(), first_uid: 5 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::HeadersFrom { mailbox, headers } => {
+            assert_eq!(mailbox, "INBOX");
+            let mut uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
+            uids.sort();
+            assert_eq!(uids, vec![5, 6, 7]);
+        }
+        other => panic!("expected HeadersFrom, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn bulk_download_streams_every_message_with_progress() {
     skip_unless_ca_trusted!();

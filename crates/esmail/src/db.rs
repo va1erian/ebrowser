@@ -26,6 +26,22 @@ pub enum DbCommand {
         header: MailHeader,
         body: String,
     },
+    /// Metadata-only counterpart to `IndexMail` (B3): upserts `messages` for
+    /// each header without a body to cache, since these come from
+    /// `ImapCommand::FetchHeadersFrom`'s envelope-only fetch -- the response
+    /// to a `SyncPlan::FetchFrom`/`Resync` decision, acted on for the first
+    /// time in B3. Deliberately does not touch `bodies`/`messages_fts`: a
+    /// row with no body cached should not become findable-by-body-text
+    /// (nor should it clobber an existing cached body/FTS row with an empty
+    /// one) until something actually fetches and indexes that message's
+    /// body -- today only `IndexMail`, i.e. `BulkDownload`. See PLAN.md §B3
+    /// for the still-open gap that opening a single message via `FetchBody`
+    /// doesn't index it either.
+    IndexHeaders {
+        account_id: String,
+        mailbox: String,
+        headers: Vec<MailHeader>,
+    },
     Search {
         account_id: String,
         query: String,
@@ -113,6 +129,11 @@ impl DbActor {
             match cmd {
                 DbCommand::IndexMail { account_id, mailbox, header, body } => {
                     if let Err(e) = index_mail(&self.conn, &account_id, &mailbox, &header, &body) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::IndexHeaders { account_id, mailbox, headers } => {
+                    if let Err(e) = index_headers(&self.conn, &account_id, &mailbox, &headers) {
                         let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
                     }
                 }
@@ -217,6 +238,33 @@ fn add_message_id_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
         Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Insert or update several messages' metadata only, with no body to cache
+/// (B3) -- see [`DbCommand::IndexHeaders`]'s doc for why this leaves
+/// `bodies`/`messages_fts` untouched. `size` is left at whatever it already
+/// was (0 for a never-seen row, via `messages`' own column default) rather
+/// than being reset to 0 on every re-sync of an already-known message.
+fn index_headers(
+    conn: &Connection,
+    account_id: &str,
+    mailbox: &str,
+    headers: &[MailHeader],
+) -> rusqlite::Result<()> {
+    for header in headers {
+        conn.execute(
+            "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+             ON CONFLICT (account_id, mailbox, uid) DO UPDATE SET
+                subject = excluded.subject,
+                from_addr = excluded.from_addr,
+                to_addr = excluded.to_addr,
+                date = excluded.date,
+                message_id = excluded.message_id",
+            params![account_id, mailbox, header.uid, header.subject, header.from, header.to, header.date, header.message_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Insert or update one message's metadata, cached body, and FTS row. Safe to
@@ -532,6 +580,44 @@ mod tests {
         assert_eq!(fetch_mail(&conn, "acc1", "INBOX", 1).unwrap().1, "acc1 inbox");
         assert_eq!(fetch_mail(&conn, "acc2", "INBOX", 1).unwrap().1, "acc2 inbox");
         assert_eq!(fetch_mail(&conn, "acc1", "Archive", 1).unwrap().1, "acc1 archive");
+    }
+
+    // ── index_headers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_headers_populates_messages_metadata_without_a_body() {
+        let conn = test_conn();
+        index_headers(&conn, "acc", "INBOX", &[test_header(1), test_header(2)]).unwrap();
+
+        let subject: String = conn
+            .query_row("SELECT subject FROM messages WHERE account_id = 'acc' AND mailbox = 'INBOX' AND uid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(subject, "Subject 1");
+
+        // No body was ever supplied -- `bodies` and `messages_fts` must stay
+        // untouched, not get a row with an empty body that would make an
+        // unfetched message spuriously "findable" or blank out a real
+        // cached body a later index_mail wrote.
+        let bodies: i64 = conn.query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0)).unwrap();
+        assert_eq!(bodies, 0);
+        let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(fts, 0);
+    }
+
+    #[test]
+    fn index_headers_does_not_clobber_an_already_cached_body_or_its_size() {
+        // A mailbox re-sync (SyncPlan::FetchFrom) can report a UID that was
+        // already fully indexed earlier via index_mail (e.g. the server's
+        // UIDNEXT moved because of messages in a range that includes one
+        // this cache already has the body for). index_headers must not
+        // regress that row back to bodyless.
+        let conn = test_conn();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "<p>already cached</p>").unwrap();
+
+        index_headers(&conn, "acc", "INBOX", &[test_header(1)]).unwrap();
+
+        let (_, body) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(body, "<p>already cached</p>");
     }
 
     // ── search ────────────────────────────────────────────────────────────────

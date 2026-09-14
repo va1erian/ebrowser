@@ -82,6 +82,22 @@ pub enum ImapCommand {
     /// `ensure_connected`" reasoning as `PollMailbox` -- this only ever
     /// follows a `PollMailbox` that just proved there's a live session.
     FetchNewHeaders { mailbox: String, first_uid: u32 },
+    /// Fetch envelopes for UIDs `first_uid..` in `mailbox`, to feed `db.rs`'s
+    /// incremental cache sync (B3) -- a `DbEvent::SyncPlan::FetchFrom` names
+    /// exactly this UID range as what the cache is missing. Deliberately a
+    /// distinct command/event pair from `FetchNewHeaders`/`NewHeaders`
+    /// despite doing the identical fetch: those feed B10's new-mail toast
+    /// (`spawn_new_mail_watch` in main.rs builds a notification from every
+    /// `NewHeaders` it sees), and this fires far more often -- on every
+    /// `FetchHeaders` that turns up UIDs the cache hasn't seen yet, which
+    /// includes the user's own routine "open INBOX"/"hit refresh". Routing
+    /// both through one event would toast the user for their own actions.
+    /// Unlike `FetchNewHeaders`, this *does* call `ensure_connected`: it's a
+    /// direct follow-up to a `FetchHeaders` that just proved the session
+    /// live moments ago (not an independent background-timer poll), so
+    /// there's no "don't start a reconnect storm while offline" concern to
+    /// preserve.
+    FetchHeadersFrom { mailbox: String, first_uid: u32 },
 }
 
 #[derive(Debug)]
@@ -101,6 +117,8 @@ pub enum ImapEvent {
     MailboxPolled { mailbox: String, state: MailboxState },
     /// Reply to `FetchNewHeaders` (B10).
     NewHeaders { mailbox: String, headers: Vec<MailHeader> },
+    /// Reply to `FetchHeadersFrom` (B3).
+    HeadersFrom { mailbox: String, headers: Vec<MailHeader> },
     /// `PollMailbox`/`FetchNewHeaders` failed. Deliberately a separate
     /// variant from `Error` rather than reusing it: those two commands are
     /// background/best-effort (see their docs), and `main.rs` logs this
@@ -257,6 +275,22 @@ impl ImapActor {
                         Err(e) => {
                             self.session = None;
                             let _ = self.event_tx.send(ImapEvent::PollFailed(e.to_string())).await;
+                        }
+                    }
+                }
+                ImapCommand::FetchHeadersFrom { mailbox, first_uid } => {
+                    if let Err(e) = self.ensure_connected().await {
+                        let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
+                        continue;
+                    }
+                    let session = self.session.as_mut().expect("ensure_connected just verified this");
+                    match Self::fetch_new_headers(session, &mailbox, first_uid).await {
+                        Ok(headers) => {
+                            let _ = self.event_tx.send(ImapEvent::HeadersFrom { mailbox, headers }).await;
+                        }
+                        Err(e) => {
+                            self.session = None;
+                            let _ = self.event_tx.send(ImapEvent::Error(e.to_string())).await;
                         }
                     }
                 }

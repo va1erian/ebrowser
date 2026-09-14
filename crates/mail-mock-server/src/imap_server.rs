@@ -1,7 +1,7 @@
 //! A minimal IMAP4rev1 server -- just enough of the protocol for esmail's
 //! `imap.rs` to drive: `LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
-//! `UID FETCH RFC822`, `IDLE`, `LOGOUT`. Nothing else esmail sends is
-//! implemented.
+//! `UID FETCH <n|n:m|n:*> (RFC822 | (UID ENVELOPE))`, `IDLE`, `LOGOUT`.
+//! Nothing else esmail sends is implemented.
 //!
 //! `IDLE` (RFC 2177) pushes an untagged `* N EXISTS` as soon as
 //! `Store::deliver` lands a message in the selected mailbox, by subscribing
@@ -88,6 +88,28 @@ fn address(addr: &Option<(String, String, String)>) -> Vec<u8> {
             out
         }
     }
+}
+
+/// One `* <seq> FETCH (UID <uid> ENVELOPE (...))` line -- shared by the
+/// sequence-number `FETCH` handler and `UID FETCH`'s `ENVELOPE` mode, which
+/// otherwise built an identical response by hand in two places.
+fn envelope_fetch_response(seq: u32, msg: &crate::store::StoredMessage) -> Vec<u8> {
+    let mut r = format!("* {seq} FETCH (UID {} ENVELOPE (", msg.uid).into_bytes();
+    r.extend_from_slice(&nstring(&msg.envelope.date));
+    r.push(b' ');
+    r.extend_from_slice(&nstring(&msg.envelope.subject));
+    r.push(b' ');
+    r.extend_from_slice(&address(&msg.envelope.from));
+    r.push(b' ');
+    r.extend_from_slice(&address(&msg.envelope.from)); // sender
+    r.push(b' ');
+    r.extend_from_slice(&address(&msg.envelope.from)); // reply-to
+    r.push(b' ');
+    r.extend_from_slice(&address(&msg.envelope.to));
+    r.extend_from_slice(b" NIL NIL NIL "); // cc bcc in-reply-to
+    r.extend_from_slice(&nstring(&msg.envelope.message_id));
+    r.extend_from_slice(b"))\r\n");
+    r
 }
 
 async fn handle_connection<S>(stream: S, store: SharedStore) -> anyhow::Result<()>
@@ -197,22 +219,7 @@ where
                         let mut responses = Vec::new();
                         for seq in start.max(1)..=end {
                             if let Some(msg) = mailbox.messages.get((seq - 1) as usize) {
-                                let mut r = format!("* {seq} FETCH (UID {} ENVELOPE (", msg.uid).into_bytes();
-                                r.extend_from_slice(&nstring(&msg.envelope.date));
-                                r.push(b' ');
-                                r.extend_from_slice(&nstring(&msg.envelope.subject));
-                                r.push(b' ');
-                                r.extend_from_slice(&address(&msg.envelope.from));
-                                r.push(b' ');
-                                r.extend_from_slice(&address(&msg.envelope.from)); // sender
-                                r.push(b' ');
-                                r.extend_from_slice(&address(&msg.envelope.from)); // reply-to
-                                r.push(b' ');
-                                r.extend_from_slice(&address(&msg.envelope.to));
-                                r.extend_from_slice(b" NIL NIL NIL "); // cc bcc in-reply-to
-                                r.extend_from_slice(&nstring(&msg.envelope.message_id));
-                                r.extend_from_slice(b"))\r\n");
-                                responses.push(r);
+                                responses.push(envelope_fetch_response(seq, msg));
                             }
                         }
                         responses
@@ -232,24 +239,66 @@ where
                     write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
                     continue;
                 };
-                let Some(uid_str) = tokens.get(3) else {
+                let Some(uid_spec) = tokens.get(3) else {
                     write_half.write_all(format!("{tag} BAD UID FETCH needs a UID\r\n").as_bytes()).await?;
                     continue;
                 };
-                let Ok(uid) = uid_str.parse::<u32>() else {
-                    write_half.write_all(format!("{tag} BAD invalid UID\r\n").as_bytes()).await?;
-                    continue;
-                };
-                let found = {
-                    let guard = store.lock().unwrap();
-                    guard.mailbox(&mailbox_name).and_then(|mb| mb.messages.iter().find(|m| m.uid == uid).cloned())
+                // The fetch-item spec is everything after the UID/range --
+                // one bare token (`RFC822`) or several once `tokenize` has
+                // split a parenthesized list like `(UID ENVELOPE)` on its
+                // internal space (`imap.rs::fetch_body` sends the former,
+                // `imap.rs::fetch_new_headers`/`fetch_headers_from` the
+                // latter). Matched by substring rather than parsed
+                // structurally -- esmail's client only ever sends exactly
+                // these two shapes (see this module's doc comment), so a
+                // full IMAP fetch-item-list grammar would be effort spent
+                // on inputs that never arrive.
+                let items = tokens[4..].join(" ").to_ascii_uppercase();
+                let wants_envelope = items.contains("ENVELOPE");
+                let wants_rfc822 = items.contains("RFC822");
+
+                // A bare UID (`5`) is its own one-message range; `async_imap`
+                // also sends open-ended ranges (`5:*`) for "from this UID
+                // onward" fetches -- `*` here always means "the highest UID
+                // this mailbox currently has", same as real IMAP.
+                let (start, end) = if let Some((a, b)) = uid_spec.split_once(':') {
+                    let a: u32 = a.parse().unwrap_or(1);
+                    let b = if b == "*" { u32::MAX } else { b.parse().unwrap_or(a) };
+                    (a, b)
+                } else {
+                    match uid_spec.parse::<u32>() {
+                        Ok(uid) => (uid, uid),
+                        Err(_) => {
+                            write_half.write_all(format!("{tag} BAD invalid UID\r\n").as_bytes()).await?;
+                            continue;
+                        }
+                    }
                 };
 
-                if let Some(msg) = found {
-                    let mut r = format!("* 1 FETCH (UID {} RFC822 ", msg.uid).into_bytes();
-                    r.extend_from_slice(&literal(&msg.raw));
-                    r.extend_from_slice(b")\r\n");
-                    write_half.write_all(&r).await?;
+                let matches: Vec<(u32, crate::store::StoredMessage)> = {
+                    let guard = store.lock().unwrap();
+                    guard
+                        .mailbox(&mailbox_name)
+                        .map(|mb| {
+                            mb.messages
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, m)| m.uid >= start && m.uid <= end)
+                                .map(|(i, m)| ((i + 1) as u32, m.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+
+                for (seq, msg) in &matches {
+                    if wants_envelope {
+                        write_half.write_all(&envelope_fetch_response(*seq, msg)).await?;
+                    } else if wants_rfc822 {
+                        let mut r = format!("* {seq} FETCH (UID {} RFC822 ", msg.uid).into_bytes();
+                        r.extend_from_slice(&literal(&msg.raw));
+                        r.extend_from_slice(b")\r\n");
+                        write_half.write_all(&r).await?;
+                    }
                 }
                 write_half.write_all(format!("{tag} OK UID FETCH completed\r\n").as_bytes()).await?;
             }
