@@ -419,6 +419,19 @@ impl EsMailApp {
                     // fetch new envelopes / show a toast). Nothing left here
                     // for the UI to do with either variant.
                 }
+                ImapEvent::HeadersFrom { mailbox, headers } => {
+                    // B3: reply to the `FetchHeadersFrom` sent in
+                    // `handle_db_events`'s `SyncPlan::FetchFrom`/`Resync`
+                    // arm -- index into the cache now that these envelopes
+                    // are in hand. See `ImapCommand::FetchHeadersFrom`'s doc
+                    // for why this is a separate event from `NewHeaders`
+                    // rather than reusing it.
+                    let _ = self.db_tx.try_send(DbCommand::IndexHeaders {
+                        account_id: self.account_id(),
+                        mailbox,
+                        headers,
+                    });
+                }
                 ImapEvent::PollFailed(e) => {
                     // Deliberately not `self.status` -- see the variant's
                     // doc in imap.rs: a background poll failing every 60s
@@ -442,13 +455,30 @@ impl EsMailApp {
                     }
                 }
                 DbEvent::SyncPlan { account_id, mailbox, plan } => {
-                    // Not yet acted on — no incremental fetch is issued in
-                    // response to `FetchFrom`/`Resync` today, so BulkDownload
-                    // remains the only way to pull more than the current
-                    // page. Logged (not surfaced in the UI) so the decision
-                    // is at least visible while nothing consumes it yet.
-                    // See PLAN.md §B3.
-                    log::debug!("sync plan for {account_id}/{mailbox}: {plan:?}");
+                    // B3: turn a `FetchFrom`/`Resync` decision into an
+                    // actual incremental fetch, so the cache accumulates
+                    // message metadata for this mailbox over time instead of
+                    // only ever being populated by `BulkDownload`. A
+                    // `Resync` already wiped the cache's rows for this
+                    // mailbox in `db.rs::report_mailbox_state` by the time
+                    // this event arrives -- fetching from UID 1 repopulates
+                    // it under the server's new UIDVALIDITY.
+                    //
+                    // `account_id` isn't used to route this -- there is
+                    // exactly one account connected at a time today (see
+                    // `EsMailApp::account_id`'s own doc), so it's implicitly
+                    // always "the" account; kept on the event for when that
+                    // stops being true.
+                    let _ = account_id;
+                    match plan {
+                        db::SyncPlan::UpToDate => {}
+                        db::SyncPlan::FetchFrom { first_new_uid } => {
+                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeadersFrom { mailbox, first_uid: first_new_uid });
+                        }
+                        db::SyncPlan::Resync => {
+                            let _ = self.imap_tx.try_send(ImapCommand::FetchHeadersFrom { mailbox, first_uid: 1 });
+                        }
+                    }
                 }
                 DbEvent::Error(e) => {
                     self.status = format!("DB Error: {}", e);

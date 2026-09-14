@@ -496,7 +496,7 @@ just an error message, which is wasteful but never leaves the actor (or the
 worker) stuck. Worth revisiting once real error variants are threaded
 through instead of `anyhow::Error`.
 
-### B3. Local cache — finish and harden `db.rs` — **PARTIALLY DONE**
+### B3. Local cache — finish and harden `db.rs` — **PARTIALLY DONE** (incremental sync now acted on)
 The WIP `DbActor` is the right idea; give it the schema the rest of the plan
 needs: `accounts`, `mailboxes` (with `uidvalidity` / `uidnext` /
 `highestmodseq`), `messages` (envelope + flags + size + thread key), `bodies`
@@ -528,16 +528,48 @@ parameter now (regression test:
 `mails.db` was accidentally committed (an empty schema, no real data in it —
 checked) as a stray runtime artifact; it's untracked and gitignored now.
 
-**What did not land:** nothing yet *acts* on a `FetchFrom`/`Resync` decision.
-`DbEvent::SyncPlan` is computed and logged, but no incremental UID fetch is
-issued in response — `BulkDownload` is still the only way to pull more than
-the current page, and still pulls the whole mailbox unconditionally every
-time. Turning a `SyncPlan` into an actual `UID FETCH` request, and switching
-header paging from sequence-number ranges to UID-based ranges served from the
-local cache (so the list renders instantly and works offline), is real
-follow-on work — the DB-side half above is what it needs to build on, but
-doing the IMAP-side half blind (no live server here to verify it against)
-felt like the wrong tradeoff, same reasoning as B2's deferred session split.
+**A `FetchFrom`/`Resync` decision is now acted on**, landed once
+`mail-mock-server` existed to verify the IMAP-side half against — same
+unblocking as B2/B11. `EsMailApp::handle_db_events`'s `SyncPlan` arm sends a
+new `ImapCommand::FetchHeadersFrom { mailbox, first_uid }` (an envelope-only,
+unpaged `UID FETCH first_uid:* (UID ENVELOPE)`, mechanically the same fetch
+`FetchNewHeaders`/B10 already does — kept as a *separate* command/event pair
+rather than reused, since `NewHeaders` also drives B10's new-mail toast, and
+this fires far more often, including on the user's own routine "open
+INBOX"/"hit refresh"; reusing it would toast the user for their own
+actions). Its reply (`ImapEvent::HeadersFrom`) is indexed via a new
+`DbCommand::IndexHeaders`/`index_headers` — metadata-only, deliberately
+leaving `bodies`/`messages_fts` untouched (a row with no cached body
+shouldn't become search-findable, nor clobber a real cached body a later
+`BulkDownload`/`IndexMail` already wrote for the same UID; regression-tested
+by `index_headers_does_not_clobber_an_already_cached_body_or_its_size`).
+
+Finding this wiring required fixing a real, previously-latent gap in
+`mail-mock-server` itself: its `UID FETCH` handler only ever supported a
+single numeric UID with `RFC822` (enough for `imap.rs::fetch_body`, the only
+thing exercising it before now) — not the `first_uid:*` range with
+`(UID ENVELOPE)` that `fetch_new_headers`/`fetch_headers_from` actually
+send. `FetchNewHeaders` (B10) had apparently never been exercised against
+this server either, since nothing caught it until this phase's own
+integration test (`fetch_headers_from_returns_envelopes_from_the_given_uid_onward`)
+failed with an empty result. Fixed by extending `UID FETCH` to parse a
+`start:end`/`start:*` range and an `ENVELOPE` fetch-item, sharing the
+existing sequence-number `FETCH` handler's envelope-response building via a
+new `envelope_fetch_response` helper instead of a third hand-copied block.
+
+**What still did not land:** switching header-list *paging* from
+sequence-number ranges served live from the network to UID-based ranges
+served from the local cache (so the list renders instantly and works
+offline) — the header list still always re-fetches from the server on every
+page/mailbox change; the cache accumulates in the background but the UI
+doesn't read from it yet. That's a genuinely separate, larger change (when
+to trust the cache vs. re-fetch, pagination consistency, offline behavior)
+from "does an incremental fetch happen at all", which is what this phase
+scoped down to. Also still open: `FetchBody` (opening a single message) still
+doesn't index anything into the cache — only `BulkDownload`/`IndexMail` and
+now this phase's `FetchHeadersFrom`/`IndexHeaders` do, so a message opened
+one at a time is never searchable until a bulk download also happens to
+cover it.
 
 ### B4. Search — **PARTIALLY DONE**
 Two paths behind one search box:
@@ -1037,7 +1069,7 @@ to verify against.
 | ~~1~~ | ~~A1, A2~~ **DONE** | all of A |
 | ~~2~~ | ~~A3, A4~~ **DONE** | B5 |
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (worker-session split now done; cancellation-of-in-flight-work still doesn't interrupt an active fetch, see §B2) | B3, B7 |
-| 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
+| 4 | B3 **partially done** (incremental fetch now acted on; UID-based cache paging still not, see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
 | 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); **A6, A7, B8, B9 — start here** | — |

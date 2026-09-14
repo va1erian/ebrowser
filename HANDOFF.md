@@ -7,8 +7,9 @@ repeat them.
 **Your next task is one of A6/A7/B8/B9** ([PLAN.md](PLAN.md), phase 7 — all
 independent of each other, pick whichever is most useful next; A6/A7 may
 already be in progress or done by the time you read this, see §5's table).
-Phases 0-2, B1, B5, B10, and now B11 (IMAP push) and B2's worker-session
-split (see below) are done. B3, B4, B6, B7, and A5 are each partially done —
+Phases 0-2, B1, B5, B10, and now B11 (IMAP push), B2's worker-session
+split, and B3's incremental-fetch half (see below) are done. B3 (its
+UID-based cache-paging half), B4, B6, B7, and A5 are each partially done —
 see their PLAN.md sections for exactly what landed vs. what's deliberately
 deferred. Most of the remaining deferrals are still the live-IMAP-facing
 half of a phase — B7's exceptions are IMAP `APPEND`/drafts, a real retry
@@ -21,19 +22,25 @@ of this blocks phase 7.
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
-(see §5's table). This is what unblocked B11 (IMAP `IDLE`/push) and B2's
-worker-session split landing here without the "no server to verify this
-against" caveat every other live-IMAP deferral above still carries. If you
-pick up any of those next — B3's incremental-UID-fetch half, B4's
-server-side `UID SEARCH`, B6's lazy `BODY.PEEK[n]`, B7's `APPEND`/drafts —
-this is the tool to verify them with; see `crates/mail-mock-server/README.md`
-for how to trust its test CA locally (already done once in this worktree)
-and `crates/esmail/tests/imap_smtp_integration.rs` for the pattern to follow
+(see §5's table). This is what unblocked B11 (IMAP `IDLE`/push), B2's
+worker-session split, and B3's incremental-fetch half landing here without
+the "no server to verify this against" caveat every other live-IMAP
+deferral above still carries. If you pick up any of those next — B3's
+UID-based cache-paging half, B4's server-side `UID SEARCH`, B6's lazy
+`BODY.PEEK[n]`, B7's `APPEND`/drafts — this is the tool to verify them with;
+see `crates/mail-mock-server/README.md` for how to trust its test CA
+locally (already done once in this worktree) and
+`crates/esmail/tests/imap_smtp_integration.rs` for the pattern to follow
 (drive `ImapActor`/`SmtpActor`/`idle_watch` directly against a freshly seeded
 in-process server, no live account needed — including a concurrency test,
 `bulk_download_does_not_block_a_concurrent_header_fetch`, worth reading as a
 template if your change also needs to prove two things run independently
-rather than just that each individually returns the right data).
+rather than just that each individually returns the right data). Also worth
+knowing: `mail-mock-server`'s `UID FETCH` handler only supported a single
+numeric UID with `RFC822` until B3 needed range + `ENVELOPE` support too —
+if your change sends a `UID FETCH`/`FETCH` shape not already covered
+(check `imap_server.rs`'s module doc for the current list), expect to
+extend the mock server itself first, the same way B3 and B11 each did.
 
 **B2's worker-session split (the "session pool" PLAN.md §B2 called for) is
 now done too** — see [PLAN.md](PLAN.md) §B2. `imap.rs` gained
@@ -305,7 +312,8 @@ the `glow` renderer. That is §A6.
 | `7599249`, merged as `988beb9` | **B10** — Windows tray icon + toast notifications for new mail (a background agent's work, merged into this branch). `notify.rs` (pure watermark/toast-text logic), `tray.rs` (Windows-only), `imap.rs`'s `PollMailbox`/`FetchNewHeaders`, `spawn_new_mail_watch` polling INBOX every 60s, minimize-to-tray. See PLAN.md §B10 for the full scope and what didn't land. |
 | `e590d59`, `ec7bdf4` (merged from another branch/PR) | **`crates/mail-mock-server`** — an in-process IMAP4rev1 + SMTP server (`LOGIN`/`LIST`/`EXAMINE`/`FETCH`/`UID FETCH`/`LOGOUT`, plaintext SMTP with `AUTH PLAIN`), a committed throwaway TLS test CA, seed fixtures, and `crates/esmail/tests/imap_smtp_integration.rs` driving `ImapActor`/`SmtpActor` against it. `esmail` gained a `lib.rs` so the integration test crate can import it. Also fixed: `safe_attachment_filename` (B6) now splits on `/`/`\` manually instead of `std::path::Path`, since `Path`'s separator handling is host-OS-dependent and silently failed to strip a Windows-style path on Linux. This is what unblocked B11. |
 | `405851f` | **B11** — IMAP `IDLE`/push (see PLAN.md §B11). `idle_watch.rs`: a dedicated always-on IDLE connection, independent of `ImapActor`'s session, that sends a wake signal on any server push; wired into `main.rs` so `spawn_new_mail_watch` (B10) polls immediately on a push instead of waiting for its 60s timer, which keeps running as a fallback. Added `IDLE` support to `mail-mock-server` itself (`Store::notify` broadcast channel, `imap_server.rs`'s `IDLE` handler) plus an integration test proving a push arrives in low single-digit seconds. Merged into `main` via PR #6. |
-| *(this branch)* | **B2 (worker-session split)** — see PLAN.md §B2. `imap.rs` gained `spawn_body_worker`, a second independent IMAP connection (own connect/reconnect loop, `ensure_worker_connected`) that `FetchBody`/`BulkDownload` are routed to instead of `ImapActor`'s own session, so they can't block `FetchHeaders`/`FetchMailboxes` behind them any more. Verified with a real concurrency test (`bulk_download_does_not_block_a_concurrent_header_fetch`), not just unit tests. |
+| `de711a1` (PR #7) | **B2 (worker-session split)** — see PLAN.md §B2. `imap.rs` gained `spawn_body_worker`, a second independent IMAP connection (own connect/reconnect loop, `ensure_worker_connected`) that `FetchBody`/`BulkDownload` are routed to instead of `ImapActor`'s own session, so they can't block `FetchHeaders`/`FetchMailboxes` behind them any more. Verified with a real concurrency test (`bulk_download_does_not_block_a_concurrent_header_fetch`), not just unit tests. |
+| *(this branch)* | **B3 (incremental fetch acted on)** — see PLAN.md §B3. A `DbEvent::SyncPlan::FetchFrom`/`Resync` now triggers a new `ImapCommand::FetchHeadersFrom` (envelope-only `UID FETCH`, kept separate from B10's `FetchNewHeaders` so the cache-sync path can't spuriously trigger a new-mail toast), indexed metadata-only via a new `DbCommand::IndexHeaders`/`index_headers`. Along the way, fixed a real gap in `mail-mock-server`'s `UID FETCH` handler: it only ever supported a single numeric UID with `RFC822`, not the `first:*` range + `ENVELOPE` this needed (and `FetchNewHeaders`/B10 needed too, apparently never exercised against this server until now). UID-based cache paging for the header list itself did not land — see PLAN.md §B3 for why that's scoped as separate follow-on work. |
 
 State: `cargo check --workspace` clean, `cargo test --workspace` all passing
 (unit tests across every crate plus the `mail-mock-server`-backed integration
