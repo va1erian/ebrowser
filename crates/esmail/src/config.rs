@@ -38,19 +38,36 @@ pub struct AccountConfig {
 
 impl AccountConfig {
     /// A new account for `username`@`imap_host`, with the common IMAPS/SMTPS
-    /// defaults (993/465, implicit TLS) until B7 lets the user override them.
+    /// defaults (993/465, implicit TLS) and a guessed `smtp_host` (see
+    /// [`derive_smtp_host`]) that the login screen lets the user override —
+    /// there's no real provider-settings lookup (that's B9's first-run
+    /// wizard, not done), just the common `imap.` → `smtp.` convention.
     pub fn new(display_name: String, imap_host: String, imap_port: u16, username: String) -> Self {
         Self {
             id: format!("{username}@{imap_host}"),
             display_name,
+            smtp_host: derive_smtp_host(&imap_host),
             imap_host,
             imap_port,
             imap_tls: TlsMode::Ssl,
-            smtp_host: String::new(),
             smtp_port: 465,
             smtp_tls: TlsMode::Ssl,
             username,
         }
+    }
+}
+
+/// Guess an SMTP host from an IMAP one, using the common `imap.` → `smtp.`
+/// naming convention (e.g. `imap.gmail.com` → `smtp.gmail.com`). Falls back
+/// to prefixing `smtp.` when the IMAP host doesn't start with `imap.` (e.g.
+/// `mail.example.com` → `smtp.mail.example.com`) — not always right, but a
+/// starting point the login screen lets the user edit rather than leaving
+/// the field empty. There is no real per-provider settings lookup here
+/// (that's B9's first-run wizard).
+fn derive_smtp_host(imap_host: &str) -> String {
+    match imap_host.strip_prefix("imap.") {
+        Some(rest) => format!("smtp.{rest}"),
+        None => format!("smtp.{imap_host}"),
     }
 }
 
@@ -164,6 +181,22 @@ mod tests {
         let a = AccountConfig::new("A".into(), "imap.example.com".into(), 993, "alice".into());
         let b = AccountConfig::new("B".into(), "imap.example.com".into(), 993, "bob".into());
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn derive_smtp_host_swaps_the_imap_prefix() {
+        assert_eq!(derive_smtp_host("imap.gmail.com"), "smtp.gmail.com");
+    }
+
+    #[test]
+    fn derive_smtp_host_prefixes_when_there_is_no_imap_prefix_to_swap() {
+        assert_eq!(derive_smtp_host("mail.example.com"), "smtp.mail.example.com");
+    }
+
+    #[test]
+    fn new_account_guesses_its_smtp_host() {
+        let account = AccountConfig::new("Home".into(), "imap.example.com".into(), 993, "alice".into());
+        assert_eq!(account.smtp_host, "smtp.example.com");
     }
 
     #[test]

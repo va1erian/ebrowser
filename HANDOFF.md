@@ -4,12 +4,14 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is B7** ([PLAN.md](PLAN.md) §B7 — compose and send).
-Phases 0-2, B1, and B5 are done. B2, B3, B4, and B6 are each partially done —
-see their PLAN.md sections for exactly what landed vs. what's deliberately
-deferred (in every case, the live-IMAP-facing half, since there is no real or
-mock IMAP server here to verify that kind of change against). None of it
-blocks B7.
+**Your next task is one of A5/A6/A7/B8/B9** ([PLAN.md](PLAN.md), phase 7 — all
+independent of each other, pick whichever is most useful next). Phases 0-2,
+B1, and B5 are done. B2, B3, B4, B6, and B7 are each partially done — see
+their PLAN.md sections for exactly what landed vs. what's deliberately
+deferred (mostly the live-IMAP-facing half of each, since there is no real or
+mock IMAP server here to verify that kind of change against — B7 is the
+exception: its deferred pieces are IMAP `APPEND`/drafts, a real retry queue,
+rich-text composing, and recipient autocomplete). None of it blocks phase 7.
 
 ---
 
@@ -243,9 +245,10 @@ the `glow` renderer. That is §A6.
 | `e3b695f` | **B2 (partial)** — `req_id` on `FetchHeaders`/`FetchBody`, dropped when stale; `Disconnected` event; `ensure_connected` auto-reconnects with backoff using remembered credentials. Session pool + IDLE not done — see PLAN.md §B2 |
 | `f8cd3f9` | **B3 (partial)** — real `mailboxes`/`messages`/`bodies` schema, LRU-capped bodies, FTS5 fixed (was building its mailbox filter with `format!()` — SQL injection, now a bound param), `sync_decision` (pure, tested) fed by UIDVALIDITY/UIDNEXT `fetch_headers` already had. Nothing acts on a `FetchFrom`/`Resync` yet — see PLAN.md §B3. **B4 (partial)** — `search_query.rs`'s DSL parser + FTS5 `MATCH` builder, wired into the search box. `since:`/`before:`/`is:unread`/`has:attachment` parse but aren't applied; server-side `UID SEARCH` not wired — see PLAN.md §B4. Also: untracked the accidentally-committed `mails.db`. |
 | `85f7d05` | **B5** — `render.rs`'s parse→sanitize→resolve-`cid:` pipeline (`ammonia`, 9 tests), replacing the duplicated `find_html`/`find_text` in `imap.rs` and the unescaped `format!("<pre>{}</pre>", text)` fallback. `egui-servo-webview`'s `WebViewHandler::intercept` gained a real `Block` outcome (it could only Allow/Serve before — a gap A3 left, closed here); `MessageViewHandler` in `main.rs` uses it to block remote `http(s)` requests by default, with a "Load remote images" button per message. Per-sender allowlist not done — see PLAN.md §B5. |
-| *(this branch)* | **B6 (partial)** — `render::extract_attachments` (6 tests), a chip row (filename/MIME/size) with `Save…` (`rfd`)/`Open` (temp file + `opener`) per attachment. Only wired for direct message opens, not cached search results; lazy `BODY.PEEK[n]` fetch not done — see PLAN.md §B6. Self-review before committing caught `open_attachment` joining the message's own (attacker-controlled) filename onto a path unsanitized — a crafted `"../../../x"` could write outside the temp dir; fixed with `safe_attachment_filename` (4 tests) before this landed. |
+| `7199ea3` | **B6 (partial)** — `render::extract_attachments` (6 tests), a chip row (filename/MIME/size) with `Save…` (`rfd`)/`Open` (temp file + `opener`) per attachment. Only wired for direct message opens, not cached search results; lazy `BODY.PEEK[n]` fetch not done — see PLAN.md §B6. Self-review before committing caught `open_attachment` joining the message's own (attacker-controlled) filename onto a path unsanitized — a crafted `"../../../x"` could write outside the temp dir; fixed with `safe_attachment_filename` (4 tests) before this landed. |
+| *(this branch)* | **B7 (partial)** — `smtp.rs` (`SmtpActor` + `lettre`) sends plain-text mail, with attachments as `multipart/mixed`; `compose.rs` derives Reply/Reply All/Forward (subject prefixing, `In-Reply-To`/`References` from a new `MailHeader.message_id`, plain-text quoting) — 9+9 unit tests. Compose window, Reply/Reply All/Forward buttons, and SMTP Host/Port login fields wired into `main.rs`. IMAP `APPEND` to Sent/Drafts, a real retry queue, rich-text composing, and recipient autocomplete not done — see PLAN.md §B7. Caught in self-review: `messages.message_id`'s `CREATE TABLE IF NOT EXISTS` migration would have silently no-opped against this session's own pre-B7 local `mails.db`, breaking `index_mail` at runtime; fixed with an idempotent `ALTER TABLE` step (2 tests) before this landed. |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` 74 passing, app
+State: `cargo check --workspace` clean, `cargo test --workspace` 98 passing, app
 builds, runs, screenshots and exits cleanly.
 
 ---

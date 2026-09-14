@@ -171,6 +171,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             from_addr   TEXT NOT NULL,
             to_addr     TEXT NOT NULL,
             date        TEXT NOT NULL,
+            message_id  TEXT NOT NULL DEFAULT '',
             size        INTEGER NOT NULL DEFAULT 0,
             flags       TEXT NOT NULL DEFAULT '',
             thread_key  TEXT,
@@ -196,7 +197,26 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             body
         );
         ",
-    )
+    )?;
+    add_message_id_column_if_missing(conn)
+}
+
+/// `messages.message_id` (B7) was added after `messages` itself (B3).
+/// `CREATE TABLE IF NOT EXISTS` only creates a table that doesn't exist yet
+/// at all — it does nothing to a `messages` table an earlier build of this
+/// app already created without the column, which is exactly the local
+/// `mails.db` this session's own B3-B6 testing left behind. Without this,
+/// every `INSERT INTO messages (..., message_id, ...)` in `index_mail` would
+/// fail against that file with "table messages has no column named
+/// message_id" the first time a message was indexed.
+fn add_message_id_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN message_id TEXT NOT NULL DEFAULT ''", []) {
+        Ok(_) => Ok(()),
+        // SQLite has no "ALTER TABLE ... ADD COLUMN IF NOT EXISTS"; detect
+        // the column already being there by its own error text instead.
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Insert or update one message's metadata, cached body, and FTS row. Safe to
@@ -210,13 +230,14 @@ fn index_mail(
     body: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, size)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (account_id, mailbox, uid) DO UPDATE SET
             subject = excluded.subject,
             from_addr = excluded.from_addr,
             to_addr = excluded.to_addr,
             date = excluded.date,
+            message_id = excluded.message_id,
             size = excluded.size",
         params![
             account_id,
@@ -226,6 +247,7 @@ fn index_mail(
             header.from,
             header.to,
             header.date,
+            header.message_id,
             body.len() as i64,
         ],
     )?;
@@ -282,7 +304,7 @@ fn search(
     // containing a `'` alter the query. IMAP mailbox names are server-
     // controlled, so this was reachable from an untrusted source.
     let mut stmt = conn.prepare(
-        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date
+        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id
          FROM messages_fts f
          JOIN messages m ON m.account_id = f.account_id
             AND m.mailbox = f.mailbox AND m.uid = f.uid
@@ -298,6 +320,7 @@ fn search(
             from: row.get(2)?,
             to: row.get(3)?,
             date: row.get(4)?,
+            message_id: row.get(5)?,
         })
     })?;
 
@@ -315,7 +338,7 @@ fn fetch_mail(
     uid: u32,
 ) -> rusqlite::Result<(MailHeader, String)> {
     conn.query_row(
-        "SELECT m.subject, m.from_addr, m.to_addr, m.date, b.body
+        "SELECT m.subject, m.from_addr, m.to_addr, m.date, m.message_id, b.body
          FROM messages m JOIN bodies b
             ON b.account_id = m.account_id AND b.mailbox = m.mailbox AND b.uid = m.uid
          WHERE m.account_id = ?1 AND m.mailbox = ?2 AND m.uid = ?3",
@@ -328,8 +351,9 @@ fn fetch_mail(
                     from: row.get(1)?,
                     to: row.get(2)?,
                     date: row.get(3)?,
+                    message_id: row.get(4)?,
                 },
-                row.get(4)?,
+                row.get(5)?,
             ))
         },
     )
@@ -423,6 +447,7 @@ mod tests {
             from: "alice@example.com".to_string(),
             to: "bob@example.com".to_string(),
             date: "2026-01-01".to_string(),
+            message_id: format!("<msg{uid}@example.com>"),
         }
     }
 
@@ -430,6 +455,40 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn init_schema_is_idempotent() {
+        // Regression guard for the ALTER TABLE migration: running init twice
+        // (e.g. every app startup against the same mails.db) must not error
+        // the second time just because the column is already there.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn init_schema_adds_message_id_to_a_pre_b7_messages_table() {
+        // Simulates a mails.db left over from before B7 added the column:
+        // a `messages` table that init_schema's CREATE TABLE IF NOT EXISTS
+        // alone would never touch, since the table already exists.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                account_id TEXT NOT NULL, mailbox TEXT NOT NULL, uid INTEGER NOT NULL,
+                subject TEXT NOT NULL, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL,
+                date TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                flags TEXT NOT NULL DEFAULT '', thread_key TEXT,
+                PRIMARY KEY (account_id, mailbox, uid)
+            )",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+
+        let (header, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(header.message_id, "<msg1@example.com>");
     }
 
     // ── index_mail / fetch_mail ──────────────────────────────────────────────

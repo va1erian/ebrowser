@@ -32,6 +32,10 @@ pub struct MailHeader {
     pub from: String,
     pub to: String,
     pub date: String,
+    /// The `Message-ID` header, e.g. `<abc123@example.com>`, angle brackets
+    /// included (that's how `In-Reply-To`/`References` expect it). Empty
+    /// when the server's ENVELOPE didn't include one — rare, but legal.
+    pub message_id: String,
 }
 
 /// UIDVALIDITY/UIDNEXT as of the most recent `EXAMINE`/`SELECT`, read off
@@ -313,10 +317,11 @@ impl ImapActor {
             let from = format_address(envelope.from.as_deref());
             let to = format_address(envelope.to.as_deref());
             let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
+            let message_id = envelope.message_id.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
 
-            headers.push(MailHeader { uid, subject, from, to, date });
+            headers.push(MailHeader { uid, subject, from, to, date, message_id });
         }
-        
+
         headers.reverse(); // Newest first
         Ok((headers, total_pages, mailbox_state))
     }
@@ -377,8 +382,9 @@ impl ImapActor {
             let from = format_address(envelope.from.as_deref());
             let to = format_address(envelope.to.as_deref());
             let date = envelope.date.as_ref().map(|d| String::from_utf8_lossy(d).to_string()).unwrap_or_default();
+            let message_id = envelope.message_id.as_ref().map(|m| String::from_utf8_lossy(m).to_string()).unwrap_or_default();
 
-            let header = MailHeader { uid, subject, from, to, date };
+            let header = MailHeader { uid, subject, from, to, date, message_id };
 
             // Now fetch body for this UID
             let body_query = format!("{}", uid);

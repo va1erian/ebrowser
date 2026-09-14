@@ -5,6 +5,8 @@ mod config;
 mod secrets;
 mod search_query;
 mod render;
+mod compose;
+mod smtp;
 
 use egui_servo_webview::{
     InterceptOutcome, NavigationPolicy, WebResourceRequest, WebView, WebViewConfig, WebViewHandler,
@@ -70,6 +72,8 @@ struct EsMailApp {
     imap_rx: mpsc::Receiver<ImapEvent>,
     db_tx: mpsc::Sender<DbCommand>,
     db_rx: mpsc::Receiver<DbEvent>,
+    smtp_tx: mpsc::Sender<smtp::SmtpCommand>,
+    smtp_rx: mpsc::Receiver<smtp::SmtpEvent>,
 
     /// Saved accounts (host/port/username; no passwords — those are in the OS
     /// keyring, see `secrets`). Persisted to `config.toml`.
@@ -80,6 +84,12 @@ struct EsMailApp {
     port: String,
     username: String,
     password: String,
+    /// SMTP host for the login form, prefilled from
+    /// [`config::derive_smtp_host`]'s guess but editable — see B7 in
+    /// PLAN.md. TLS mode is fixed to `Ssl`/465 for now; `StartTls`/`None`
+    /// have no UI toggle yet, only the `AccountConfig` fields to hold them.
+    smtp_host: String,
+    smtp_port: String,
     status: String,
     is_connected: bool,
     
@@ -96,6 +106,15 @@ struct EsMailApp {
     /// only stores rendered HTML, not the raw bytes attachments come from;
     /// see PLAN.md §B6.
     current_attachments: Vec<render::Attachment>,
+    /// The currently-open message's rendered HTML, kept only so
+    /// Reply/Reply All/Forward (B7) can quote it — see `compose.rs`. Empty
+    /// when no message is loaded.
+    current_message_html: String,
+
+    /// The compose window's state, when one is open — `None` means it's
+    /// closed. See `compose.rs`.
+    compose: Option<compose::ComposeState>,
+    compose_status: String,
 
     /// Monotonic source for `ImapCommand::FetchHeaders`/`FetchBody` request
     /// ids. Only the reply matching `current_headers_req`/`current_body_req`
@@ -146,6 +165,18 @@ impl EsMailApp {
         });
         DbActor::spawn(db_cmd_rx, tx_db);
 
+        let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
+        let (smtp_evt_tx, smtp_evt_rx) = mpsc::channel(8);
+        let (tx_smtp, mut rx_smtp) = mpsc::channel(8);
+        let ctx_clone_smtp = egui_ctx.clone();
+        tokio::spawn(async move {
+            while let Some(evt) = rx_smtp.recv().await {
+                let _ = smtp_evt_tx.send(evt).await;
+                ctx_clone_smtp.request_repaint();
+            }
+        });
+        smtp::SmtpActor::spawn(smtp_cmd_rx, tx_smtp);
+
         // Preview mode: render one page full-window with no IMAP account, so the
         // webview itself can be exercised and screenshotted. ESMAIL_PREVIEW is
         // either a path to an HTML file, a URL, or "demo" for a built-in page.
@@ -173,15 +204,30 @@ impl EsMailApp {
         // Prefill the login form from the first saved account, if any; its
         // password (if the OS keyring has one) comes along too, so a
         // returning user does not have to retype it.
-        let (host_str, port_str, username_str, password_str) = match config.accounts.first() {
-            Some(account) => {
-                let password = secrets::get_password(&account.id, "imap")
-                    .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
-                    .unwrap_or_default();
-                (account.imap_host.clone(), account.imap_port.to_string(), account.username.clone(), password)
-            }
-            None => ("imap.gmail.com".to_string(), "993".to_string(), String::new(), String::new()),
-        };
+        let (host_str, port_str, username_str, password_str, smtp_host_str, smtp_port_str) =
+            match config.accounts.first() {
+                Some(account) => {
+                    let password = secrets::get_password(&account.id, "imap")
+                        .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
+                        .unwrap_or_default();
+                    (
+                        account.imap_host.clone(),
+                        account.imap_port.to_string(),
+                        account.username.clone(),
+                        password,
+                        account.smtp_host.clone(),
+                        account.smtp_port.to_string(),
+                    )
+                }
+                None => (
+                    "imap.gmail.com".to_string(),
+                    "993".to_string(),
+                    String::new(),
+                    String::new(),
+                    "smtp.gmail.com".to_string(),
+                    "465".to_string(),
+                ),
+            };
         let initial_status = "Ready".to_string();
 
         // One engine per window; the view borrows it to start up. A second view
@@ -204,11 +250,15 @@ impl EsMailApp {
             imap_rx: imap_evt_rx,
             db_tx: db_cmd_tx,
             db_rx: db_evt_rx,
+            smtp_tx: smtp_cmd_tx,
+            smtp_rx: smtp_evt_rx,
             config,
             host: host_str,
             port: port_str,
             username: username_str,
             password: password_str,
+            smtp_host: smtp_host_str,
+            smtp_port: smtp_port_str,
             status: initial_status,
             is_connected: false,
             mailboxes: Vec::new(),
@@ -218,6 +268,9 @@ impl EsMailApp {
             current_page: 1,
             total_pages: 1,
             current_attachments: Vec::new(),
+            current_message_html: String::new(),
+            compose: None,
+            compose_status: String::new(),
             next_req_id: 0,
             current_headers_req: 0,
             current_body_req: 0,
@@ -272,6 +325,7 @@ impl EsMailApp {
                         && self.selected_uid == Some(uid)
                         && self.search_results.is_none()
                     {
+                        self.current_message_html = html.clone();
                         self.web_view.load(WebViewSource::Html(html));
                         self.current_attachments = attachments;
                     }
@@ -303,6 +357,7 @@ impl EsMailApp {
                 }
                 DbEvent::MailFetched { header, body } => {
                     if self.selected_uid == Some(header.uid) {
+                        self.current_message_html = body.clone();
                         self.web_view.load(WebViewSource::Html(body));
                     }
                 }
@@ -317,6 +372,26 @@ impl EsMailApp {
                 }
                 DbEvent::Error(e) => {
                     self.status = format!("DB Error: {}", e);
+                }
+            }
+        }
+    }
+
+    fn handle_smtp_events(&mut self) {
+        while let Ok(evt) = self.smtp_rx.try_recv() {
+            match evt {
+                smtp::SmtpEvent::Sent => {
+                    // The compose window closes on success; a failure (the
+                    // Error arm below) leaves it open with the typed text
+                    // intact instead, so nothing is lost -- see smtp.rs's
+                    // module docs on why that's a deliberately smaller
+                    // promise than a real retry queue.
+                    self.compose = None;
+                    self.compose_status.clear();
+                    self.status = "Message sent".to_string();
+                }
+                smtp::SmtpEvent::Error(e) => {
+                    self.compose_status = format!("Send failed: {e}");
                 }
             }
         }
@@ -359,27 +434,158 @@ impl EsMailApp {
         self.host = account.imap_host.clone();
         self.port = account.imap_port.to_string();
         self.username = account.username.clone();
+        self.smtp_host = account.smtp_host.clone();
+        self.smtp_port = account.smtp_port.to_string();
         self.password = secrets::get_password(&account.id, "imap")
             .map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string())
             .unwrap_or_default();
     }
 
     /// Persist the account currently in the login form: upsert it into
-    /// `config.toml` and its password into the OS keyring. Called once a
-    /// connection actually succeeds, not on every keystroke or click.
+    /// `config.toml` and its password into the OS keyring (under both
+    /// `"imap"` and `"smtp"` — B7 sends with the same credentials, since
+    /// `AccountConfig::username` is documented as used for both). Called
+    /// once a connection actually succeeds, not on every keystroke or click.
     fn persist_current_account(&mut self) {
-        let account = AccountConfig::new(
+        let mut account = AccountConfig::new(
             self.username.clone(),
             self.host.clone(),
             self.port.parse().unwrap_or(993),
             self.username.clone(),
         );
-        if let Err(e) = secrets::set_password(&account.id, "imap", &SecretString::from(self.password.clone())) {
-            log::warn!("could not save password to the OS keyring: {e}");
+        // AccountConfig::new only guesses smtp_host/smtp_port; the login
+        // form's fields (pre-filled from that guess, but editable) win.
+        if !self.smtp_host.is_empty() {
+            account.smtp_host = self.smtp_host.clone();
+        }
+        if let Ok(port) = self.smtp_port.parse() {
+            account.smtp_port = port;
+        }
+        let password = SecretString::from(self.password.clone());
+        if let Err(e) = secrets::set_password(&account.id, "imap", &password) {
+            log::warn!("could not save IMAP password to the OS keyring: {e}");
+        }
+        if let Err(e) = secrets::set_password(&account.id, "smtp", &password) {
+            log::warn!("could not save SMTP password to the OS keyring: {e}");
         }
         self.config.upsert_account(account);
         if let Err(e) = self.config.save() {
             log::warn!("could not persist account config: {e}");
+        }
+    }
+
+    /// Build the SMTP account `smtp.rs` needs to send, from the current
+    /// login form and saved keyring password. `None` if there's no SMTP
+    /// password saved yet — e.g. the very first connection, before
+    /// [`EsMailApp::persist_current_account`] has ever run for this account.
+    fn smtp_account(&self) -> Option<smtp::SmtpAccount> {
+        let account_id = self.account_id();
+        let password = secrets::get_password(&account_id, "smtp")?;
+        Some(smtp::SmtpAccount {
+            host: self.smtp_host.clone(),
+            port: self.smtp_port.parse().unwrap_or(465),
+            tls: config::TlsMode::Ssl,
+            username: self.username.clone(),
+            password,
+            from_address: self.username.clone(),
+        })
+    }
+
+    /// Draws the compose window when `self.compose` is `Some`, and handles
+    /// its Send/Attach/Discard buttons. A separate top-level `egui::Window`
+    /// rather than part of the main layout — B7 says "compose window", and
+    /// this can stay open (or get discarded) independent of what the user
+    /// does with the message list behind it.
+    fn show_compose_window(&mut self, ctx: &egui::Context) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+
+        let mut open = true;
+        let mut send_clicked = false;
+        let mut discard_clicked = false;
+        egui::Window::new("Compose")
+            .open(&mut open)
+            .default_size([480.0, 420.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("compose_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("To:");
+                    ui.add(egui::TextEdit::singleline(&mut compose.to).desired_width(f32::INFINITY));
+                    ui.end_row();
+
+                    ui.label("Cc:");
+                    ui.add(egui::TextEdit::singleline(&mut compose.cc).desired_width(f32::INFINITY));
+                    ui.end_row();
+
+                    ui.label("Bcc:");
+                    ui.add(egui::TextEdit::singleline(&mut compose.bcc).desired_width(f32::INFINITY));
+                    ui.end_row();
+
+                    ui.label("Subject:");
+                    ui.add(egui::TextEdit::singleline(&mut compose.subject).desired_width(f32::INFINITY));
+                    ui.end_row();
+                });
+
+                ui.separator();
+
+                if !compose.attachments.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (filename, data) in &compose.attachments {
+                            ui.label(format!("{filename} ({})", format_size(data.len())));
+                        }
+                    });
+                }
+                if ui.button("Attach file…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        match std::fs::read(&path) {
+                            Ok(data) => {
+                                let filename = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "attachment".to_string());
+                                compose.attachments.push((filename, data));
+                            }
+                            Err(e) => {
+                                self.compose_status = format!("Could not read {}: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+
+                ui.add_sized(
+                    ui.available_size() - egui::vec2(0.0, 60.0),
+                    egui::TextEdit::multiline(&mut compose.body),
+                );
+
+                ui.horizontal(|ui| {
+                    if ui.button("Send").clicked() {
+                        send_clicked = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        discard_clicked = true;
+                    }
+                    if !self.compose_status.is_empty() {
+                        ui.label(egui::RichText::new(&self.compose_status).color(egui::Color32::RED));
+                    }
+                });
+            });
+
+        if send_clicked {
+            match self.smtp_account() {
+                Some(account) => {
+                    let compose = self.compose.clone().expect("just matched Some above");
+                    let _ = self.smtp_tx.try_send(smtp::SmtpCommand::Send { account, compose });
+                    self.compose_status = "Sending…".to_string();
+                }
+                None => {
+                    self.compose_status =
+                        "No SMTP password on file yet — connect once via IMAP first.".to_string();
+                }
+            }
+        }
+        if discard_clicked || !open {
+            self.compose = None;
+            self.compose_status.clear();
         }
     }
 }
@@ -404,6 +610,7 @@ impl eframe::App for EsMailApp {
 
         self.handle_imap_events();
         self.handle_db_events();
+        self.handle_smtp_events();
 
         if self.is_connected {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -422,6 +629,10 @@ impl eframe::App for EsMailApp {
                         ui.close();
                     }
                 });
+                if ui.button("New Message").clicked() {
+                    self.compose = Some(compose::ComposeState::default());
+                    self.compose_status.clear();
+                }
             });
         }
 
@@ -497,6 +708,12 @@ impl eframe::App for EsMailApp {
                         ui.add(egui::TextEdit::singleline(&mut self.port).hint_text("Port"));
                         ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Username"));
                         ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Password"));
+
+                        // Guessed by config::derive_smtp_host (imap. -> smtp.)
+                        // when this is a brand new account; editable since
+                        // that guess is often wrong. Used by B7's Send.
+                        ui.add(egui::TextEdit::singleline(&mut self.smtp_host).hint_text("SMTP Host"));
+                        ui.add(egui::TextEdit::singleline(&mut self.smtp_port).hint_text("SMTP Port"));
 
                         if ui.button("Connect").clicked() {
                             self.status = "Connecting...".to_string();
@@ -616,7 +833,12 @@ impl eframe::App for EsMailApp {
 
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 if let Some(uid) = self.selected_uid {
-                    if let Some(header) = self.headers.iter().find(|h| h.uid == uid) {
+                    // Cloned rather than borrowed: the Reply/Reply All/
+                    // Forward buttons below need `&mut self.compose` while
+                    // this is in scope, which can't coexist with a borrow of
+                    // `self.headers` (the same reason the mailbox/message
+                    // list loops elsewhere in this file defer their sends).
+                    if let Some(header) = self.headers.iter().find(|h| h.uid == uid).cloned() {
                         egui::Panel::top("mail_info").show_inside(ui, |ui| {
                             egui::Grid::new("mail_info_grid").num_columns(2).show(ui, |ui| {
                                 ui.label(egui::RichText::new("From:").strong());
@@ -634,6 +856,24 @@ impl eframe::App for EsMailApp {
                                 ui.label(egui::RichText::new("Subject:").strong());
                                 ui.add(egui::Label::new(&header.subject).selectable(true));
                                 ui.end_row();
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("Reply").clicked() {
+                                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html));
+                                    self.compose_status.clear();
+                                }
+                                if ui.button("Reply All").clicked() {
+                                    self.compose = Some(compose::ComposeState::reply_all(
+                                        &header,
+                                        &self.current_message_html,
+                                        &self.username,
+                                    ));
+                                    self.compose_status.clear();
+                                }
+                                if ui.button("Forward").clicked() {
+                                    self.compose = Some(compose::ComposeState::forward(&header, &self.current_message_html));
+                                    self.compose_status.clear();
+                                }
                             });
                         });
                     }
@@ -694,6 +934,8 @@ impl eframe::App for EsMailApp {
                 }
             });
         }
+
+        self.show_compose_window(ui.ctx());
     }
 }
 

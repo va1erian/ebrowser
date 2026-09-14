@@ -28,6 +28,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-native-tls = "0.3"
 futures = "0.3"
 
+# SMTP sending (B7).
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-native-tls", "smtp-transport", "builder"] }
+
 # Mail
 async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 mailparse = "0.15"

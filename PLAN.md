@@ -600,7 +600,7 @@ from a cached search result (`DbEvent::MailFetched`) shows none, because
 `bodies` only caches the rendered HTML (B3), not the raw bytes attachments
 are extracted from.
 
-### B7. Compose and send
+### B7. Compose and send — **PARTIALLY DONE**
 Add `lettre` (`tokio1-native-tls`, `builder`). A compose window with To/Cc/Bcc
 (chip entry completed from cached correspondents), Subject, attachment picker and
 a body editor. Ship plain-text composing first, then a minimal rich-text layer
@@ -613,6 +613,66 @@ from the source message, and quote the original. On send: submit over SMTP, then
 IMAP `APPEND` to Sent (discovered via the `\Sent` special-use flag, name-based
 fallback). Drafts autosave via `APPEND` with `\Draft`. Queue sends so a failure
 retries rather than losing the message.
+
+**What landed:** `smtp.rs` (an `SmtpActor` following `imap.rs`/`db.rs`'s
+existing actor-behind-an-mpsc-channel pattern) sends over SMTP via `lettre`,
+picking implicit-TLS/STARTTLS/none from `AccountConfig::smtp_tls` (only `Ssl`
+is reachable from the UI today — see below) and building either a plain
+`SinglePart` or a `multipart/mixed` with `Attachment` parts when there are
+attachments. `compose.rs` is the pure (9 unit test) half: `ComposeState` plus
+`reply`/`reply_all`/`forward`, which derive the recipient(s), prefix the
+subject (without piling up "Re: Re: Re:"), set `In-Reply-To`/`References`
+from the original's `Message-ID` (a new field on `MailHeader`, fed from
+`envelope.message_id` — already parsed by `async_imap`, same free-lunch as
+`MailboxState` in B3), and quote the original body as plain text (stripped
+from the already-rendered HTML via `ammonia::Builder::empty()`) with an
+attribution line. A plain-text body editor, an attach-file button (`rfd`),
+and Reply/Reply All/Forward buttons on the open message are wired into
+`main.rs`'s compose window.
+
+`AccountConfig::new` now also guesses `smtp_host` via the `imap.` → `smtp.`
+convention (`config::derive_smtp_host`, tested), and the login screen grew
+SMTP Host/Port fields (prefilled from that guess, editable) since there was
+previously no way to set them at all.
+
+**Caught while wiring `messages.message_id` into `db.rs`'s schema:** the new
+column only reaches a *freshly created* `messages` table —
+`CREATE TABLE IF NOT EXISTS` does nothing to one an earlier build already
+made without it, which described this session's own leftover local
+`mails.db` from B3–B6 testing exactly. Without a fix, the first
+`index_mail` call against that file would have failed with "table messages
+has no column named message_id". Fixed with an idempotent
+`ALTER TABLE ... ADD COLUMN` migration step, tested both for idempotency and
+against a hand-built pre-B7 `messages` table.
+
+**What did not land, and why:**
+- **Rich-text composing.** The plan itself sequences this after plain-text
+  ("ship plain-text composing first, *then* ..."), so landing only the first
+  half matches the plan's own ordering, not a cut corner.
+- **IMAP `APPEND` to Sent, and drafts.** A sent message reaches its recipient
+  over SMTP but is never saved to the account's Sent folder, and there is no
+  draft autosave. Both need `\Sent`/`\Drafts` special-use-flag discovery (or
+  a name-based fallback) plus `APPEND` — new live-IMAP-protocol code, same
+  reasoning as every other live-IMAP half deferred this session (B2/B3/B4/B6):
+  nothing here to verify it against.
+- **A real send-retry queue.** A failed send reports the error and leaves the
+  compose window open with everything the user typed intact, so nothing is
+  lost — but there's no automatic retry-with-backoff, and nothing survives an
+  app restart. Only half of "queue sends so a failure retries rather than
+  losing the message" is there.
+- **Chip-entry recipients completed from cached correspondents.** To/Cc/Bcc
+  are plain comma-separated text fields; no autocomplete against anything
+  `db.rs` has seen before.
+- **TLS mode picker for SMTP.** `AccountConfig::smtp_tls` exists and
+  `smtp.rs` honors it, but the login screen has no control to set it to
+  anything but the `Ssl` default `AccountConfig::new` picks — `StartTls`
+  accounts (port 587, common for non-Gmail-style providers) can't be
+  configured through the UI yet.
+- **Reply-All's Cc is best-effort.** `imap.rs`'s envelope parsing only ever
+  kept the *first* From/To address (predates B7), so there's no captured
+  multi-recipient list to Cc the rest of — an empty or single-address Cc is
+  what that limitation looks like, documented in `compose.rs` rather than
+  silently under-delivering.
 
 ### B8. Flags and the rest of the reading experience
 `\Seen` on open (with a mark-as-read delay), star/flag toggle, delete → Trash
@@ -642,8 +702,8 @@ and Outlook therefore need app passwords.
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (session pool/IDLE remain, see §B2) | B3, B7 |
 | 4 | B3 **partially done** (see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
-| **6** | **B7 — start here** | — |
-| 7 | A5, A6, A7, B8, B9 | — |
+| 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
+| **7** | **A5, A6, A7, B8, B9 — start here** | — |
 
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.
