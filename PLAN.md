@@ -286,7 +286,7 @@ rather than faking it, and say so in the README.
 `WebViewSource::Html` gains an optional base URL — it currently always base64s
 into a `data:` URL, which makes every relative link dead.
 
-### A5. Input completeness — **PARTIALLY DONE**
+### A5. Input completeness — **DONE**
 Every item below was checked against servoshell — Servo's own egui-based
 browser — and against the vendored `InputEvent` enum, which has
 `Keyboard`, `Ime`, `MouseButton`, `MouseMove`, `MouseLeftViewport`, `Wheel`,
@@ -350,21 +350,94 @@ and page/engine-side double-click detection is not this widget's job). 4 new
 unit tests plus a rewrite of the one that documented the old lowercase-only
 behavior as a known defect.
 
-**Deliberately not done: the `Scroll::Delta` → `InputEvent::Wheel` switch.**
-This is the one item in this section with a real, unverifiable-here
-regression risk: `WheelDelta`'s doc comment describes the *opposite* sign
-convention from `Scroll::Delta`'s (positive `y` scrolls up/reveals content
-above, vs. `Scroll::Delta`'s positive-`y`-scrolls-down), so migrating
-requires also flipping the computed sign — and getting that wrong silently
-inverts scroll direction, which nothing in this environment (no synthetic
-input dispatch, only passive screenshot rendering) can catch. Landing the
-`preventDefault`-support fix at the cost of maybe shipping backwards
-scrolling seemed like the wrong trade; left for whoever can next scroll the
-real app and watch which way the page moves. **Also not done:** IME
-(`egui::Event::Ime` → `InputEvent::Ime`), the cursor-icon delegate hook, and
-clipboard shortcuts (`Ctrl/Cmd+X/C/V` → `InputEvent::EditingAction`) — all
-real, scoped-out for size rather than risk; PLAN.md still describes exactly
-what each needs.
+**The remaining four items (`Scroll::Delta`→`Wheel`, IME, cursor, clipboard
+shortcuts) all landed in a follow-on pass.**
+
+**1. The `Scroll::Delta` → `InputEvent::Wheel` migration**, the one item
+above with a real regression risk (the two APIs' sign conventions are
+opposite, so migrating naively could silently invert scroll direction, and
+nothing in this environment — no synthetic input dispatch, only passive
+screenshot rendering — could have caught that live). It was resolved by
+reading the actual convention from the vendored source rather than guessing:
+- `servo-embedder-traits-0.1.0/input_events.rs`'s `WheelDelta::y` doc
+  comment: "A positive value means that the view scrolls up, revealing more
+  content above the current viewport" (symmetric wording for `x`).
+- `servo-paint-0.1.0/webview_renderer.rs`'s `notify_input_event_handled` is
+  where Servo itself turns a *received* `Wheel` event into the `Scroll::Delta`
+  that actually moves the page: `let scroll_delta = -wheel_event.delta;`
+  (comment: "A scroll delta for a wheel event is the inverse of the wheel
+  delta"). This confirms the two APIs are deliberately opposite-signed — the
+  risk the deferral above named was real, not hypothetical.
+- egui's own sign was the missing third data point. `egui-0.34.1/src/
+  containers/scroll_area.rs`'s `ScrollArea` applies `smooth_scroll_delta` as
+  `state.offset[d] -= scroll_delta`, and `state.offset` is "how far scrolled
+  past the top/left" — so a positive `smooth_scroll_delta.y` *decreases* that
+  offset, moving the viewport toward the top. That is the exact same
+  direction `WheelDelta::y`'s doc comment describes for a positive value.
+  egui's sign therefore already matches `WheelDelta`'s (both are the inverse
+  of `Scroll::Delta`'s), so the new `WebView::scroll_to_wheel_delta` is a
+  straight scale-to-device-pixels with **no negation on either axis** — the
+  opposite of what the old `Scroll::Delta` path did (which negated both axes
+  to convert into that API's opposite convention). Pinned by two new unit
+  tests (`scroll_to_wheel_delta_does_not_negate_egui_s_sign`,
+  `..._handles_negative_scroll_without_a_double_flip`) so a future regression
+  here is caught mechanically rather than by eyeballing scroll direction
+  again. Verified visually too (see below) — the demo page's tall scrollable
+  block responds to `smooth_scroll_delta` correctly after the change,
+  scrolling the same direction it did before the migration.
+- Keyboard-driven scrolling (arrow keys, Page Up/Down, Home/End) was left on
+  `Scroll::Delta`/`Scroll::Start`/`Scroll::End` — that's a distinct,
+  already-working, already-shipped code path with no `preventDefault`
+  argument for switching it, and PLAN.md's own wording above only ever called
+  out the *wheel* path as being on the wrong API.
+
+**2. IME.** `egui::Event::Ime` is forwarded via a new pure helper,
+`egui_ime_to_servo_ime`, matching servoshell's Start/Update/End/Dismissed
+states: `Enabled`→`Composition(CompositionState::Start)`,
+`Preedit(text)`→`Composition(CompositionState::Update)`,
+`Commit(text)`→`Composition(CompositionState::End)`,
+`Disabled`→`Dismissed`. One subtlety worth recording: `Dismissed` is not a
+fourth `keyboard_types::CompositionState` (that enum only has
+`Start`/`Update`/`End`) — it's a sibling variant one level up on
+embedder_traits' own `ImeEvent` (`Composition(CompositionEvent) |
+Dismissed`), which is why `Enabled`/`Disabled` map onto two different Rust
+enums rather than all four onto one. 4 new unit tests exercise all four
+states through the real helper function.
+
+**3. Cursor.** `WebViewDelegate::notify_cursor_changed` is implemented,
+storing the mapped `egui::CursorIcon` in a `Rc<Cell<_>>` shared between the
+`Delegate` and `WebView` (the same pattern `frame_dirty` already used).
+`show_impl` calls `ctx.set_cursor_icon(..)` every frame the pointer is over
+the widget (`resp.hovered()`) — egui resets the cursor to `Default` each
+frame otherwise, so this can't be a one-shot "set once when it changes."
+`servo_cursor_to_egui_cursor_icon` is an exhaustive match (a new upstream
+`Cursor` variant fails it at compile time rather than silently falling back
+to `Default`) — the two enums don't share naming conventions for the
+diagonal/edge resize cursors (`NeswResize`↔`ResizeNeSw`,
+`EwResize`↔`ResizeHorizontal`, etc.), which the mapping test exercises
+specifically rather than only the obvious cases.
+
+**4. Clipboard.** Verified, as PLAN.md suspected: `servo`'s `clipboard`
+feature is in its `default` feature list
+(`servo-0.1.0/Cargo.toml`), which installs a real `arboard`-backed
+`DefaultClipboardDelegate` (`clipboard_delegate.rs`) whenever the embedder
+doesn't supply its own — this crate doesn't, so the OS clipboard already
+works for free, exactly as the plan guessed. What was actually missing was
+telling Servo *when* to invoke it: a keydown alone doesn't imply "run the
+copy/cut/paste editing command" the way a browser's own accelerator table
+does. Added: Ctrl/Cmd+C/X/V (without Shift/Alt) now also dispatch
+`InputEvent::EditingAction(Copy/Cut/Paste)` alongside the ordinary
+`Keyboard` event already sent for that key. A small pure table
+(`action_for` in the test) mirrors the `show_impl` match and is unit tested
+independently of a live Servo view.
+
+**Verification.** `cargo test -p egui-servo-webview` — 23 tests (up from 18),
+all passing, doc-test included. Screenshotted per HANDOFF.md §2
+(`ESMAIL_PREVIEW=demo`, 90 frames) before and after: the demo page (heading,
+accented text, link, table, text input, tall scrollable block) renders
+identically to the pre-change baseline — this phase touches `show_impl`'s
+input-forwarding code, not its paint path, so an unchanged screenshot is the
+expected (and confirmed) result, not a null result.
 
 ### A6. Rendering path — **PARTIALLY DONE**
 **The zero-copy path exists and we are already on the backend it needs.**

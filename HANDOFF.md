@@ -9,22 +9,27 @@ item — "Flags and the rest of the reading experience": `\Seen`/star/
 delete-to-Trash/archive/mark-unread, multi-select, unread counts, a real
 mailbox tree, IDLE on the selected mailbox, keyboard shortcuts. It may
 already be in progress or done in a separate worktree by the time you read
-this — check for a B8 commit before starting). A6, A7, and B9 are now each
-landed or partially landed — see §5's table and their own PLAN.md sections.
-Phases 0-2, B1, B5, B10, B11 (IMAP push), B2's worker-session split, B3's
-incremental-fetch half, and B7's `APPEND`-to-Sent half are done. B3 (its
-UID-based cache-paging half), B4, B6, B7 (its still-open pieces), A5, A6,
-and now B9 are each partially done — see their PLAN.md sections for exactly
-what landed vs. what's deliberately deferred. B7's remaining exceptions are
-now `\Sent` special-use-flag discovery, drafts, a real retry queue,
-rich-text composing, and recipient autocomplete; A5's is specifically the
-`Scroll::Delta`→`Wheel` API migration, held back over a sign-convention flip
-that needs a live app to watch scroll direction on, which this environment
-can't do (screenshots are passive, no synthetic input dispatch) — IME/
-cursor/clipboard in A5 are separate, smaller, still-open items. B9's is
-per-operation progress (generalizing `download_progress`), deliberately left
-for its own commit once B8's concurrent `main.rs` changes land — see §B9.
-None of this blocks B8.
+this — check for a B8 commit before starting). A5, A6, A7, and B9 are now
+each landed or partially landed — see §5's table and their own PLAN.md
+sections. Phases 0-2, B1, B5, B10, B11 (IMAP push), B2's worker-session
+split, B3's incremental-fetch half, and B7's `APPEND`-to-Sent half are
+done. B3 (its UID-based cache-paging half), B4, B6, B7 (its still-open
+pieces), A6, and now B9 are each partially done — see their PLAN.md
+sections for exactly what landed vs. what's deliberately deferred. B7's
+remaining exceptions are now `\Sent` special-use-flag discovery, drafts, a
+real retry queue, rich-text composing, and recipient autocomplete. **A5 is
+now fully done** — its one previously-deferred item, the `Scroll::Delta`→
+`Wheel` API migration, turned out to be resolvable without a live app after
+all: the sign convention is fully pinned down by three vendored doc
+comments/call sites (`WheelDelta`'s own doc comment, Servo's own
+`-wheel_event.delta` translation from `Wheel` to `Scroll::Delta`, and
+egui's `ScrollArea` applying `smooth_scroll_delta` as `offset -= delta`)
+rather than needing to be watched live — see PLAN.md's A5 section for the
+full derivation and the two unit tests that pin it. IME, the cursor-icon
+delegate hook, and clipboard shortcuts landed in the same pass. B9's
+remaining item is per-operation progress (generalizing
+`download_progress`), deliberately left for its own commit once B8's
+concurrent `main.rs` changes land — see §B9. None of this blocks B8.
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
@@ -323,6 +328,7 @@ the `glow` renderer. That is §A6.
 | `6db4c18` (PR #7) | **B3 (incremental fetch acted on)** — see PLAN.md §B3. A `DbEvent::SyncPlan::FetchFrom`/`Resync` now triggers a new `ImapCommand::FetchHeadersFrom` (envelope-only `UID FETCH`, kept separate from B10's `FetchNewHeaders` so the cache-sync path can't spuriously trigger a new-mail toast), indexed metadata-only via a new `DbCommand::IndexHeaders`/`index_headers`. Along the way, fixed a real gap in `mail-mock-server`'s `UID FETCH` handler: it only ever supported a single numeric UID with `RFC822`, not the `first:*` range + `ENVELOPE` this needed (and `FetchNewHeaders`/B10 needed too, apparently never exercised against this server until now). UID-based cache paging for the header list itself did not land — see PLAN.md §B3 for why that's scoped as separate follow-on work. |
 | *(prior branch)* | **B7 (`APPEND` to Sent)** — see PLAN.md §B7. `smtp.rs`'s `SmtpEvent::Sent` now carries the exact raw bytes that were sent; `main.rs` follows a successful send with `ImapCommand::Append { mailbox: "Sent", raw }`, indexed via a new `ImapEvent::AppendFailed` (kept separate from `Error` so a save failure can't overwrite the "Message sent" status). Added `APPEND` support to `mail-mock-server` (it had none), delivering into the same `Store::deliver` `smtp_server.rs`'s `DATA` handler uses. `\Sent` special-use-flag discovery and drafts still not done — `SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`. |
 | *(this branch)* | **B9 (partial) — Polish** — see PLAN.md §B9. Error banners (`main.rs`'s new `Banner`/`push_banner`, replacing `status = format!("Error: {e}")`/`"DB Error: {e}"` and giving `AppendFailed` a visible-but-non-clobbering notice for the first time), a Dark/Light/System theme toggle persisted via `config::ThemeMode`, window-geometry persistence (`config::WindowGeometry`, tracked from `egui::ViewportInfo::outer_rect` and saved once on a real close, read back by `main()` before the window is created), and a first-run provider-table wizard (`config::provider_for_email` — gmail.com/outlook.com/yahoo.com/icloud.com/fastmail.com/gmx.com/zoho.com — autofilling the login form's host/port/SMTP fields from just an email address, distinct from B7's mechanical `derive_smtp_host`). Added `crates/esmail/README.md` with the OAuth2-out-of-scope/app-password note the plan calls for. Per-operation progress (generalizing `download_progress`) deliberately deferred — see PLAN.md §B9 for why (B8 is concurrently landing in the same busy part of `main.rs`). |
+| *(this branch)* | **A5 (finished)** — see PLAN.md §A5. The `Scroll::Delta`→`InputEvent::Wheel` migration landed: the sign convention was resolved from three vendored doc comments/call sites (`WheelDelta`'s own doc comment, Servo's own `webview_renderer.rs` negating a wheel delta into `Scroll::Delta`, and egui's `ScrollArea` applying `smooth_scroll_delta` as `offset -= delta`), pinned by two new unit tests on the extracted `WebView::scroll_to_wheel_delta` helper rather than needing to be watched live after all. IME (`egui::Event::Ime` → `InputEvent::Ime` via a new pure `egui_ime_to_servo_ime` helper), the cursor-icon delegate hook (`notify_cursor_changed` → `servo_cursor_to_egui_cursor_icon`, applied every frame the pointer hovers the widget since egui resets to `Default` otherwise), and Ctrl/Cmd+C/X/V → `InputEvent::EditingAction` also landed — the OS clipboard itself was confirmed already free (`servo`'s `clipboard` feature is in its `default` list, installing a real `arboard`-backed delegate), so only the shortcut-to-action wiring was missing. 5 new unit tests on top of A5's existing 18 (23 total in the crate). |
 
 State: `cargo check --workspace` clean, `cargo test --workspace` all passing
 (unit tests across every crate plus the `mail-mock-server`-backed integration
