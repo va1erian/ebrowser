@@ -560,22 +560,36 @@ impl EsMailApp {
                 }
                 ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id: _ } => {
                     // B8: reflect the server-confirmed flags back into the
-                    // visible header list and the local cache. Applied
-                    // regardless of which mailbox/message is currently
-                    // selected (unlike Headers/Body's req_id staleness
-                    // guard) -- a flag change always succeeded for the exact
-                    // message it was sent for, so there's nothing "stale"
-                    // about applying it whenever it arrives.
-                    let was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
-                    if let Some(header) = self.headers.iter_mut().find(|h| h.uid == uid) {
-                        header.flags = flags.clone();
-                    }
-                    if let (Some(was_seen), Some(count)) = (was_seen, self.unread_counts.get_mut(&mailbox)) {
-                        let now_seen = flags.iter().any(|f| f.eq_ignore_ascii_case(imap::FLAG_SEEN));
-                        if was_seen && !now_seen {
-                            *count += 1;
-                        } else if !was_seen && now_seen {
-                            *count = count.saturating_sub(1);
+                    // visible header list, any active search-results list,
+                    // and the local cache. Only touches self.headers/
+                    // self.unread_counts/self.search_results when `mailbox`
+                    // matches what's actually on screen -- both lists only
+                    // ever hold messages from `self.selected_mailbox`
+                    // (search is itself scoped to it, see the `Search`
+                    // send-site below), so an event for a different mailbox
+                    // finding a same-numbered UID in either list would
+                    // otherwise patch the wrong message's row and skew the
+                    // unread count for a mailbox that wasn't actually
+                    // touched. The DB write below is unaffected by this
+                    // guard: it's already keyed by `mailbox`, so it's
+                    // correct regardless of what's currently displayed.
+                    if mailbox == self.selected_mailbox {
+                        let was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
+                        if let Some(header) = self.headers.iter_mut().find(|h| h.uid == uid) {
+                            header.flags = flags.clone();
+                        }
+                        if let Some(results) = self.search_results.as_mut() {
+                            if let Some(header) = results.iter_mut().find(|h| h.uid == uid) {
+                                header.flags = flags.clone();
+                            }
+                        }
+                        if let (Some(was_seen), Some(count)) = (was_seen, self.unread_counts.get_mut(&mailbox)) {
+                            let now_seen = flags.iter().any(|f| f.eq_ignore_ascii_case(imap::FLAG_SEEN));
+                            if was_seen && !now_seen {
+                                *count += 1;
+                            } else if !was_seen && now_seen {
+                                *count = count.saturating_sub(1);
+                            }
                         }
                     }
                     let _ = self.db_tx.try_send(DbCommand::UpdateFlags {
@@ -586,14 +600,23 @@ impl EsMailApp {
                     });
                 }
                 ImapEvent::FlagsUpdateFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.status = format!("Could not update flags on message {uid}: {error}");
+                    self.push_banner(format!("Could not update flags on message {uid}: {error}"));
                 }
                 ImapEvent::Moved { mailbox, uid, dest, req_id: _ } => {
                     // B8: delete-to-Trash/archive succeeded -- drop the
-                    // message from the visible list, the cache, and any
-                    // selection it was part of.
-                    let was_unread = self.headers.iter().find(|h| h.uid == uid).map(|h| !h.is_seen()).unwrap_or(false);
-                    self.headers.retain(|h| h.uid != uid);
+                    // message from the visible list, any active
+                    // search-results list, the cache, and any selection it
+                    // was part of. See FlagsUpdated above for why the
+                    // header/search-results/unread-count mutations are
+                    // guarded on `mailbox == self.selected_mailbox`.
+                    let was_unread = mailbox == self.selected_mailbox
+                        && self.headers.iter().find(|h| h.uid == uid).map(|h| !h.is_seen()).unwrap_or(false);
+                    if mailbox == self.selected_mailbox {
+                        self.headers.retain(|h| h.uid != uid);
+                        if let Some(results) = self.search_results.as_mut() {
+                            results.retain(|h| h.uid != uid);
+                        }
+                    }
                     self.selected_uids.remove(&uid);
                     if self.selected_uid == Some(uid) {
                         self.selected_uid = None;
@@ -602,6 +625,15 @@ impl EsMailApp {
                     if was_unread {
                         if let Some(count) = self.unread_counts.get_mut(&mailbox) {
                             *count = count.saturating_sub(1);
+                        }
+                        // The message just landed in `dest` unread -- bump
+                        // its count too if we're already tracking it (it
+                        // may not be yet if FetchUnreadCounts hasn't
+                        // completed), so the sidebar doesn't read "no new
+                        // mail in Archive/Trash" for a message that just
+                        // arrived there.
+                        if let Some(count) = self.unread_counts.get_mut(&dest) {
+                            *count += 1;
                         }
                     }
                     self.status = format!("Moved to {dest}");
@@ -612,7 +644,7 @@ impl EsMailApp {
                     });
                 }
                 ImapEvent::MoveFailed { mailbox: _, uid, error, req_id: _ } => {
-                    self.status = format!("Could not move message {uid}: {error}");
+                    self.push_banner(format!("Could not move message {uid}: {error}"));
                 }
                 ImapEvent::UnreadCounts(counts) => {
                     self.unread_counts = counts;
@@ -846,6 +878,45 @@ impl EsMailApp {
         }
     }
 
+    /// A target UID's current `\Flagged` state, checked against whichever
+    /// list is actually on screen for it (`search_results` when a search is
+    /// active, else `headers`) -- used by `toggle_star_on_selection` so each
+    /// message's own state decides its own direction.
+    fn is_flagged_uid(&self, uid: u32) -> bool {
+        self.search_results
+            .as_ref()
+            .unwrap_or(&self.headers)
+            .iter()
+            .any(|h| h.uid == uid && h.is_flagged())
+    }
+
+    /// Toggle `\Flagged` on every target in [`Self::action_targets`],
+    /// per-message rather than applying one shared direction to the whole
+    /// selection: a message that's already starred gets unstarred and one
+    /// that isn't gets starred, independently of what its neighbors in the
+    /// selection are doing. A single shared direction (star everything /
+    /// unstar everything, decided from just one message's state) would
+    /// silently flip messages the user never intended to touch whenever a
+    /// multi-selection has mixed flag states.
+    fn toggle_star_on_selection(&mut self) {
+        let mailbox = self.selected_mailbox.clone();
+        for uid in self.action_targets() {
+            let req_id = self.next_req_id();
+            let (add, remove) = if self.is_flagged_uid(uid) {
+                (vec![], vec![imap::FLAG_FLAGGED.to_string()])
+            } else {
+                (vec![imap::FLAG_FLAGGED.to_string()], vec![])
+            };
+            let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+                mailbox: mailbox.clone(),
+                uid,
+                add,
+                remove,
+                req_id,
+            });
+        }
+    }
+
     /// Send `MoveMessage` (Archive/Delete-to-Trash) for every target in
     /// [`Self::action_targets`].
     fn move_selection(&mut self, dest: &str) {
@@ -1037,14 +1108,7 @@ impl EsMailApp {
             self.move_selection(TRASH_MAILBOX);
         }
         if star {
-            let currently_flagged = self.selected_uid.is_some_and(|uid| {
-                self.headers.iter().any(|h| h.uid == uid && h.is_flagged())
-            });
-            if currently_flagged {
-                self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
-            } else {
-                self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
-            }
+            self.toggle_star_on_selection();
         }
     }
 
@@ -1663,11 +1727,7 @@ impl eframe::App for EsMailApp {
                                 // needing to select it in the list.
                                 let star_label = if header.is_flagged() { "☆ Unstar" } else { "★ Star" };
                                 if ui.button(star_label).clicked() {
-                                    if header.is_flagged() {
-                                        self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
-                                    } else {
-                                        self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
-                                    }
+                                    self.toggle_star_on_selection();
                                 }
                                 if ui.button("Mark unread").clicked() {
                                     self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);

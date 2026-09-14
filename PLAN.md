@@ -1113,6 +1113,58 @@ keystroke ever turns out to be too chatty in practice.
   `fetch_unread_counts_reflects_seen_flags`) that exercise the exact command/
   event pairs `main.rs` sends and consumes.
 
+**Fixed in a post-merge review pass** (a multi-angle review of the merged
+A5+B8+B9 diff against `main`, before opening the PR): a missing DB migration
+(`messages.flags` never got the same `ALTER TABLE ... ADD COLUMN` treatment
+`message_id` did in B7, so a pre-B8 local `mails.db` would break on the first
+`IndexHeaders`/`IndexMail` — fixed with `add_flags_column_if_missing`,
+mirroring `add_message_id_column_if_missing`, plus a regression test); the
+`f`/star-toolbar toggle deciding one shared add/remove direction from a
+single message's flag state and applying it to the whole multi-selection
+(fixed with a new `toggle_star_on_selection`/`is_flagged_uid` that decides
+each target's own direction independently); `FlagsUpdated`/`Moved` never
+updating `self.search_results` (a message starred/archived from a search
+view stayed stale or pointed at a since-moved UID until the search was
+re-run — fixed by mirroring every `self.headers` mutation onto
+`search_results` when present); `Moved` never crediting the destination
+mailbox's unread count (fixed by incrementing `dest`'s count alongside
+decrementing the source's); `FlagsUpdateFailed`/`MoveFailed` writing to
+`self.status` instead of `push_banner` like every sibling error path added
+in the same wave of work (fixed — a failed flag/move action no longer
+flashes for one frame and vanishes under the next routine status update);
+and a same-numbered-UID-in-a-different-mailbox unread-count skew (the
+`was_seen` lookup for a `FlagsUpdated` event used to search `self.headers`
+regardless of whether that list actually belonged to the event's own
+mailbox — fixed by guarding the whole `self.headers`/`search_results`/
+`unread_counts` mutation on `mailbox == self.selected_mailbox`, matching
+how the DB write below it was already correctly scoped). Also fixed in
+`mail-mock-server`: a real bug in the new `STORE`/replace-mode path
+(`Mailbox::store_flags` applied `add` before `remove`, and the replace-mode
+caller passes the new flags as both `add` and, via a wildcard, `remove` —
+so a plain, non-`+`/`-` `STORE FLAGS` always ended up stripping the very
+flags it just added, leaving the message with an empty flag set; fixed by
+reordering to remove-then-add, with two new unit tests pinning both the
+replace-mode fix and that `+FLAGS`/`-FLAGS` are unaffected by the reorder).
+
+**Still open, named rather than fixed in that same pass** (real but out of
+scope for a review-driven fix — each is closer to a small feature than a
+one-line correction): bulk flag/move actions still issue one `SELECT` +
+one `STORE`/`COPY`+`STORE`+`EXPUNGE` sequence *per selected message*
+(`imap.rs`'s `store_flags`/`move_message` are UID-singular) rather than
+using IMAP's UID-set syntax to cover a whole multi-selection in one round
+trip — archiving 20 messages costs up to 80 serialized round trips instead
+of one per verb; the theme toggle (`apply_theme` in `main.rs`, B9) calls
+`Config::save()` synchronously on the UI thread inside the click handler,
+unlike every other piece of I/O in this app which goes through the async
+`imap_tx`/`db_tx` channels — a slow/contended disk stalls the whole frame
+for a purely cosmetic write; and B9's saved window position/size is applied
+at startup with no validation against which monitors are actually
+connected, so undocking a second monitor after closing esmail there can
+place the window off every visible display on next launch (no obvious
+recovery short of deleting `config.toml` — a real fix needs monitor
+enumeration before window creation, which `eframe`/`winit` doesn't
+straightforwardly expose at that point in startup).
+
 **Mock server extensions this phase needed** (following the pattern B3/B7/B11
 each established): `STORE`/`UID STORE` (mutating a new `StoredMessage::flags`
 field via `Mailbox::store_flags`, returning `FETCH (FLAGS (...))`), `COPY`/

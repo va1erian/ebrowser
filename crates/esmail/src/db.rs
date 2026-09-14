@@ -250,7 +250,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         ",
     )?;
-    add_message_id_column_if_missing(conn)
+    add_message_id_column_if_missing(conn)?;
+    add_flags_column_if_missing(conn)
 }
 
 /// `messages.message_id` (B7) was added after `messages` itself (B3).
@@ -266,6 +267,22 @@ fn add_message_id_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
         Ok(_) => Ok(()),
         // SQLite has no "ALTER TABLE ... ADD COLUMN IF NOT EXISTS"; detect
         // the column already being there by its own error text instead.
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `messages.flags` (B8) was added after `messages` itself (B3), same
+/// situation as `message_id` above: `CREATE TABLE IF NOT EXISTS` does
+/// nothing to a `messages` table an earlier build already created without
+/// this column (e.g. one from between B7 and B8, which has `message_id`
+/// but not `flags`). Without this, `index_headers`/`index_mail`'s
+/// `INSERT INTO messages (..., flags)` and `search`/`fetch_mail`'s
+/// `SELECT ... m.flags` would fail with "table messages has no column
+/// named flags" against such a file.
+fn add_flags_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    match conn.execute("ALTER TABLE messages ADD COLUMN flags TEXT NOT NULL DEFAULT ''", []) {
+        Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
         Err(e) => Err(e),
     }
@@ -607,6 +624,33 @@ mod tests {
 
         let (header, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(header.message_id, "<msg1@example.com>");
+    }
+
+    #[test]
+    fn init_schema_adds_flags_to_a_pre_b8_messages_table() {
+        // Simulates a mails.db left over from between B7 and B8: has
+        // message_id (B7) but not flags (B8) -- the exact gap
+        // add_flags_column_if_missing exists to close, same shape as the
+        // message_id regression test above.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                account_id TEXT NOT NULL, mailbox TEXT NOT NULL, uid INTEGER NOT NULL,
+                subject TEXT NOT NULL, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL,
+                date TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, thread_key TEXT,
+                PRIMARY KEY (account_id, mailbox, uid)
+            )",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        let mut header = test_header(1);
+        header.flags = vec!["\\Seen".to_string()];
+        index_mail(&conn, "acc", "INBOX", &header, "body").unwrap();
+
+        let (fetched, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(fetched.flags, vec!["\\Seen".to_string()]);
     }
 
     // ── index_mail / fetch_mail ──────────────────────────────────────────────

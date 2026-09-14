@@ -64,12 +64,22 @@ impl Mailbox {
     /// this mailbox has that UID.
     pub fn store_flags(&mut self, uid: u32, add: &[String], remove: &[String]) -> Option<Vec<String>> {
         let msg = self.messages.iter_mut().find(|m| m.uid == uid)?;
+        // Remove before add: a plain (replace-the-whole-set) STORE is
+        // modeled by the caller as "remove every known system flag, then
+        // add the new set" (imap_server.rs), so `remove` and `add` can
+        // legitimately share members there. Removing first means a flag
+        // that's in both ends up present, matching "replace with this set"
+        // -- doing it the other way around (as this used to) would add the
+        // new flags and then immediately strip them again via the wildcard
+        // remove list, leaving every replace-mode STORE with an empty flag
+        // set. The +FLAGS/-FLAGS cases (where `add`/`remove` are always
+        // disjoint, one of them empty) are unaffected by the order.
+        msg.flags.retain(|f| !remove.iter().any(|r| r.eq_ignore_ascii_case(f)));
         for flag in add {
             if !msg.flags.iter().any(|f| f.eq_ignore_ascii_case(flag)) {
                 msg.flags.push(flag.clone());
             }
         }
-        msg.flags.retain(|f| !remove.iter().any(|r| r.eq_ignore_ascii_case(f)));
         Some(msg.flags.clone())
     }
 
@@ -196,6 +206,41 @@ pub fn parse_envelope(raw: &[u8]) -> Envelope {
         from: address("From"),
         to: address("To"),
         message_id: header("Message-ID"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_flags_replace_mode_keeps_the_new_set_instead_of_ending_up_empty() {
+        // Regression test for a real bug: imap_server.rs models a plain
+        // (replace-the-whole-set) STORE as "remove every known system flag,
+        // then add the new set" -- calling store_flags with the new set as
+        // both members of `add` and (via the wildcard) `remove`. Applying
+        // `add` before `remove` (the original order) stripped the just-added
+        // flags right back out, so every replace-mode STORE ended up empty.
+        let mut mailbox = Mailbox::new("INBOX", 1);
+        let uid = mailbox.append(b"raw".to_vec(), Envelope::default());
+
+        let all_system_flags: Vec<String> =
+            ["\\Seen", "\\Flagged", "\\Deleted", "\\Answered", "\\Draft"].iter().map(|s| s.to_string()).collect();
+        let result = mailbox.store_flags(uid, &["\\Seen".to_string()], &all_system_flags);
+
+        assert_eq!(result, Some(vec!["\\Seen".to_string()]));
+    }
+
+    #[test]
+    fn store_flags_add_then_remove_are_unaffected_by_the_reordering() {
+        // The +FLAGS/-FLAGS cases always pass a disjoint, one-sided
+        // add/remove pair -- confirm the fix (remove-then-add) doesn't
+        // change their behavior.
+        let mut mailbox = Mailbox::new("INBOX", 1);
+        let uid = mailbox.append(b"raw".to_vec(), Envelope::default());
+
+        assert_eq!(mailbox.store_flags(uid, &["\\Seen".to_string()], &[]), Some(vec!["\\Seen".to_string()]));
+        assert_eq!(mailbox.store_flags(uid, &[], &["\\Seen".to_string()]), Some(vec![]));
     }
 }
 
