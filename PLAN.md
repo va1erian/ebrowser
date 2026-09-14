@@ -885,13 +885,140 @@ with shift/ctrl. Unread counts per mailbox. Render the flat `LIST` output
 delimiter, special-use folders sorted first. IDLE on the selected mailbox for
 new-mail push. Keyboard shortcuts (j/k, Enter, r, a, f, Del, Ctrl+F, Ctrl+N).
 
-### B9. Polish
+### B9. Polish — **PARTIALLY DONE**
 Error banners instead of a status string ([src/main.rs:88](src/main.rs:88)),
 per-operation progress (the WIP `download_progress` field generalises here),
 dark/light theme, window-geometry persistence, and a first-run wizard that
 guesses IMAP/SMTP settings from the email domain via a small built-in provider
 table. OAuth2 is explicitly out of scope for v1 — note in the README that Gmail
 and Outlook therefore need app passwords.
+
+**What landed:** four of the five sub-items, in the order the plan's own
+notes suggested prioritizing them (error banners, theme, window geometry,
+wizard) — per-operation progress (generalizing `download_progress`) did not,
+see below.
+
+- **Error banners.** A new `Banner { id, message }` (`main.rs`) replaces the
+  old pattern of clobbering `EsMailApp::status` with `format!("Error: {e}")`/
+  `format!("DB Error: {e}")` on `ImapEvent::Error`/`DbEvent::Error` — which
+  lost whatever the status string was showing before (e.g. "Page 3 of 9")
+  the instant an unrelated background error arrived, and could only ever
+  show the single most recent one. `status` itself is untouched and still
+  carries transient, non-error progress text ("Connecting...", "Page 3 of
+  9") — only the error half of that field's old job moved. Banners are
+  additive (a `Vec<Banner>`, each independently dismissable via an "x"
+  button) and rendered in their own panel below the top bar. This also let
+  `ImapEvent::AppendFailed` (B7's "couldn't save a copy to Sent") gain a
+  visible banner for the first time — it was previously log-only specifically
+  *because* the single `status` string had nowhere to put it without
+  overwriting "Message sent"; a banner has no such conflict, which is exactly
+  the problem banners solve. `smtp::SmtpEvent::Error` still reports through
+  `compose_status` inside the compose window rather than a banner — that's
+  deliberate, not an oversight: it's contextual to the window the user is
+  actively looking at, arguably better placed there than in a top-level
+  banner.
+- **Dark/light theme.** `config::ThemeMode` (`Dark`/`Light`/`System`, its own
+  type rather than reusing `egui::ThemePreference` so `config.rs` keeps zero
+  egui dependency) persists in `config.toml`, applied to the `egui::Context`
+  once at startup (before the first frame paints, to avoid a dark-then-light
+  flash) and again on every click of a new "Theme: <mode>" button in the top
+  bar, which cycles Dark → Light → System and saves immediately.
+- **Window-geometry persistence.** `config::WindowGeometry { x, y, width,
+  height }` is tracked every frame from `egui::ViewportInfo::outer_rect` and
+  written to `config.toml` once, when a real close is going through (gated
+  the same way B10's tray hide-to-tray redirect is — see `ui()`'s comment —
+  so a plain window close on Windows, which the tray intercepts into "hide"
+  rather than exit, doesn't spuriously save mid-session and a *real* close
+  reliably does). `main()` reads `config.toml` a second time before building
+  `NativeOptions` (the window has to exist with the right size *before*
+  `EsMailApp::new` — which also loads config, for the account list and
+  theme — ever runs) and seeds `ViewportBuilder::with_inner_size`/
+  `with_position` from it when present; a first run with no saved geometry
+  keeps the existing 1280×720 default.
+- **First-run wizard / provider table.** `config::provider_for_email` (a
+  small `&[(&str, ProviderSettings)]` table — gmail.com, googlemail.com,
+  outlook.com/hotmail.com/live.com, yahoo.com, icloud.com/me.com,
+  fastmail.com, gmx.com, zoho.com) looks up complete IMAP+SMTP host/port
+  settings by the domain half of an email address. This is a different axis
+  from B7's `config::derive_smtp_host`: that one mechanically transforms an
+  IMAP host the user already typed (`imap.` → `smtp.`) and stays exactly as
+  it was, still the fallback for any domain not in the table; this one goes
+  from just an email address to a complete guess, which is what a provider
+  like Outlook needs (`outlook.office365.com`/`smtp.office365.com`, port
+  587/STARTTLS — nothing about that is reachable by string-transforming
+  `outlook.com`). Wired into the login screen as an "Email address" field,
+  shown only when `config.accounts` is empty (first run — a returning user
+  picking a saved account, or editing an already-filled host, has nothing
+  useful for this to guess); typing a recognized domain fills in
+  host/port/SMTP host/SMTP port and the username, but only while the host
+  field still looks untouched (empty, or still the generic
+  `imap.gmail.com`/`993` `EsMailApp::new` seeds a blank form with) — it never
+  clobbers a host the user actually edited.
+- **README note on OAuth2.** Added: Gmail and Outlook need an app password
+  for v1, consistent with the provider table above guessing their connection
+  settings correctly while still not being able to authenticate against
+  either without one.
+
+**What did not land, and why:**
+- **Per-operation progress (generalizing `download_progress`).** The field
+  is still exactly what B10/B6 left it: `Option<(u32, u32)>` fed only by
+  `ImapEvent::DownloadProgress`, shown as one progress bar tied to bulk
+  mailbox download. Generalizing it to cover more than one concurrent
+  operation (e.g. an `IndexHeaders` batch alongside a `BulkDownload`) means
+  either a `HashMap<OperationKind, (u32, u32)>` or a small `Vec` of named
+  progress entries, plus a matching new event shape from `imap.rs`/`db.rs`
+  and a render loop instead of the current single `if let Some(...)` block —
+  a real, if small, redesign of that state rather than a wire-through.
+  Deliberately not attempted in the same session as the other four
+  sub-items: this is also one of the two places (along with the Reply/Reply
+  All/Forward buttons and the mailbox list) `main.rs` is busiest, and B8 (see
+  PLAN.md) is concurrently landing flags/unread-counts/multi-select in a
+  separate worktree touching the same file — a broader progress-state
+  refactor is exactly the kind of change likely to conflict line-for-line
+  with whatever B8 does to the message-list panel, so it's left for its own
+  follow-on commit once both land and the merge has settled rather than
+  risked here.
+- **Rich theme customization.** Only Dark/Light/System — no accent-color
+  picker or custom palette; "dark/light theme" in the plan's own wording is
+  satisfied by the three-way toggle.
+- **Window-geometry edge cases.** `egui::ViewportInfo::outer_rect` is `None`
+  on Android/Wayland (documented on the field itself) — `window_geometry`
+  simply stays `None` there and nothing is persisted, which degrades to
+  today's un-persisted behavior rather than erroring. Multi-monitor DPI
+  changes between runs aren't specially handled either; a geometry saved on
+  one monitor layout is applied verbatim on the next launch, same as most
+  native apps that do this at all.
+- **A dedicated "wizard" flow/modal.** The plan says "a first-run wizard";
+  what landed is a single autofill field on the existing login screen rather
+  than a separate multi-step dialog. Chosen deliberately over a modal:
+  `main.rs` is shared, actively-touched ground with B8's concurrent work
+  (see above), and a new top-level window/dialog is a much bigger footprint
+  for the same practical outcome ("typing your email fills in the right
+  settings") than one conditionally-shown text field plus a lookup function.
+  If a real multi-step wizard (confirm the guessed settings, test the
+  connection, etc.) is wanted later, `provider_for_email` and
+  `apply_provider_wizard` are the two pieces such a UI would call into.
+
+**Verification:** `cargo check --workspace` and
+`ESMAIL_TEST_CA_TRUSTED=1 cargo test --workspace` both clean (98 `esmail::lib`
+unit tests including the new `config::tests` for `ThemeMode`,
+`WindowGeometry`'s TOML round-trip, and `provider_for_email`; 7 `main.rs`
+tests; 11 passing / 2 ignored integration tests; all unaffected by this
+change). Screenshotted both `ESMAIL_PREVIEW=demo` (pixel-identical to the
+pre-B9 baseline — nothing here touches the webview/`show()`/sizing path) and
+the login screen with `ESMAIL_SCREENSHOT` (no `ESMAIL_PREVIEW`), which
+confirmed the new "Theme: System" button renders correctly in the top bar
+without disturbing the existing layout. The first-run wizard's empty-state
+screenshot (no saved accounts) was attempted but not captured cleanly: this
+environment has a **pre-existing, unrelated** interaction between B10's
+tray-icon hide-to-tray redirect (a plain window close on Windows only exits
+when `exit_requested` was set by the tray's own "Quit," which nothing sets
+during an automated `ESMAIL_SCREENSHOT` run) and this dev machine's leftover
+`Config::migrate_legacy` source file (`%APPDATA%\esmail_config.txt`, from
+pre-B1 testing) repopulating a saved account the instant `config.toml` is
+removed to simulate a first run — neither is a B9 regression, and the wizard
+field's gating logic (`self.config.accounts.is_empty()`) was verified by
+direct code reading instead.
 
 ### B10. New-mail notifications — **DONE** (Windows only; scoped as below)
 A new phase, not in the original plan wording above. Windows system-toast
@@ -1189,7 +1316,7 @@ to verify against.
 | 4 | B3 **partially done** (incremental fetch now acted on; UID-based cache paging still not, see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
 | 6 | B7 **partially done** (APPEND to Sent now lands; special-use discovery/drafts/retry-queue/rich-text still deferred, see §B7) | — |
-| 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); **A6, A7, B8, B9 — start here** | — |
+| 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); A6 **partially done** (see §A6), A7 landed (see §A7); B9 **partially done** (error banners, theme, window geometry, provider-table wizard land; per-operation progress deferred, see §B9); **B8 — start here** | — |
 | *(unordered)* | ~~B10~~ **DONE** (Windows only; INBOX-only polling, see §B10) — independent of B7/A5/B8/B9, landed out of sequence alongside whichever of those another session was mid-way through | — |
 | *(unordered)* | ~~B11~~ **DONE** (IMAP `IDLE`/push, augments B10's poll timer rather than replacing it, see §B11) — depended on `mail-mock-server` existing, independent of everything else in this table | — |
 

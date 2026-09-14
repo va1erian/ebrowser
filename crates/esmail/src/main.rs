@@ -52,6 +52,18 @@ impl WebViewHandler for MessageViewHandler {
     }
 }
 
+/// A dismissable error notice (B9), replacing the old pattern of clobbering
+/// `EsMailApp::status` with `format!("Error: {e}")`/`format!("DB Error: {e}")`
+/// — which lost whatever the status string was showing before (e.g. "Page 3
+/// of 9") the moment an unrelated background error arrived, and gave the
+/// user no way to see more than the single most recent one. `status` itself
+/// stays for transient, non-error progress text ("Connecting...", "Page 3 of
+/// 9") — this only replaces the error half of that one field's job.
+struct Banner {
+    id: u64,
+    message: String,
+}
+
 struct EsMailApp {
     // Field order is drop order: the view must be torn down before the engine
     // that backs it, so it stays declared above the host.
@@ -108,7 +120,37 @@ struct EsMailApp {
     smtp_port: String,
     status: String,
     is_connected: bool,
-    
+
+    /// First-run wizard (B9): an email address typed on the login screen, to
+    /// look up in `config::provider_for_email` and autofill the host/port
+    /// fields from — see `apply_provider_wizard`. Not itself persisted; it
+    /// only ever feeds the other fields, which are.
+    wizard_email: String,
+
+    /// Active error banners (B9), newest last. See [`Banner`].
+    banners: Vec<Banner>,
+    /// Monotonic source for `Banner::id`, so a dismiss click can target the
+    /// exact banner clicked even if another one is added/removed the same
+    /// frame — mirrors `next_req_id`'s reasoning.
+    next_banner_id: u64,
+
+    /// Current theme preference (B9), mirrored from `config.theme` and kept
+    /// in sync with it on every toggle. Applied to the `egui::Context` once
+    /// at startup and again whenever the toggle button changes it.
+    theme: config::ThemeMode,
+
+    /// The window's last-known outer rect, refreshed every frame from
+    /// `egui::ViewportInfo::outer_rect` (B9's window-geometry persistence).
+    /// `None` until the platform has reported one at least once (e.g. not
+    /// available on Wayland/Android — see that field's own doc in egui).
+    window_geometry: Option<config::WindowGeometry>,
+    /// Set once geometry has been written to `config.toml` for the close
+    /// currently in progress, so the write happens exactly once rather than
+    /// once per frame between the close request and the process actually
+    /// exiting.
+    geometry_saved_on_close: bool,
+
+
     mailboxes: Vec<String>,
     selected_mailbox: String,
     
@@ -241,6 +283,15 @@ impl EsMailApp {
             }
         }
 
+        // Apply the saved theme (B9) once, up front, rather than defaulting
+        // to egui's own built-in dark theme for one frame first -- avoids a
+        // visible flash on launch for a user who picked Light.
+        egui_ctx.set_theme(match config.theme {
+            config::ThemeMode::Dark => egui::ThemePreference::Dark,
+            config::ThemeMode::Light => egui::ThemePreference::Light,
+            config::ThemeMode::System => egui::ThemePreference::System,
+        });
+
         // Prefill the login form from the first saved account, if any; its
         // password (if the OS keyring has one) comes along too, so a
         // returning user does not have to retype it.
@@ -301,6 +352,8 @@ impl EsMailApp {
             None
         };
 
+        let initial_theme = config.theme;
+
         Self {
             web_view_host,
             web_view,
@@ -324,6 +377,12 @@ impl EsMailApp {
             smtp_port: smtp_port_str,
             status: initial_status,
             is_connected: false,
+            wizard_email: String::new(),
+            banners: Vec::new(),
+            next_banner_id: 0,
+            theme: initial_theme,
+            window_geometry: None,
+            geometry_saved_on_close: false,
             mailboxes: Vec::new(),
             selected_mailbox: "INBOX".to_string(),
             headers: Vec::new(),
@@ -361,7 +420,7 @@ impl EsMailApp {
                     self.status = "Connection lost, reconnecting...".to_string();
                 }
                 ImapEvent::Error(e) => {
-                    self.status = format!("Error: {}", e);
+                    self.push_banner(format!("IMAP error: {e}"));
                 }
                 ImapEvent::Mailboxes(mbs) => {
                     self.mailboxes = mbs;
@@ -433,8 +492,13 @@ impl EsMailApp {
                     // doc in imap.rs: the send itself already succeeded and
                     // is already reflected there, and this is a background,
                     // best-effort step the user never explicitly asked to
-                    // watch.
+                    // watch. A banner (B9), unlike the old single `status`
+                    // string this replaces, can say so *alongside* "Message
+                    // sent" instead of only being able to overwrite it --
+                    // which is exactly the problem that made this event a
+                    // log-only affair up to now.
                     log::warn!("could not save sent message to {mailbox}: {error}");
+                    self.push_banner(format!("Sent, but could not save a copy to {mailbox}: {error}"));
                 }
                 ImapEvent::HeadersFrom { mailbox, headers } => {
                     // B3: reply to the `FetchHeadersFrom` sent in
@@ -498,7 +562,7 @@ impl EsMailApp {
                     }
                 }
                 DbEvent::Error(e) => {
-                    self.status = format!("DB Error: {}", e);
+                    self.push_banner(format!("Database error: {e}"));
                 }
             }
         }
@@ -527,6 +591,70 @@ impl EsMailApp {
                 smtp::SmtpEvent::Error(e) => {
                     self.compose_status = format!("Send failed: {e}");
                 }
+            }
+        }
+    }
+
+    /// Add a new error banner (B9). Callers pass a complete, already-worded
+    /// message; this just assigns it an id and appends it — dismissal is a
+    /// separate click handled in `ui()`, since building the message needs
+    /// `&mut self` at the call site but the dismiss button needs it while
+    /// iterating `self.banners`, and those can't overlap in one place.
+    fn push_banner(&mut self, message: String) {
+        self.next_banner_id += 1;
+        self.banners.push(Banner { id: self.next_banner_id, message });
+    }
+
+    /// Apply `theme` to both `self.config` (so it's saved) and the live
+    /// `egui::Context` (so the toggle takes effect immediately, not just on
+    /// the next launch).
+    fn apply_theme(&mut self, ctx: &egui::Context, theme: config::ThemeMode) {
+        self.theme = theme;
+        self.config.theme = theme;
+        ctx.set_theme(match theme {
+            config::ThemeMode::Dark => egui::ThemePreference::Dark,
+            config::ThemeMode::Light => egui::ThemePreference::Light,
+            config::ThemeMode::System => egui::ThemePreference::System,
+        });
+        if let Err(e) = self.config.save() {
+            log::warn!("could not persist theme preference: {e}");
+        }
+    }
+
+    /// First-run wizard (B9): if `self.wizard_email` names a domain
+    /// `config::provider_for_email` recognizes, and the host fields still
+    /// look untouched (empty, or still holding the generic `imap.gmail.com`/
+    /// `993` placeholder `EsMailApp::new` seeds a brand-new login form
+    /// with), fill in the guessed host/port/SMTP settings and the username.
+    /// Never overwrites a host the user has actually typed or edited —
+    /// there's no "are you sure" here, so silently clobbering a manual entry
+    /// on every keystroke in the email field would be worse than not
+    /// guessing at all.
+    fn apply_provider_wizard(&mut self) {
+        let Some(settings) = config::provider_for_email(&self.wizard_email) else {
+            return;
+        };
+        let untouched = matches!(self.host.as_str(), "" | "imap.gmail.com");
+        if !untouched {
+            return;
+        }
+        self.host = settings.imap_host.to_string();
+        self.port = settings.imap_port.to_string();
+        self.smtp_host = settings.smtp_host.to_string();
+        self.smtp_port = settings.smtp_port.to_string();
+        if self.username.is_empty() {
+            self.username = self.wizard_email.clone();
+        }
+    }
+
+    /// Persist the window's last-tracked outer rect (B9) into `config.toml`,
+    /// if the platform ever reported one (see `window_geometry`'s doc).
+    /// Called once when a real close is going through — see `ui()`.
+    fn save_window_geometry(&mut self) {
+        if let Some(geometry) = self.window_geometry {
+            self.config.window = Some(geometry);
+            if let Err(e) = self.config.save() {
+                log::warn!("could not persist window geometry: {e}");
             }
         }
     }
@@ -789,6 +917,32 @@ impl eframe::App for EsMailApp {
 
         self.screenshotter.update(ui.ctx());
 
+        // Window-geometry persistence (B9): keep the latest known outer rect
+        // around every frame (cheap -- just a field write, no I/O), and
+        // write it to config.toml exactly once when a real close is going
+        // through. `close_requested()` fires the same frame the window's
+        // own close button (or, on Windows, the tray's "Quit") is clicked;
+        // `handle_tray`'s hide-to-tray redirect on Windows cancels most of
+        // those, so `exit_requested` (set only by that Quit path) has to
+        // gate this the same way it gates the redirect itself, or a plain
+        // window close on Windows would never reach this at all.
+        if let Some(rect) = ui.ctx().input(|i| i.viewport().outer_rect) {
+            self.window_geometry = Some(config::WindowGeometry {
+                x: rect.min.x,
+                y: rect.min.y,
+                width: rect.width(),
+                height: rect.height(),
+            });
+        }
+        #[cfg(target_os = "windows")]
+        let closing = ui.ctx().input(|i| i.viewport().close_requested()) && self.exit_requested;
+        #[cfg(not(target_os = "windows"))]
+        let closing = ui.ctx().input(|i| i.viewport().close_requested());
+        if closing && !self.geometry_saved_on_close {
+            self.geometry_saved_on_close = true;
+            self.save_window_geometry();
+        }
+
         if self.preview {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 for event in self.web_view.show(ui) {
@@ -863,8 +1017,39 @@ impl eframe::App for EsMailApp {
                 }
 
                 ui.label(&self.status);
+
+                // Theme toggle (B9): right-aligned so it stays in a
+                // consistent spot regardless of how long `self.status` is.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = format!("Theme: {}", self.theme.label());
+                    if ui.button(label).on_hover_text("Cycle Dark / Light / System").clicked() {
+                        let next = self.theme.next();
+                        self.apply_theme(ui.ctx(), next);
+                    }
+                });
             });
         });
+
+        // Error banners (B9) — see `Banner`'s doc. Shown below the top panel
+        // so they don't shove the search box around; a dismissed banner is
+        // just removed from the list, nothing more.
+        if !self.banners.is_empty() {
+            egui::Panel::top("error_banners").show_inside(ui, |ui| {
+                let mut dismissed = None;
+                for banner in &self.banners {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(180, 40, 40), "⚠");
+                        ui.colored_label(egui::Color32::from_rgb(180, 40, 40), &banner.message);
+                        if ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                            dismissed = Some(banner.id);
+                        }
+                    });
+                }
+                if let Some(id) = dismissed {
+                    self.banners.retain(|b| b.id != id);
+                }
+            });
+        }
 
         if !self.is_connected {
             egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -892,6 +1077,26 @@ impl eframe::App for EsMailApp {
                                 if let Err(e) = self.config.save() {
                                     log::warn!("could not persist account removal: {e}");
                                 }
+                            }
+                            ui.separator();
+                        }
+
+                        // First-run wizard (B9): only shown before any
+                        // account has ever been saved -- a returning user
+                        // picking a saved account above, or editing an
+                        // already-filled-in host, has nothing this would
+                        // usefully guess. Typing a recognized domain here
+                        // (gmail.com, outlook.com, ...) fills in the fields
+                        // below from `config::PROVIDERS`; an unrecognized
+                        // domain leaves them for the user to type directly,
+                        // same as before this existed.
+                        if self.config.accounts.is_empty() {
+                            let email_resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.wizard_email)
+                                    .hint_text("Email address (gmail.com, outlook.com, ...)"),
+                            );
+                            if email_resp.changed() {
+                                self.apply_provider_wizard();
                             }
                             ui.separator();
                         }
@@ -1375,8 +1580,21 @@ fn format_size(bytes: usize) -> String {
 
 #[tokio::main]
 async fn main() -> eframe::Result {
+    // Window-geometry persistence (B9): the saved size/position has to be
+    // known before the window is created at all, so this reads config.toml
+    // a second time here (`EsMailApp::new` also loads it, for the account
+    // list and theme) rather than threading a pre-loaded `Config` through
+    // `run_native`'s `Box<dyn FnOnce>` closure -- a second cheap file read on
+    // startup is a small price for keeping `EsMailApp::new`'s signature
+    // (`&eframe::CreationContext`, same as every other eframe app) untouched.
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]);
+    if let Some(geometry) = config::Config::load().window {
+        viewport = viewport
+            .with_inner_size([geometry.width, geometry.height])
+            .with_position([geometry.x, geometry.y]);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
+        viewport,
         ..Default::default()
     };
 

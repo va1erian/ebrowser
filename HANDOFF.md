@@ -4,21 +4,27 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is one of A6/A7/B8/B9** ([PLAN.md](PLAN.md), phase 7 — all
-independent of each other, pick whichever is most useful next; A6/A7 may
-already be in progress or done by the time you read this, see §5's table).
-Phases 0-2, B1, B5, B10, and now B11 (IMAP push), B2's worker-session
-split, B3's incremental-fetch half, and B7's `APPEND`-to-Sent half (see
-below) are done. B3 (its UID-based cache-paging half), B4, B6, B7 (its
-still-open pieces), and A5 are each partially done — see their PLAN.md
-sections for exactly what landed vs. what's deliberately deferred. B7's
-remaining exceptions are now `\Sent` special-use-flag discovery, drafts, a
-real retry queue, rich-text composing, and recipient autocomplete; A5's is
-specifically the `Scroll::Delta`→`Wheel` API migration, held back over a
-sign-convention flip that needs a live app to watch scroll direction on,
-which this environment can't do (screenshots are passive, no synthetic
-input dispatch) — IME/cursor/clipboard in A5 are separate, smaller,
-still-open items. None of this blocks phase 7.
+**Your next task is B8** ([PLAN.md](PLAN.md), phase 7's last remaining
+item — "Flags and the rest of the reading experience": `\Seen`/star/
+delete-to-Trash/archive/mark-unread, multi-select, unread counts, a real
+mailbox tree, IDLE on the selected mailbox, keyboard shortcuts. It may
+already be in progress or done in a separate worktree by the time you read
+this — check for a B8 commit before starting). A6, A7, and B9 are now each
+landed or partially landed — see §5's table and their own PLAN.md sections.
+Phases 0-2, B1, B5, B10, B11 (IMAP push), B2's worker-session split, B3's
+incremental-fetch half, and B7's `APPEND`-to-Sent half are done. B3 (its
+UID-based cache-paging half), B4, B6, B7 (its still-open pieces), A5, A6,
+and now B9 are each partially done — see their PLAN.md sections for exactly
+what landed vs. what's deliberately deferred. B7's remaining exceptions are
+now `\Sent` special-use-flag discovery, drafts, a real retry queue,
+rich-text composing, and recipient autocomplete; A5's is specifically the
+`Scroll::Delta`→`Wheel` API migration, held back over a sign-convention flip
+that needs a live app to watch scroll direction on, which this environment
+can't do (screenshots are passive, no synthetic input dispatch) — IME/
+cursor/clipboard in A5 are separate, smaller, still-open items. B9's is
+per-operation progress (generalizing `download_progress`), deliberately left
+for its own commit once B8's concurrent `main.rs` changes land — see §B9.
+None of this blocks B8.
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
@@ -315,7 +321,8 @@ the `glow` renderer. That is §A6.
 | `405851f` | **B11** — IMAP `IDLE`/push (see PLAN.md §B11). `idle_watch.rs`: a dedicated always-on IDLE connection, independent of `ImapActor`'s session, that sends a wake signal on any server push; wired into `main.rs` so `spawn_new_mail_watch` (B10) polls immediately on a push instead of waiting for its 60s timer, which keeps running as a fallback. Added `IDLE` support to `mail-mock-server` itself (`Store::notify` broadcast channel, `imap_server.rs`'s `IDLE` handler) plus an integration test proving a push arrives in low single-digit seconds. Merged into `main` via PR #6. |
 | `de711a1` (PR #7) | **B2 (worker-session split)** — see PLAN.md §B2. `imap.rs` gained `spawn_body_worker`, a second independent IMAP connection (own connect/reconnect loop, `ensure_worker_connected`) that `FetchBody`/`BulkDownload` are routed to instead of `ImapActor`'s own session, so they can't block `FetchHeaders`/`FetchMailboxes` behind them any more. Verified with a real concurrency test (`bulk_download_does_not_block_a_concurrent_header_fetch`), not just unit tests. |
 | `6db4c18` (PR #7) | **B3 (incremental fetch acted on)** — see PLAN.md §B3. A `DbEvent::SyncPlan::FetchFrom`/`Resync` now triggers a new `ImapCommand::FetchHeadersFrom` (envelope-only `UID FETCH`, kept separate from B10's `FetchNewHeaders` so the cache-sync path can't spuriously trigger a new-mail toast), indexed metadata-only via a new `DbCommand::IndexHeaders`/`index_headers`. Along the way, fixed a real gap in `mail-mock-server`'s `UID FETCH` handler: it only ever supported a single numeric UID with `RFC822`, not the `first:*` range + `ENVELOPE` this needed (and `FetchNewHeaders`/B10 needed too, apparently never exercised against this server until now). UID-based cache paging for the header list itself did not land — see PLAN.md §B3 for why that's scoped as separate follow-on work. |
-| *(this branch)* | **B7 (`APPEND` to Sent)** — see PLAN.md §B7. `smtp.rs`'s `SmtpEvent::Sent` now carries the exact raw bytes that were sent; `main.rs` follows a successful send with `ImapCommand::Append { mailbox: "Sent", raw }`, indexed via a new `ImapEvent::AppendFailed` (kept separate from `Error` so a save failure can't overwrite the "Message sent" status). Added `APPEND` support to `mail-mock-server` (it had none), delivering into the same `Store::deliver` `smtp_server.rs`'s `DATA` handler uses. `\Sent` special-use-flag discovery and drafts still not done — `SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`. |
+| *(prior branch)* | **B7 (`APPEND` to Sent)** — see PLAN.md §B7. `smtp.rs`'s `SmtpEvent::Sent` now carries the exact raw bytes that were sent; `main.rs` follows a successful send with `ImapCommand::Append { mailbox: "Sent", raw }`, indexed via a new `ImapEvent::AppendFailed` (kept separate from `Error` so a save failure can't overwrite the "Message sent" status). Added `APPEND` support to `mail-mock-server` (it had none), delivering into the same `Store::deliver` `smtp_server.rs`'s `DATA` handler uses. `\Sent` special-use-flag discovery and drafts still not done — `SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`. |
+| *(this branch)* | **B9 (partial) — Polish** — see PLAN.md §B9. Error banners (`main.rs`'s new `Banner`/`push_banner`, replacing `status = format!("Error: {e}")`/`"DB Error: {e}"` and giving `AppendFailed` a visible-but-non-clobbering notice for the first time), a Dark/Light/System theme toggle persisted via `config::ThemeMode`, window-geometry persistence (`config::WindowGeometry`, tracked from `egui::ViewportInfo::outer_rect` and saved once on a real close, read back by `main()` before the window is created), and a first-run provider-table wizard (`config::provider_for_email` — gmail.com/outlook.com/yahoo.com/icloud.com/fastmail.com/gmx.com/zoho.com — autofilling the login form's host/port/SMTP fields from just an email address, distinct from B7's mechanical `derive_smtp_host`). Added `crates/esmail/README.md` with the OAuth2-out-of-scope/app-password note the plan calls for. Per-operation progress (generalizing `download_progress`) deliberately deferred — see PLAN.md §B9 for why (B8 is concurrently landing in the same busy part of `main.rs`). |
 
 State: `cargo check --workspace` clean, `cargo test --workspace` all passing
 (unit tests across every crate plus the `mail-mock-server`-backed integration
