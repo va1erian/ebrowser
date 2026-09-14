@@ -19,6 +19,12 @@
 //! One [`WebViewHost`] owns the engine; it can produce any number of
 //! [`WebView`]s that share it.
 
+// A7 (PLAN.md): `warn`, not `deny` -- this crate is internal-only (never
+// published, see PLAN.md's A7 section), so there's no external consumer to
+// protect with a hard failure. `warn` still gets every public item reviewed
+// once and keeps new ones from silently going undocumented.
+#![warn(missing_docs)]
+
 // Re-exported so callers can name the types in this crate's signatures without
 // taking their own dependency on these crates (and risking a version skew).
 pub use dpi;
@@ -191,10 +197,16 @@ struct Delegate {
     /// distinguish the initial navigation from user-initiated link clicks.
     initial_load_done: Rc<RefCell<bool>>,
     handler: Rc<RefCell<dyn WebViewHandler>>,
+    /// Set whenever Servo has painted a new frame; cleared by `show()` once
+    /// it has re-read the framebuffer. The `read_to_image` round-trip is not
+    /// cheap, so re-reading only when a new frame actually landed (rather
+    /// than on every `show()`) is worth doing (A6, PLAN.md).
+    frame_dirty: Rc<Cell<bool>>,
 }
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _webview: ServoWebView) {
+        self.frame_dirty.set(true);
         self.egui_ctx.request_repaint();
     }
 
@@ -377,6 +389,9 @@ impl WebViewHost {
 
         let events: Rc<RefCell<Vec<WebViewEvent>>> = Rc::new(RefCell::new(Vec::new()));
         let initial_load_done: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Start dirty so the CPU fallback path's first `show()` reads a frame
+        // even if `notify_new_frame_ready` hasn't fired yet.
+        let frame_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(true));
         let handler = config
             .handler
             .clone()
@@ -387,6 +402,7 @@ impl WebViewHost {
             events: events.clone(),
             initial_load_done,
             handler,
+            frame_dirty: frame_dirty.clone(),
         });
 
         let servo_view = WebViewBuilder::new(
@@ -401,6 +417,7 @@ impl WebViewHost {
             servo_view,
             offscreen_ctx,
             events,
+            frame_dirty,
             texture: None,
             texture_name: format!("egui_servo_webview_{view_id}"),
             last_phys_size: config.size,
@@ -458,6 +475,8 @@ pub struct WebView {
     /// The offscreen GL framebuffer that Servo renders into.
     offscreen_ctx: Rc<OffscreenRenderingContext>,
     events: Rc<RefCell<Vec<WebViewEvent>>>,
+    /// Shared with the [`Delegate`]; see its field doc.
+    frame_dirty: Rc<Cell<bool>>,
     /// Reused across frames; reallocating one per frame was measurable waste.
     texture: Option<egui::TextureHandle>,
     /// Unique per view, so two views cannot collide on one egui texture.
@@ -534,6 +553,13 @@ impl WebView {
     /// Call once per frame per view. The engine itself is driven separately by
     /// [`WebViewHost::spin`], which must be called once per frame overall.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
+        self.show_impl(ui).1
+    }
+
+    /// Shared implementation behind [`WebView::show`] and the
+    /// `egui::Widget for &mut WebView` impl below -- the two differ only in
+    /// which half of this they hand back to the caller.
+    fn show_impl(&mut self, ui: &mut egui::Ui) -> (egui::Response, Vec<WebViewEvent>) {
         let dpi = ui.ctx().pixels_per_point();
 
         // Claim the rect first, then size the engine to exactly what we claimed.
@@ -566,40 +592,62 @@ impl WebView {
         self.servo_view.paint();
 
         // ── Blit offscreen framebuffer → egui texture ─────────────────────────
+        //
+        // A6 (PLAN.md) attempted the zero-copy `render_to_parent_callback` +
+        // `egui::PaintCallback` path here and it does not work in this crate's
+        // architecture -- see PLAN.md's A6 section for the full account of why
+        // (screenshot came back a uniform blank fill; root-caused to
+        // `WindowRenderingContext::new` building Servo its own independent GL
+        // context on the window handle, never shared with eframe/glutin's own
+        // context, so the "parent" framebuffer `render_to_parent_callback`
+        // blits into is not the framebuffer `egui_glow` is actually
+        // compositing into). Reverted in favor of the CPU readback path,
+        // which is what actually renders correctly. The other half of A6 did
+        // land: only re-read when a new frame has arrived since the last one
+        // (`frame_dirty`, set by `notify_new_frame_ready`), rather than
+        // unconditionally on every `show()`.
         let read_rect = euclid::Box2D::<i32, DevicePixel>::new(
             euclid::Point2D::new(0, 0),
             euclid::Point2D::new(phys_w as i32, phys_h as i32),
         );
 
-        let mut drew = false;
-        if let Some(rgba) = self.offscreen_ctx.read_to_image(read_rect) {
-            let w = rgba.width() as usize;
-            let h = rgba.height() as usize;
-            if w > 0 && h > 0 {
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
-                // Reuse one texture for the life of the view. `load_texture`
-                // allocates a new one on every call, which meant a fresh
-                // full-surface texture every frame.
-                let texture = match &mut self.texture {
-                    Some(handle) => {
-                        handle.set(color_image, egui::TextureOptions::LINEAR);
-                        handle
+        if self.frame_dirty.get() {
+            if let Some(rgba) = self.offscreen_ctx.read_to_image(read_rect) {
+                let w = rgba.width() as usize;
+                let h = rgba.height() as usize;
+                if w > 0 && h > 0 {
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
+                    // Reuse one texture for the life of the view. `load_texture`
+                    // allocates a new one on every call, which meant a fresh
+                    // full-surface texture every frame.
+                    match &mut self.texture {
+                        Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
+                        slot => {
+                            let _ = slot.insert(ui.ctx().load_texture(
+                                &self.texture_name,
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
                     }
-                    slot => slot.insert(ui.ctx().load_texture(
-                        &self.texture_name,
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    )),
-                };
-                ui.painter().image(
-                    texture.id(),
-                    widget_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-                drew = true;
+                }
             }
+            self.frame_dirty.set(false);
+        }
+
+        // Paint whatever the texture currently holds -- the frame just read
+        // above, or (when not dirty) the one from a previous frame, so the
+        // widget doesn't flash blank on a `show()` with nothing new.
+        let mut drew = false;
+        if let Some(texture) = &self.texture {
+            ui.painter().image(
+                texture.id(),
+                widget_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            drew = true;
         }
 
         if !drew {
@@ -787,7 +835,8 @@ impl WebView {
         }
 
         // Drain accumulated events for the caller.
-        std::mem::take(&mut *self.events.borrow_mut())
+        let events = std::mem::take(&mut *self.events.borrow_mut());
+        (resp, events)
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
@@ -842,6 +891,21 @@ impl WebView {
         let b64 = general_purpose::STANDARD.encode(html.as_bytes());
         let s = format!("data:text/html;charset=utf-8;base64,{}", b64);
         Url::parse(&s).expect("data URL is always valid")
+    }
+}
+
+/// A convenience for embedding a view with `ui.add(&mut view)` instead of
+/// `view.show(ui)`.
+///
+/// This drops the [`WebViewEvent`]s [`WebView::show`] would have returned --
+/// `egui::Widget::ui` can only hand back a [`egui::Response`], with no room
+/// for a second value. Call [`WebView::show`] directly instead whenever the
+/// caller needs navigation/lifecycle events (link clicks, title changes,
+/// etc.); this impl exists for the common case of a view that's just being
+/// displayed.
+impl egui::Widget for &mut WebView {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        self.show_impl(ui).0
     }
 }
 
