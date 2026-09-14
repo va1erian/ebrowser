@@ -419,6 +419,23 @@ impl EsMailApp {
                     // fetch new envelopes / show a toast). Nothing left here
                     // for the UI to do with either variant.
                 }
+                ImapEvent::Appended { mailbox } => {
+                    // B7: confirmation that the just-sent message was saved
+                    // to `mailbox` (see the `Append` sent from
+                    // `handle_smtp_events`'s `Sent` arm). Nothing for the UI
+                    // to update -- the compose window and "Message sent"
+                    // status already reflect the send itself, which
+                    // succeeded independently of this.
+                    log::debug!("appended sent message to {mailbox}");
+                }
+                ImapEvent::AppendFailed { mailbox, error } => {
+                    // Deliberately not `self.status` -- see the variant's
+                    // doc in imap.rs: the send itself already succeeded and
+                    // is already reflected there, and this is a background,
+                    // best-effort step the user never explicitly asked to
+                    // watch.
+                    log::warn!("could not save sent message to {mailbox}: {error}");
+                }
                 ImapEvent::HeadersFrom { mailbox, headers } => {
                     // B3: reply to the `FetchHeadersFrom` sent in
                     // `handle_db_events`'s `SyncPlan::FetchFrom`/`Resync`
@@ -490,7 +507,7 @@ impl EsMailApp {
     fn handle_smtp_events(&mut self) {
         while let Ok(evt) = self.smtp_rx.try_recv() {
             match evt {
-                smtp::SmtpEvent::Sent => {
+                smtp::SmtpEvent::Sent { raw } => {
                     // The compose window closes on success; a failure (the
                     // Error arm below) leaves it open with the typed text
                     // intact instead, so nothing is lost -- see smtp.rs's
@@ -499,6 +516,13 @@ impl EsMailApp {
                     self.compose = None;
                     self.compose_status.clear();
                     self.status = "Message sent".to_string();
+                    // B7: save a copy to Sent, the way every other mail
+                    // client does (SMTP itself doesn't). Best-effort -- a
+                    // failure here only logs (via the generic
+                    // ImapEvent::Error path), it doesn't reopen the compose
+                    // window or otherwise imply the send itself failed,
+                    // since it didn't.
+                    let _ = self.imap_tx.try_send(ImapCommand::Append { mailbox: SENT_MAILBOX.to_string(), raw });
                 }
                 smtp::SmtpEvent::Error(e) => {
                     self.compose_status = format!("Send failed: {e}");
@@ -1144,6 +1168,12 @@ const NEW_MAIL_POLL_MAILBOX: &str = "INBOX";
 /// How often `spawn_new_mail_watch` asks `ImapActor` to check
 /// [`NEW_MAIL_POLL_MAILBOX`] for new mail.
 const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Where a sent message is `APPEND`ed after sending (B7). A hardcoded name
+/// rather than `\Sent` special-use-flag discovery with a name-based
+/// fallback -- see `ImapCommand::Append`'s doc in imap.rs and PLAN.md §B7
+/// for the real gap this leaves (an account whose Sent folder isn't
+/// literally named "Sent" gets a new mailbox silently created instead).
+const SENT_MAILBOX: &str = "Sent";
 
 /// Background watcher for B10 (new-mail notifications). Forwards every
 /// `ImapEvent` from `ImapActor` to the UI channel (bumping a repaint) --

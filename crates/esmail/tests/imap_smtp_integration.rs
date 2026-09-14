@@ -286,7 +286,7 @@ async fn send_via_smtp_then_see_it_over_imap() {
 
     smtp_cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
     match timeout(RECV_TIMEOUT, smtp_evt_rx.recv()).await.unwrap().unwrap() {
-        SmtpEvent::Sent => {}
+        SmtpEvent::Sent { .. } => {}
         SmtpEvent::Error(e) => panic!("send failed: {e}"),
     }
 
@@ -296,6 +296,61 @@ async fn send_via_smtp_then_see_it_over_imap() {
             assert_eq!(headers.len(), 3); // 2 fixtures + the one just sent
             assert!(headers.iter().any(|h| h.subject == "Sent from the integration test"));
             assert!(mailbox_state.uid_next >= 4);
+        }
+        other => panic!("expected Headers, got {other:?}"),
+    }
+}
+
+/// B7: after a send, `main.rs` also `APPEND`s a copy to Sent -- verify the
+/// IMAP-side half of that directly (the raw bytes `SmtpEvent::Sent` carries
+/// really do round-trip through `ImapCommand::Append` into a mailbox
+/// `FetchHeaders` can then see), the same way `send_via_smtp_then_see_it_over_imap`
+/// verifies the SMTP-then-INBOX half.
+#[tokio::test]
+async fn append_saves_a_sent_copy_that_fetch_headers_can_then_see() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    let (smtp_cmd_tx, smtp_cmd_rx) = mpsc::channel(8);
+    let (smtp_evt_tx, mut smtp_evt_rx) = mpsc::channel(8);
+    SmtpActor::spawn(smtp_cmd_rx, smtp_evt_tx);
+
+    let account = SmtpAccount {
+        host: "127.0.0.1".to_string(),
+        port: h.server.smtp_addr.port(),
+        tls: esmail::config::TlsMode::None,
+        username: TEST_USER.to_string(),
+        password: SecretString::from(TEST_PASSWORD),
+        from_address: TEST_USER.to_string(),
+    };
+    let compose = ComposeState {
+        to: "someone-else@example.com".to_string(),
+        subject: "Copy me to Sent".to_string(),
+        body: "This should show up in Sent too.".to_string(),
+        ..Default::default()
+    };
+
+    smtp_cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
+    let raw = match timeout(RECV_TIMEOUT, smtp_evt_rx.recv()).await.unwrap().unwrap() {
+        SmtpEvent::Sent { raw } => raw,
+        SmtpEvent::Error(e) => panic!("send failed: {e}"),
+    };
+    assert!(String::from_utf8_lossy(&raw).contains("Copy me to Sent"), "raw bytes should be the actual sent message");
+
+    h.imap_cmd.send(ImapCommand::Append { mailbox: "Sent".to_string(), raw }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Appended { mailbox } => assert_eq!(mailbox, "Sent"),
+        other => panic!("expected Appended, got {other:?}"),
+    }
+
+    // fixtures.rs seeds one message into Sent already (see `seed`'s
+    // `deliver_fixture(store, "Sent", plain_message(9999))`), so the
+    // appended copy should be the second.
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "Sent".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => {
+            assert_eq!(headers.len(), 2);
+            assert!(headers.iter().any(|h| h.subject == "Copy me to Sent"));
         }
         other => panic!("expected Headers, got {other:?}"),
     }
@@ -482,7 +537,7 @@ mod stress {
                 };
                 cmd_tx.send(SmtpCommand::Send { account, compose }).await.unwrap();
                 match timeout(Duration::from_secs(30), evt_rx.recv()).await {
-                    Ok(Some(SmtpEvent::Sent)) => true,
+                    Ok(Some(SmtpEvent::Sent { .. })) => true,
                     other => {
                         eprintln!("send #{i} failed: {other:?}");
                         false

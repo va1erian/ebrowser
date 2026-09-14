@@ -686,7 +686,7 @@ from a cached search result (`DbEvent::MailFetched`) shows none, because
 `bodies` only caches the rendered HTML (B3), not the raw bytes attachments
 are extracted from.
 
-### B7. Compose and send — **PARTIALLY DONE**
+### B7. Compose and send — **PARTIALLY DONE** (APPEND to Sent now lands)
 Add `lettre` (`tokio1-native-tls`, `builder`). A compose window with To/Cc/Bcc
 (chip entry completed from cached correspondents), Subject, attachment picker and
 a body editor. Ship plain-text composing first, then a minimal rich-text layer
@@ -731,16 +731,46 @@ has no column named message_id". Fixed with an idempotent
 `ALTER TABLE ... ADD COLUMN` migration step, tested both for idempotency and
 against a hand-built pre-B7 `messages` table.
 
-**What did not land, and why:**
+**`APPEND` to Sent landed once `mail-mock-server` existed to verify it
+against** — same unblocking as B2/B3/B11. `smtp.rs`'s `SmtpEvent::Sent` now
+carries the exact raw RFC822 bytes handed to the transport (`Message::
+formatted()`, captured before the message is moved into `transport.send`,
+so the appended copy is byte-identical to what was actually sent — not a
+second, possibly-diverged call to `build_message`); `main.rs` follows a
+successful send with `ImapCommand::Append { mailbox: "Sent", raw }`. A
+failed `Append` is reported through a new `ImapEvent::AppendFailed`, kept
+separate from the generic `Error` event specifically so it can't overwrite
+the "Message sent" status the send's own success already set — the send
+and the save are two independent steps, and a save failure shouldn't read
+as if the send itself failed.
+
+Landing this needed `mail-mock-server`'s `APPEND` support added alongside
+(it had none): `imap_server.rs` reads the `APPEND "<mailbox>" {n}` command
+line, sends the `+` continuation, reads exactly `n` literal bytes plus the
+client's trailing CRLF, then delivers into `Store` via the same
+`Store::deliver` `smtp_server.rs`'s `DATA` handler already uses — an
+appended message becomes indistinguishable from one that arrived over SMTP,
+which is the correct behavior for what a real server's Sent folder holds.
+Verified end to end by a new integration test
+(`append_saves_a_sent_copy_that_fetch_headers_can_then_see`): send over
+SMTP, `Append` the returned raw bytes to Sent, then `FetchHeaders` on Sent
+and confirm the message is there.
+
+**Still not done: `\Sent` special-use-flag discovery, and drafts.**
+`SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`, not discovered via the
+`\Sent` special-use flag (`LIST`'s `\HasNoChildren`/etc. attributes) with a
+name-based fallback for servers that don't advertise it — an account whose
+Sent folder is actually named something else (`Sent Items`, `Sent Mail`,
+locale-dependent names) would get a *new* mailbox silently created next to
+its real one, since `Store::deliver`/most real IMAP servers create-on-append
+by default. There is also still no draft autosave (`APPEND` with `\Draft`)
+— the `APPEND` machinery this phase added is the same primitive drafts
+would need, but nothing calls it for that purpose yet.
+
+**What else did not land, and why:**
 - **Rich-text composing.** The plan itself sequences this after plain-text
   ("ship plain-text composing first, *then* ..."), so landing only the first
   half matches the plan's own ordering, not a cut corner.
-- **IMAP `APPEND` to Sent, and drafts.** A sent message reaches its recipient
-  over SMTP but is never saved to the account's Sent folder, and there is no
-  draft autosave. Both need `\Sent`/`\Drafts` special-use-flag discovery (or
-  a name-based fallback) plus `APPEND` — new live-IMAP-protocol code, same
-  reasoning as every other live-IMAP half deferred this session (B2/B3/B4/B6):
-  nothing here to verify it against.
 - **A real send-retry queue.** A failed send reports the error and leaves the
   compose window open with everything the user typed intact, so nothing is
   lost — but there's no automatic retry-with-backoff, and nothing survives an
@@ -1071,7 +1101,7 @@ to verify against.
 | 3 | ~~B1~~ **DONE**, B2 **partially done** (worker-session split now done; cancellation-of-in-flight-work still doesn't interrupt an active fetch, see §B2) | B3, B7 |
 | 4 | B3 **partially done** (incremental fetch now acted on; UID-based cache paging still not, see §B3), B4 **partially done** (see §B4) | B8 |
 | 5 | ~~B5~~ **DONE** (allowlist deferred, see §B5), B6 **partially done** (lazy fetch deferred, see §B6) | — |
-| 6 | B7 **partially done** (APPEND/drafts/retry-queue/rich-text deferred, see §B7) | — |
+| 6 | B7 **partially done** (APPEND to Sent now lands; special-use discovery/drafts/retry-queue/rich-text still deferred, see §B7) | — |
 | 7 | A5 **partially done** (Wheel/IME/cursor/clipboard deferred, see §A5); **A6, A7, B8, B9 — start here** | — |
 | *(unordered)* | ~~B10~~ **DONE** (Windows only; INBOX-only polling, see §B10) — independent of B7/A5/B8/B9, landed out of sequence alongside whichever of those another session was mid-way through | — |
 | *(unordered)* | ~~B11~~ **DONE** (IMAP `IDLE`/push, augments B10's poll timer rather than replacing it, see §B11) — depended on `mail-mock-server` existing, independent of everything else in this table | — |

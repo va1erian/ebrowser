@@ -1,7 +1,16 @@
 //! A minimal IMAP4rev1 server -- just enough of the protocol for esmail's
 //! `imap.rs` to drive: `LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
-//! `UID FETCH <n|n:m|n:*> (RFC822 | (UID ENVELOPE))`, `IDLE`, `LOGOUT`.
-//! Nothing else esmail sends is implemented.
+//! `UID FETCH <n|n:m|n:*> (RFC822 | (UID ENVELOPE))`, `APPEND`, `IDLE`,
+//! `LOGOUT`. Nothing else esmail sends is implemented.
+//!
+//! `APPEND` delivers straight into `Store` via `Store::deliver`, same as
+//! `smtp_server.rs`'s `DATA` handler -- an `APPEND`ed message becomes
+//! indistinguishable from one that arrived over SMTP once it lands, which
+//! is the correct behavior (a real server's `Sent` folder holds exactly
+//! that: client-appended copies, not anything the server itself received).
+//! No `APPENDUID`/`UIDPLUS` response extension, no flags/date-time
+//! arguments -- `imap.rs::ImapCommand::Append` sends none of those, only a
+//! bare `APPEND <mailbox> {n}` followed by the literal.
 //!
 //! `IDLE` (RFC 2177) pushes an untagged `* N EXISTS` as soon as
 //! `Store::deliver` lands a message in the selected mailbox, by subscribing
@@ -21,7 +30,7 @@
 //! verified against the vendored `imap-proto-0.16.7` grammar
 //! (`parser/core.rs::literal`).
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_native_tls::TlsAcceptor;
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor as NativeTlsAcceptor};
@@ -301,6 +310,42 @@ where
                     }
                 }
                 write_half.write_all(format!("{tag} OK UID FETCH completed\r\n").as_bytes()).await?;
+            }
+            "APPEND" => {
+                if authenticated_user.is_none() {
+                    write_half.write_all(format!("{tag} NO not authenticated\r\n").as_bytes()).await?;
+                    continue;
+                }
+                let Some(mailbox_name) = tokens.get(2).cloned() else {
+                    write_half.write_all(format!("{tag} BAD APPEND needs a mailbox\r\n").as_bytes()).await?;
+                    continue;
+                };
+                // async_imap::Session::append sends `APPEND "<mailbox>"
+                // {<len>}` -- no flags, no date-time, matching
+                // `ImapCommand::Append`'s doc on what this server needs to
+                // support. The literal size is `tokens[3]` as `{n}`.
+                let Some(size_tok) = tokens.get(3) else {
+                    write_half.write_all(format!("{tag} BAD APPEND needs a literal\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let Some(size) = size_tok.strip_prefix('{').and_then(|s| s.strip_suffix('}')).and_then(|s| s.parse::<usize>().ok()) else {
+                    write_half.write_all(format!("{tag} BAD invalid literal size\r\n").as_bytes()).await?;
+                    continue;
+                };
+
+                write_half.write_all(b"+ send literal data\r\n").await?;
+
+                let mut raw = vec![0u8; size];
+                reader.read_exact(&mut raw).await?;
+                // The client follows the literal's exact byte count with a
+                // trailing CRLF that terminates the APPEND command line --
+                // not part of the message, so it's read and discarded here
+                // rather than appended to `raw`.
+                let mut trailing_crlf = [0u8; 2];
+                reader.read_exact(&mut trailing_crlf).await?;
+
+                let uid = store.lock().unwrap().deliver(&mailbox_name, raw);
+                write_half.write_all(format!("{tag} OK [APPENDUID 1 {uid}] APPEND completed\r\n").as_bytes()).await?;
             }
             "LOGOUT" => {
                 write_half.write_all(b"* BYE logging out\r\n").await?;

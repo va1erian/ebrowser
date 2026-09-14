@@ -10,13 +10,13 @@
 //! the "don't lose the message" half is covered (nothing is cleared on
 //! failure), the automatic-retry half is not.
 //!
-//! **Also not done:** IMAP `APPEND` to Sent/Drafts. A sent message reaches
-//! the recipient but is never saved to the account's Sent folder locally,
-//! and there is no draft autosave. Both are IMAP-protocol-facing work
-//! (folder discovery via the `\Sent`/`\Drafts` special-use flags, or a
-//! name-based fallback, then `APPEND`) layered on top of an already large
-//! feature; deferred for the same reason B2/B3/B4/B6's own live-IMAP halves
-//! were — no real or mock IMAP server here to verify it against.
+//! **`APPEND` to Sent now lands, `APPEND` to Drafts still doesn't.**
+//! `SmtpEvent::Sent` carries the sent message's raw RFC822 bytes so
+//! `main.rs` can hand them to `ImapCommand::Append` and save a copy to the
+//! account's Sent folder -- see that command's doc in `imap.rs` for what's
+//! still a bounded subset of the original ask (a hardcoded "Sent" mailbox
+//! name, not real `\Sent` special-use-flag discovery with a name-based
+//! fallback). There is still no draft autosave (`APPEND` with `\Draft`).
 
 use lettre::message::{Attachment, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
@@ -45,7 +45,12 @@ pub enum SmtpCommand {
 
 #[derive(Debug)]
 pub enum SmtpEvent {
-    Sent,
+    /// `raw` is the exact RFC822 bytes handed to the SMTP transport, so a
+    /// caller can `APPEND` an identical copy to Sent without re-building the
+    /// message (which would risk it drifting from what was actually sent —
+    /// a fresh `Message-ID`, say, from calling `build_message` a second
+    /// time).
+    Sent { raw: Vec<u8> },
     Error(String),
 }
 
@@ -66,8 +71,8 @@ impl SmtpActor {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 SmtpCommand::Send { account, compose } => match Self::send(&account, &compose).await {
-                    Ok(()) => {
-                        let _ = self.event_tx.send(SmtpEvent::Sent).await;
+                    Ok(raw) => {
+                        let _ = self.event_tx.send(SmtpEvent::Sent { raw }).await;
                     }
                     Err(e) => {
                         let _ = self.event_tx.send(SmtpEvent::Error(e.to_string())).await;
@@ -77,11 +82,12 @@ impl SmtpActor {
         }
     }
 
-    async fn send(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<()> {
+    async fn send(account: &SmtpAccount, compose: &ComposeState) -> anyhow::Result<Vec<u8>> {
         let message = build_message(account, compose)?;
+        let raw = message.formatted();
         let transport = build_transport(account)?;
         transport.send(message).await?;
-        Ok(())
+        Ok(raw)
     }
 }
 
