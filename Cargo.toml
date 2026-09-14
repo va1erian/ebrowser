@@ -39,6 +39,20 @@ ammonia = "4"
 # Attachment save-as / open-with (B6).
 rfd = "0.15"
 opener = "0.7"
+# System tray icon + menu, so the window can be minimized-to-tray instead of
+# exiting the process (B10 -- notifications need the app alive after the
+# window closes). Talks to the OS tray directly; default-features off drops
+# the Linux-only gtk/libxdo pulls, which are dead weight on the Windows-only
+# feature this backs. Windows-only dependency -- see crates/esmail/Cargo.toml.
+tray-icon = { version = "0.24", default-features = false }
+# Windows toast notifications for new mail (B10). Deliberately not
+# notify-rust: as published on crates.io it no longer has a Windows backend
+# (dbus/linux, bsd, mac only), despite older docs suggesting otherwise --
+# checked before picking this instead. Escapes toast XML content via xml-rs
+# (verified by reading its source), so a crafted Subject/From header can't
+# break out of the markup. Windows-only dependency -- see
+# crates/esmail/Cargo.toml.
+winrt-notification = "0.5"
 
 # Storage / secrets
 # Pinned to 0.37 to unify with servo-storage's rusqlite; libsqlite3-sys sets
