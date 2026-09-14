@@ -99,9 +99,12 @@ fn address(addr: &Option<(String, String, String)>) -> Vec<u8> {
     }
 }
 
-/// One `* <seq> FETCH (UID <uid> ENVELOPE (...))` line -- shared by the
-/// sequence-number `FETCH` handler and `UID FETCH`'s `ENVELOPE` mode, which
-/// otherwise built an identical response by hand in two places.
+/// One `* <seq> FETCH (UID <uid> ENVELOPE (...) FLAGS (...))` line -- shared
+/// by the sequence-number `FETCH` handler and `UID FETCH`'s `ENVELOPE` mode,
+/// which otherwise built an identical response by hand in two places. FLAGS
+/// is always included alongside ENVELOPE (B8 needs both, and `async_imap`'s
+/// parser is happy to see more items than a bare `FETCH (UID ENVELOPE)`
+/// request asked for).
 fn envelope_fetch_response(seq: u32, msg: &crate::store::StoredMessage) -> Vec<u8> {
     let mut r = format!("* {seq} FETCH (UID {} ENVELOPE (", msg.uid).into_bytes();
     r.extend_from_slice(&nstring(&msg.envelope.date));
@@ -117,8 +120,17 @@ fn envelope_fetch_response(seq: u32, msg: &crate::store::StoredMessage) -> Vec<u
     r.extend_from_slice(&address(&msg.envelope.to));
     r.extend_from_slice(b" NIL NIL NIL "); // cc bcc in-reply-to
     r.extend_from_slice(&nstring(&msg.envelope.message_id));
+    r.extend_from_slice(b") FLAGS (");
+    r.extend_from_slice(msg.flags.join(" ").as_bytes());
     r.extend_from_slice(b"))\r\n");
     r
+}
+
+/// One `* <seq> FETCH (FLAGS (...))` line -- the response `STORE`/`UID
+/// STORE` (B8) sends back so the client learns the message's resulting flag
+/// list without a second round trip.
+fn flags_fetch_response(seq: u32, msg: &crate::store::StoredMessage) -> Vec<u8> {
+    format!("* {seq} FETCH (FLAGS ({}))\r\n", msg.flags.join(" ")).into_bytes()
 }
 
 async fn handle_connection<S>(stream: S, store: SharedStore) -> anyhow::Result<()>
@@ -171,7 +183,20 @@ where
                 }
                 let names = store.lock().unwrap().mailbox_names();
                 for name in names {
-                    let mut resp = b"* LIST (\\HasNoChildren) \"/\" ".to_vec();
+                    // RFC 6154 special-use attributes for the well-known
+                    // mailboxes `Store::add_user` seeds (B8's mailbox-tree
+                    // sorting reads these; case-insensitive by name here
+                    // since this mock has no real per-mailbox "role"
+                    // concept, only the name `add_user`/tests chose).
+                    let special_use = match name.to_ascii_lowercase().as_str() {
+                        "sent" => " \\Sent",
+                        "drafts" => " \\Drafts",
+                        "trash" => " \\Trash",
+                        "archive" => " \\Archive",
+                        "junk" | "spam" => " \\Junk",
+                        _ => "",
+                    };
+                    let mut resp = format!("* LIST (\\HasNoChildren{special_use}) \"/\" ").into_bytes();
                     resp.extend_from_slice(&literal(name.as_bytes()));
                     resp.extend_from_slice(b"\r\n");
                     write_half.write_all(&resp).await?;
@@ -346,6 +371,188 @@ where
 
                 let uid = store.lock().unwrap().deliver(&mailbox_name, raw);
                 write_half.write_all(format!("{tag} OK [APPENDUID 1 {uid}] APPEND completed\r\n").as_bytes()).await?;
+            }
+            "STORE" | "UID" if verb == "STORE" || tokens.get(2).map(|s| s.eq_ignore_ascii_case("STORE")).unwrap_or(false) => {
+                let is_uid = verb == "UID";
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                // For plain STORE: tokens = [tag, STORE, set, mode, flags...]
+                // For UID STORE: tokens = [tag, UID, STORE, set, mode, flags...]
+                let base = if is_uid { 3 } else { 2 };
+                let (Some(set_tok), Some(mode_tok)) = (tokens.get(base), tokens.get(base + 1)) else {
+                    write_half.write_all(format!("{tag} BAD STORE needs a set and mode\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let mode = mode_tok.to_ascii_uppercase();
+                let flags_joined = tokens[base + 2..].join(" ");
+                let flags: Vec<String> = flags_joined
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+                let (start, end) = parse_range(set_tok);
+
+                let target_uid = if is_uid {
+                    // A single UID (or a small range); esmail's client only
+                    // ever sends one at a time, so treat start as the uid.
+                    Some(start)
+                } else {
+                    None
+                };
+
+                let result = {
+                    let mut guard = store.lock().unwrap();
+                    match guard.mailbox_mut(&mailbox_name) {
+                        None => None,
+                        Some(mailbox) => {
+                        // Resolve the sequence-number set to UIDs first (for
+                        // plain STORE) so `store_flags` (UID-addressed) and
+                        // the response's sequence number both line up.
+                        let candidates: Vec<(u32, u32)> = if let Some(uid) = target_uid {
+                            mailbox.messages.iter().enumerate()
+                                .filter(|(_, m)| m.uid == uid)
+                                .map(|(i, m)| ((i + 1) as u32, m.uid))
+                                .collect()
+                        } else {
+                            mailbox.messages.iter().enumerate()
+                                .filter(|(i, _)| { let seq = (*i + 1) as u32; seq >= start.max(1) && seq <= end })
+                                .map(|(i, m)| ((i + 1) as u32, m.uid))
+                                .collect()
+                        };
+                        let (add, remove): (Vec<String>, Vec<String>) = match mode.as_str() {
+                            "+FLAGS" | "+FLAGS.SILENT" => (flags.clone(), Vec::new()),
+                            "-FLAGS" | "-FLAGS.SILENT" => (Vec::new(), flags.clone()),
+                            // Plain "FLAGS"/"FLAGS.SILENT" replaces the set --
+                            // esmail's client never sends this (only +/-),
+                            // but handle it for completeness: clear via a
+                            // wildcard remove, then add the new set.
+                            _ => (flags.clone(), vec!["\\Seen".into(), "\\Flagged".into(), "\\Deleted".into(), "\\Answered".into(), "\\Draft".into()]),
+                        };
+                        let silent = mode.ends_with(".SILENT");
+                        let mut responses = Vec::new();
+                        for (seq, uid) in candidates {
+                            if mailbox.store_flags(uid, &add, &remove).is_some() && !silent {
+                                if let Some(msg) = mailbox.messages.iter().find(|m| m.uid == uid) {
+                                    responses.push(flags_fetch_response(seq, msg));
+                                }
+                            }
+                        }
+                        Some(responses)
+                        }
+                    }
+                };
+                match result {
+                    Some(responses) => {
+                        for r in responses {
+                            write_half.write_all(&r).await?;
+                        }
+                        write_half.write_all(format!("{tag} OK STORE completed\r\n").as_bytes()).await?;
+                    }
+                    None => {
+                        write_half.write_all(format!("{tag} NO mailbox gone\r\n").as_bytes()).await?;
+                    }
+                }
+            }
+            "COPY" | "UID" if verb == "COPY" || tokens.get(2).map(|s| s.eq_ignore_ascii_case("COPY")).unwrap_or(false) => {
+                let is_uid = verb == "UID";
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let base = if is_uid { 3 } else { 2 };
+                let (Some(set_tok), Some(dest)) = (tokens.get(base), tokens.get(base + 1)) else {
+                    write_half.write_all(format!("{tag} BAD COPY needs a set and destination\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let (start, _end) = parse_range(set_tok);
+                // esmail's client only ever COPYs one message (the
+                // move-to-Trash/Archive fallback); a sequence-number COPY
+                // would need resolving start..end to UIDs first, same as
+                // STORE above -- not needed for what's exercised here.
+                // Resolved to `Option<u32>` (rather than matching straight
+                // into the `None` arm's `.await`) so the `MutexGuard` --
+                // which, having a `Drop` impl, stays lexically "live" until
+                // its enclosing block ends, not just its last use -- is
+                // dropped before any `.await` in this function, which
+                // `tokio::spawn`'s `Send` bound on the whole connection
+                // future requires.
+                let resolved_uid = if is_uid {
+                    Some(start)
+                } else {
+                    let guard = store.lock().unwrap();
+                    guard.mailbox(&mailbox_name).and_then(|mb| mb.messages.get((start.saturating_sub(1)) as usize)).map(|m| m.uid)
+                };
+                let Some(uid) = resolved_uid else {
+                    write_half.write_all(format!("{tag} NO no such message\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let copied = store.lock().unwrap().copy_message(&mailbox_name, uid, dest);
+                match copied {
+                    Some(new_uid) => {
+                        write_half.write_all(format!("{tag} OK [COPYUID 1 {uid} {new_uid}] COPY completed\r\n").as_bytes()).await?;
+                    }
+                    None => {
+                        write_half.write_all(format!("{tag} NO no such message\r\n").as_bytes()).await?;
+                    }
+                }
+            }
+            "EXPUNGE" | "UID" if verb == "EXPUNGE" || tokens.get(2).map(|s| s.eq_ignore_ascii_case("EXPUNGE")).unwrap_or(false) => {
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                // UID EXPUNGE's argument (a UID set to limit the expunge to)
+                // is ignored -- esmail's client only ever calls plain
+                // EXPUNGE (see imap.rs::move_message), and this mock never
+                // has more than the caller's own \Deleted message anyway.
+                let removed = {
+                    let mut guard = store.lock().unwrap();
+                    guard.mailbox_mut(&mailbox_name).map(|mb| mb.expunge())
+                };
+                match removed {
+                    Some(removed) => {
+                        // Real EXPUNGE reports the *sequence numbers* that
+                        // were removed, at the time each was removed --
+                        // esmail's client (`imap.rs::move_message`) doesn't
+                        // read this stream's contents at all, only that the
+                        // command completed OK, so a simplified "1" per
+                        // removed message (rather than exact renumbering) is
+                        // sufficient here.
+                        for _ in &removed {
+                            write_half.write_all(b"* 1 EXPUNGE\r\n").await?;
+                        }
+                        write_half.write_all(format!("{tag} OK EXPUNGE completed\r\n").as_bytes()).await?;
+                    }
+                    None => {
+                        write_half.write_all(format!("{tag} NO mailbox gone\r\n").as_bytes()).await?;
+                    }
+                }
+            }
+            "STATUS" => {
+                if authenticated_user.is_none() {
+                    write_half.write_all(format!("{tag} NO not authenticated\r\n").as_bytes()).await?;
+                    continue;
+                }
+                let Some(mailbox_name) = tokens.get(2).cloned() else {
+                    write_half.write_all(format!("{tag} BAD STATUS needs a mailbox\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let found = {
+                    let guard = store.lock().unwrap();
+                    guard.mailbox(&mailbox_name).map(|mb| (mb.messages.len() as u32, mb.unseen_count()))
+                };
+                let Some((exists, unseen)) = found else {
+                    write_half.write_all(format!("{tag} NO mailbox does not exist\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let mut resp = b"* STATUS ".to_vec();
+                resp.extend_from_slice(&literal(mailbox_name.as_bytes()));
+                resp.extend_from_slice(format!(" (MESSAGES {exists} UNSEEN {unseen})\r\n").as_bytes());
+                write_half.write_all(&resp).await?;
+                write_half.write_all(format!("{tag} OK STATUS completed\r\n").as_bytes()).await?;
             }
             "LOGOUT" => {
                 write_half.write_all(b"* BYE logging out\r\n").await?;

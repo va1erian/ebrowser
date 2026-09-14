@@ -4,21 +4,28 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Your next task is one of A6/A7/B8/B9** ([PLAN.md](PLAN.md), phase 7 — all
-independent of each other, pick whichever is most useful next; A6/A7 may
-already be in progress or done by the time you read this, see §5's table).
-Phases 0-2, B1, B5, B10, and now B11 (IMAP push), B2's worker-session
-split, B3's incremental-fetch half, and B7's `APPEND`-to-Sent half (see
-below) are done. B3 (its UID-based cache-paging half), B4, B6, B7 (its
-still-open pieces), and A5 are each partially done — see their PLAN.md
-sections for exactly what landed vs. what's deliberately deferred. B7's
-remaining exceptions are now `\Sent` special-use-flag discovery, drafts, a
-real retry queue, rich-text composing, and recipient autocomplete; A5's is
-specifically the `Scroll::Delta`→`Wheel` API migration, held back over a
-sign-convention flip that needs a live app to watch scroll direction on,
-which this environment can't do (screenshots are passive, no synthetic
+**Your next task is B9** ([PLAN.md](PLAN.md), phase 7's last item — A6/A7/A5
+and now B8 are done or partially done, see §5's table). Phases 0-2, B1, B5,
+B10, A7, B11 (IMAP push), B2's worker-session split, B3's incremental-fetch
+half, and B7's `APPEND`-to-Sent half (see below) are done. B3 (its UID-based
+cache-paging half), B4, B6, B7 (its still-open pieces), A5, A6, and now B8
+are each partially done — see their PLAN.md sections for exactly what
+landed vs. what's deliberately deferred. B7's remaining exceptions are now
+`\Sent` special-use-flag discovery, drafts, a real retry queue, rich-text
+composing, and recipient autocomplete — **B8 built the special-use
+discovery infrastructure B7 was waiting on** (`imap::SpecialUse`, from real
+`LIST` attributes with a name-based fallback) but did not wire it into
+`main.rs`'s `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX` constants —
+that's now a small, mechanical follow-up rather than a research question;
+A5's is specifically the `Scroll::Delta`→`Wheel` API migration, held back
+over a sign-convention flip that needs a live app to watch scroll direction
+on, which this environment can't do (screenshots are passive, no synthetic
 input dispatch) — IME/cursor/clipboard in A5 are separate, smaller,
-still-open items. None of this blocks phase 7.
+still-open items. A6's is the zero-copy GL blit (see its PLAN.md section for
+why it was reverted). B8's is IDLE tied to the *selected* mailbox
+specifically (B11's `idle_watch` already covers "new-mail push" but stays
+INBOX-only, same as B10) — see §B8 for the full "what landed / what
+didn't" writeup. None of this blocks B9.
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
@@ -315,12 +322,16 @@ the `glow` renderer. That is §A6.
 | `405851f` | **B11** — IMAP `IDLE`/push (see PLAN.md §B11). `idle_watch.rs`: a dedicated always-on IDLE connection, independent of `ImapActor`'s session, that sends a wake signal on any server push; wired into `main.rs` so `spawn_new_mail_watch` (B10) polls immediately on a push instead of waiting for its 60s timer, which keeps running as a fallback. Added `IDLE` support to `mail-mock-server` itself (`Store::notify` broadcast channel, `imap_server.rs`'s `IDLE` handler) plus an integration test proving a push arrives in low single-digit seconds. Merged into `main` via PR #6. |
 | `de711a1` (PR #7) | **B2 (worker-session split)** — see PLAN.md §B2. `imap.rs` gained `spawn_body_worker`, a second independent IMAP connection (own connect/reconnect loop, `ensure_worker_connected`) that `FetchBody`/`BulkDownload` are routed to instead of `ImapActor`'s own session, so they can't block `FetchHeaders`/`FetchMailboxes` behind them any more. Verified with a real concurrency test (`bulk_download_does_not_block_a_concurrent_header_fetch`), not just unit tests. |
 | `6db4c18` (PR #7) | **B3 (incremental fetch acted on)** — see PLAN.md §B3. A `DbEvent::SyncPlan::FetchFrom`/`Resync` now triggers a new `ImapCommand::FetchHeadersFrom` (envelope-only `UID FETCH`, kept separate from B10's `FetchNewHeaders` so the cache-sync path can't spuriously trigger a new-mail toast), indexed metadata-only via a new `DbCommand::IndexHeaders`/`index_headers`. Along the way, fixed a real gap in `mail-mock-server`'s `UID FETCH` handler: it only ever supported a single numeric UID with `RFC822`, not the `first:*` range + `ENVELOPE` this needed (and `FetchNewHeaders`/B10 needed too, apparently never exercised against this server until now). UID-based cache paging for the header list itself did not land — see PLAN.md §B3 for why that's scoped as separate follow-on work. |
-| *(this branch)* | **B7 (`APPEND` to Sent)** — see PLAN.md §B7. `smtp.rs`'s `SmtpEvent::Sent` now carries the exact raw bytes that were sent; `main.rs` follows a successful send with `ImapCommand::Append { mailbox: "Sent", raw }`, indexed via a new `ImapEvent::AppendFailed` (kept separate from `Error` so a save failure can't overwrite the "Message sent" status). Added `APPEND` support to `mail-mock-server` (it had none), delivering into the same `Store::deliver` `smtp_server.rs`'s `DATA` handler uses. `\Sent` special-use-flag discovery and drafts still not done — `SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`. |
+| `27bbc8c` | **B7 (`APPEND` to Sent)** — see PLAN.md §B7. `smtp.rs`'s `SmtpEvent::Sent` now carries the exact raw bytes that were sent; `main.rs` follows a successful send with `ImapCommand::Append { mailbox: "Sent", raw }`, indexed via a new `ImapEvent::AppendFailed` (kept separate from `Error` so a save failure can't overwrite the "Message sent" status). Added `APPEND` support to `mail-mock-server` (it had none), delivering into the same `Store::deliver` `smtp_server.rs`'s `DATA` handler uses. `\Sent` special-use-flag discovery and drafts still not done — `SENT_MAILBOX` in `main.rs` is a hardcoded `"Sent"`. |
+| `254c6bc` | **A6 (partial)** — see PLAN.md §A6. Gated the CPU `read_to_image` readback on a `frame_dirty` flag set by `notify_new_frame_ready`, so `show()` only pays for a full-surface GPU→CPU copy when Servo actually painted a new frame. The zero-copy GL blit (`OffscreenRenderingContext::render_to_parent_callback`) was implemented, compiled, and then reverted once the mandatory screenshot check came back blank — root cause was an architecture mismatch (Servo's `WindowRenderingContext` is its own independent GL context, never shared with `eframe`/`glutin`'s, so the blit had no valid framebuffer to write into), not a coding slip. Full reasoning in PLAN.md §A6 for whoever picks up real GL context sharing next. |
+| `a7a7bcb` | **A7 — DONE.** See PLAN.md §A7. `impl egui::Widget for &mut WebView` (a thin wrapper over a new private `show_impl`), `#![warn(missing_docs)]` at the crate root (passes clean), `README.md` (the `WebViewHost`/`WebView` split, fail-open warning, rendering path post-A6, runtime DLL setup), `examples/two_views.rs` (one `WebViewHost`, two independent `WebView`s — proves A2's multi-instance split holds; compiles, not run interactively, no display in this environment). `cargo doc` CI and a polished `examples/minimal.rs` deliberately not added, matching the plan. |
+| *(this branch)* | **B8 (partial)** — see PLAN.md §B8. Flags (`\Seen` with a 1.2s mark-as-read delay, `\Flagged` star toggle, mark-unread) via a new `ImapCommand::StoreFlags`/`ImapEvent::FlagsUpdated`, finally populating `messages.flags` (the column B3 added and left unpopulated); delete-to-Trash/Archive via `ImapCommand::MoveMessage` (`MOVE` first, `COPY`+`STORE \Deleted`+`EXPUNGE` fallback — only the fallback is verified, since `mail-mock-server` has no `MOVE`); the mailbox tree (`imap::MailboxInfo`/`mailbox_tree`/`flatten_tree`, RFC 6154 special-use attributes with a name-based fallback, INBOX-then-Sent-then-Drafts-then-Archive-then-Junk-then-Trash-then-alphabetical sort); per-mailbox unread counts via `STATUS (UNSEEN)`; multi-select (ctrl toggles, shift range-selects via a pure `select_range` helper); keyboard shortcuts (`j`/`k`/`Enter`/`r`/`a`/`f`/`Del`/`Ctrl+F`/`Ctrl+N`). Extended `mail-mock-server` with `STORE`/`UID STORE`, `COPY`/`UID COPY`, `EXPUNGE`/`UID EXPUNGE`, `STATUS`, `FLAGS` on every envelope fetch, and special-use `LIST` attributes — same "extend the mock server first" pattern B3/B7/B11 each followed. **Not done:** IDLE tied to the *selected* mailbox specifically (B11's `idle_watch` already covers "new-mail push," but stays INBOX-only); wiring the new `SpecialUse` infrastructure into `main.rs`'s hardcoded `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX` (B7's still-open special-use-discovery gap — the data now exists, the wiring doesn't); a real collapsible tree widget (always-expanded flat list instead); `is:unread` in search (B4's gap, now mechanical given `messages.flags` but not reached into). |
 
-State: `cargo check --workspace` clean, `cargo test --workspace` all passing
-(unit tests across every crate plus the `mail-mock-server`-backed integration
-suite, run with `ESMAIL_TEST_CA_TRUSTED=1`), app builds, runs, screenshots and
-exits cleanly.
+State: `cargo check --workspace` clean (no warnings), `cargo test --workspace`
+all passing (18 `egui-servo-webview` unit tests, 102 `esmail` lib unit tests
++ 7 `main.rs` unit tests, 14 `imap_smtp_integration` tests plus 2
+`#[ignore]`d stress tests, run with `ESMAIL_TEST_CA_TRUSTED=1`), app builds,
+runs, screenshots (`ESMAIL_PREVIEW=demo`) and exits cleanly.
 
 ---
 

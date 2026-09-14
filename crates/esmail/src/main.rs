@@ -109,11 +109,41 @@ struct EsMailApp {
     status: String,
     is_connected: bool,
     
-    mailboxes: Vec<String>,
+    /// The mailbox tree (B8), flattened for the left panel's list UI -- see
+    /// `imap::flatten_tree`'s doc for why a flat, owned `Vec` rather than a
+    /// real recursive tree widget.
+    mailbox_rows: Vec<imap::MailboxRow>,
+    /// `STATUS (UNSEEN)` per mailbox (B8), refreshed whenever `Mailboxes`
+    /// arrives and after a flag/move changes what's unread. A mailbox
+    /// missing from this map (rather than present with `0`) means its count
+    /// hasn't been fetched yet, not that it's read.
+    unread_counts: std::collections::HashMap<String, u32>,
     selected_mailbox: String,
-    
+
     headers: Vec<MailHeader>,
     selected_uid: Option<u32>,
+    /// Multi-select (B8): every UID selected via shift/ctrl-click, in
+    /// addition to `selected_uid` (the one whose body is actually shown --
+    /// always the most recently *plain*-clicked message, or the sole member
+    /// of a multi-selection made by ctrl/shift-clicking from scratch).
+    /// Bulk actions (archive/delete/mark read or unread) act on this set
+    /// when it's non-empty, falling back to `selected_uid` alone otherwise.
+    selected_uids: std::collections::BTreeSet<u32>,
+    /// Anchor for shift-click range selection: the last *plain* (no
+    /// modifier) click, or the single UID a ctrl-click started a fresh
+    /// selection from.
+    select_anchor: Option<u32>,
+    /// Set when a message is opened, cleared once its `\Seen` flag has been
+    /// sent (or the user navigates away first) -- B8's "mark as read with a
+    /// delay" so briefly passing over a message in the list doesn't mark it
+    /// read. Checked once per frame in `ui()`.
+    pending_mark_seen: Option<(u32, std::time::Instant)>,
+    /// The search box `TextEdit`'s widget id, captured where it's drawn so
+    /// Ctrl+F (B8) can `request_focus` it from the keyboard-shortcut check
+    /// below, which runs outside that closure (and so has no access to a
+    /// freshly-computed id of its own -- egui ids depend on the enclosing
+    /// panel, not just the widget's own salt).
+    search_box_id: Option<egui::Id>,
     current_page: u32,
     total_pages: u32,
     /// Attachments for the currently-open message (B6), if fetched directly
@@ -324,10 +354,15 @@ impl EsMailApp {
             smtp_port: smtp_port_str,
             status: initial_status,
             is_connected: false,
-            mailboxes: Vec::new(),
+            mailbox_rows: Vec::new(),
+            unread_counts: std::collections::HashMap::new(),
             selected_mailbox: "INBOX".to_string(),
             headers: Vec::new(),
             selected_uid: None,
+            selected_uids: std::collections::BTreeSet::new(),
+            select_anchor: None,
+            pending_mark_seen: None,
+            search_box_id: None,
             current_page: 1,
             total_pages: 1,
             current_attachments: Vec::new(),
@@ -364,7 +399,12 @@ impl EsMailApp {
                     self.status = format!("Error: {}", e);
                 }
                 ImapEvent::Mailboxes(mbs) => {
-                    self.mailboxes = mbs;
+                    // B8: render as a tree (name split on the server's
+                    // delimiter, special-use folders first) instead of a
+                    // flat alphabetical list.
+                    let names: Vec<String> = mbs.iter().map(|m| m.name.clone()).collect();
+                    self.mailbox_rows = imap::flatten_tree(&imap::mailbox_tree(&mbs));
+                    let _ = self.imap_tx.try_send(ImapCommand::FetchUnreadCounts { mailboxes: names });
                 }
                 ImapEvent::Headers { mailbox, headers, page, total_pages, req_id, mailbox_state } => {
                     // Only the most recently issued FetchHeaders' reply is
@@ -454,6 +494,65 @@ impl EsMailApp {
                     // doc in imap.rs: a background poll failing every 60s
                     // shouldn't overwrite whatever the user is looking at.
                     log::warn!("background new-mail poll failed: {e}");
+                }
+                ImapEvent::FlagsUpdated { mailbox, uid, flags, req_id: _ } => {
+                    // B8: reflect the server-confirmed flags back into the
+                    // visible header list and the local cache. Applied
+                    // regardless of which mailbox/message is currently
+                    // selected (unlike Headers/Body's req_id staleness
+                    // guard) -- a flag change always succeeded for the exact
+                    // message it was sent for, so there's nothing "stale"
+                    // about applying it whenever it arrives.
+                    let was_seen = self.headers.iter().find(|h| h.uid == uid).map(|h| h.is_seen());
+                    if let Some(header) = self.headers.iter_mut().find(|h| h.uid == uid) {
+                        header.flags = flags.clone();
+                    }
+                    if let (Some(was_seen), Some(count)) = (was_seen, self.unread_counts.get_mut(&mailbox)) {
+                        let now_seen = flags.iter().any(|f| f.eq_ignore_ascii_case(imap::FLAG_SEEN));
+                        if was_seen && !now_seen {
+                            *count += 1;
+                        } else if !was_seen && now_seen {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    let _ = self.db_tx.try_send(DbCommand::UpdateFlags {
+                        account_id: self.account_id(),
+                        mailbox,
+                        uid,
+                        flags,
+                    });
+                }
+                ImapEvent::FlagsUpdateFailed { mailbox: _, uid, error, req_id: _ } => {
+                    self.status = format!("Could not update flags on message {uid}: {error}");
+                }
+                ImapEvent::Moved { mailbox, uid, dest, req_id: _ } => {
+                    // B8: delete-to-Trash/archive succeeded -- drop the
+                    // message from the visible list, the cache, and any
+                    // selection it was part of.
+                    let was_unread = self.headers.iter().find(|h| h.uid == uid).map(|h| !h.is_seen()).unwrap_or(false);
+                    self.headers.retain(|h| h.uid != uid);
+                    self.selected_uids.remove(&uid);
+                    if self.selected_uid == Some(uid) {
+                        self.selected_uid = None;
+                        self.web_view.load(WebViewSource::Html("<i>Message moved.</i>".to_string()));
+                    }
+                    if was_unread {
+                        if let Some(count) = self.unread_counts.get_mut(&mailbox) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    self.status = format!("Moved to {dest}");
+                    let _ = self.db_tx.try_send(DbCommand::RemoveMessage {
+                        account_id: self.account_id(),
+                        mailbox,
+                        uid,
+                    });
+                }
+                ImapEvent::MoveFailed { mailbox: _, uid, error, req_id: _ } => {
+                    self.status = format!("Could not move message {uid}: {error}");
+                }
+                ImapEvent::UnreadCounts(counts) => {
+                    self.unread_counts = counts;
                 }
             }
         }
@@ -562,6 +661,79 @@ impl EsMailApp {
         let _ = self.imap_tx.try_send(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
+    /// Open a message the way a click on it (or `j`/`k` + `Enter`, see the
+    /// keyboard-shortcut handling in `ui()`) does: select it, blank the
+    /// viewer while it loads, and either `FetchBody` (a live message) or
+    /// `DbCommand::FetchMail` (a cached search result) it -- then schedule
+    /// B8's mark-as-read delay.
+    fn open_message(&mut self, uid: u32, is_search: bool) {
+        self.selected_uid = Some(uid);
+        // A new message defaults to blocked remote content, same as any
+        // other mail client; "Load remote images" opts back in per view.
+        self.message_view_handler.borrow_mut().allow_remote = false;
+        self.current_attachments.clear();
+        self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
+        if is_search {
+            let _ = self.db_tx.try_send(DbCommand::FetchMail {
+                account_id: self.account_id(),
+                mailbox: self.selected_mailbox.clone(),
+                uid,
+            });
+        } else {
+            self.fetch_body(self.selected_mailbox.clone(), uid);
+        }
+        // B8: don't mark \Seen immediately -- only after the message has
+        // stayed open for MARK_SEEN_DELAY, so quickly arrowing past a
+        // message in the list doesn't mark it read. `ui()` checks this once
+        // per frame and fires the actual StoreFlags when it elapses.
+        if !self.headers.iter().any(|h| h.uid == uid && h.is_seen()) {
+            self.pending_mark_seen = Some((uid, std::time::Instant::now()));
+        } else {
+            self.pending_mark_seen = None;
+        }
+    }
+
+    /// The UIDs a bulk action (B8's Mark read/unread, Star/Unstar, Archive,
+    /// Delete) applies to: the multi-selection if non-empty, else the
+    /// single open message, else nothing.
+    fn action_targets(&self) -> Vec<u32> {
+        if !self.selected_uids.is_empty() {
+            self.selected_uids.iter().copied().collect()
+        } else {
+            self.selected_uid.into_iter().collect()
+        }
+    }
+
+    /// Send `StoreFlags` for every target in [`Self::action_targets`].
+    fn store_flags_on_selection(&mut self, add: Vec<String>, remove: Vec<String>) {
+        let mailbox = self.selected_mailbox.clone();
+        for uid in self.action_targets() {
+            let req_id = self.next_req_id();
+            let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+                mailbox: mailbox.clone(),
+                uid,
+                add: add.clone(),
+                remove: remove.clone(),
+                req_id,
+            });
+        }
+    }
+
+    /// Send `MoveMessage` (Archive/Delete-to-Trash) for every target in
+    /// [`Self::action_targets`].
+    fn move_selection(&mut self, dest: &str) {
+        let mailbox = self.selected_mailbox.clone();
+        for uid in self.action_targets() {
+            let req_id = self.next_req_id();
+            let _ = self.imap_tx.try_send(ImapCommand::MoveMessage {
+                mailbox: mailbox.clone(),
+                uid,
+                dest: dest.to_string(),
+                req_id,
+            });
+        }
+    }
+
     /// Fill the login form from a saved account and pull its password back
     /// out of the OS keyring, if there is one.
     fn select_account(&mut self, account: &AccountConfig) {
@@ -630,6 +802,125 @@ impl EsMailApp {
     /// rather than part of the main layout — B7 says "compose window", and
     /// this can stay open (or get discarded) independent of what the user
     /// does with the message list behind it.
+    /// B8's mark-as-read delay: fires the actual `StoreFlags` once
+    /// `MARK_SEEN_DELAY` has elapsed since `open_message` scheduled it,
+    /// provided the same message is still the one open (otherwise the timer
+    /// is simply dropped -- the message the user moved on to gets its own
+    /// timer from its own `open_message` call). Checked once per frame.
+    fn handle_mark_seen_delay(&mut self) {
+        let Some((uid, at)) = self.pending_mark_seen else { return };
+        if self.selected_uid != Some(uid) {
+            self.pending_mark_seen = None;
+            return;
+        }
+        if at.elapsed() < MARK_SEEN_DELAY {
+            return;
+        }
+        self.pending_mark_seen = None;
+        let mailbox = self.selected_mailbox.clone();
+        let req_id = self.next_req_id();
+        let _ = self.imap_tx.try_send(ImapCommand::StoreFlags {
+            mailbox,
+            uid,
+            add: vec![imap::FLAG_SEEN.to_string()],
+            remove: vec![],
+            req_id,
+        });
+    }
+
+    /// B8's keyboard shortcuts: `j`/`k` (next/previous message, and open
+    /// it), `Enter` (re-open the current selection -- a harmless no-op
+    /// today since `j`/`k` already open as they move, kept for the shortcut
+    /// list's own sake and so a future "highlight without opening" cursor
+    /// has something to bind to), `r` (Reply), `a` (Archive), `f`
+    /// (star/unstar), `Del`/`Backspace` (delete to Trash), `Ctrl+F` (focus
+    /// search), `Ctrl+N` (compose). Disabled while the compose window is
+    /// open (its own text fields need every keystroke) or the search box
+    /// has focus (so typing "j"/"f"/etc. into a search query doesn't also
+    /// fire a shortcut).
+    fn handle_keyboard_shortcuts(&mut self, ui: &mut egui::Ui) {
+        if self.compose.is_some() {
+            return;
+        }
+        let search_focused = self
+            .search_box_id
+            .is_some_and(|id| ui.memory(|m| m.has_focus(id)));
+        if search_focused {
+            return;
+        }
+
+        let (ctrl_f, ctrl_n, next, prev, enter, reply, archive, star, delete) = ui.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            (
+                ctrl && i.key_pressed(egui::Key::F),
+                ctrl && i.key_pressed(egui::Key::N),
+                !ctrl && i.key_pressed(egui::Key::J),
+                !ctrl && i.key_pressed(egui::Key::K),
+                !ctrl && i.key_pressed(egui::Key::Enter),
+                !ctrl && i.key_pressed(egui::Key::R),
+                !ctrl && i.key_pressed(egui::Key::A),
+                !ctrl && i.key_pressed(egui::Key::F),
+                !ctrl && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
+            )
+        });
+
+        if ctrl_f {
+            if let Some(id) = self.search_box_id {
+                ui.memory_mut(|m| m.request_focus(id));
+            }
+        }
+        if ctrl_n {
+            self.compose = Some(compose::ComposeState::default());
+            self.compose_status.clear();
+        }
+        if next || prev {
+            let is_search = self.search_results.is_some();
+            let list = self.search_results.as_ref().unwrap_or(&self.headers);
+            if !list.is_empty() {
+                let idx = self.selected_uid.and_then(|uid| list.iter().position(|h| h.uid == uid));
+                let new_idx = match idx {
+                    Some(i) if next => (i + 1).min(list.len() - 1),
+                    Some(i) => i.saturating_sub(1), // prev
+                    None => 0,
+                };
+                let uid = list[new_idx].uid;
+                self.selected_uids.clear();
+                self.select_anchor = Some(uid);
+                self.open_message(uid, is_search);
+            }
+        }
+        if enter {
+            if let Some(uid) = self.selected_uid {
+                let is_search = self.search_results.is_some();
+                self.open_message(uid, is_search);
+            }
+        }
+        if reply {
+            if let Some(uid) = self.selected_uid {
+                if let Some(header) = self.headers.iter().find(|h| h.uid == uid).cloned() {
+                    self.compose = Some(compose::ComposeState::reply(&header, &self.current_message_html));
+                    self.compose_status.clear();
+                }
+            }
+        }
+        if archive {
+            self.move_selection(ARCHIVE_MAILBOX);
+        }
+        if delete {
+            self.move_selection(TRASH_MAILBOX);
+        }
+        if star {
+            let currently_flagged = self.selected_uid.is_some_and(|uid| {
+                self.headers.iter().any(|h| h.uid == uid && h.is_flagged())
+            });
+            if currently_flagged {
+                self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
+            } else {
+                self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
+            }
+        }
+    }
+
     fn show_compose_window(&mut self, ctx: &egui::Context) {
         let Some(compose) = &mut self.compose else {
             return;
@@ -816,6 +1107,11 @@ impl eframe::App for EsMailApp {
                         self.is_connected = false;
                         self.headers.clear();
                         self.selected_uid = None;
+                        self.selected_uids.clear();
+                        self.select_anchor = None;
+                        self.pending_mark_seen = None;
+                        self.mailbox_rows.clear();
+                        self.unread_counts.clear();
                         self.status = "Logged out".to_string();
                         self.web_view.load(WebViewSource::Html("<h1>Logged out</h1>".to_string()));
                         ui.close();
@@ -835,7 +1131,12 @@ impl eframe::App for EsMailApp {
                 
                 if self.is_connected {
                     ui.label("Search:");
-                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Enter keywords..."));
+                    // A fixed id (rather than the auto-generated one) so
+                    // Ctrl+F (B8) can `request_focus` it from outside this
+                    // closure, where `self.search_query`'s borrow isn't
+                    // available to re-add the same widget.
+                    let search_resp = ui.add(egui::TextEdit::singleline(&mut self.search_query).id_salt("search_box").hint_text("Enter keywords..."));
+                    self.search_box_id = Some(search_resp.id);
                     if search_resp.changed() || (search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         // `from:`/`to:`/`subject:`/`body:` and bare text all
                         // become an FTS5 MATCH expression; `since:`/`before:`/
@@ -865,6 +1166,11 @@ impl eframe::App for EsMailApp {
                 ui.label(&self.status);
             });
         });
+
+        if self.is_connected {
+            self.handle_mark_seen_delay();
+            self.handle_keyboard_shortcuts(ui);
+        }
 
         if !self.is_connected {
             egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -948,28 +1254,49 @@ impl eframe::App for EsMailApp {
         } else {
             egui::Panel::left("left_panel").resizable(true).default_size(300.0).show_inside(ui, |ui| {
                 ui.heading("Mailboxes");
-                egui::ScrollArea::vertical().id_salt("mailboxes_scroll").max_height(150.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("mailboxes_scroll").max_height(220.0).show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                         // Deferred past the loop for the same reason as the
                         // message list below: fetch_headers needs &mut self,
-                        // which can't happen while `mb` still borrows
-                        // self.mailboxes.
+                        // which can't happen while `row` still borrows
+                        // self.mailbox_rows.
                         let mut clicked_mailbox = None;
-                        for mb in &self.mailboxes {
-                            let is_selected = self.selected_mailbox == *mb;
-                            if ui.add(egui::Button::selectable(is_selected, mb)).clicked() {
-                                clicked_mailbox = Some(mb.clone());
-                            }
+                        for row in &self.mailbox_rows {
+                            let Some(full_name) = &row.full_name else {
+                                // A hierarchy node with no mailbox of its own
+                                // (see MailboxNode::full_name's doc) -- shown
+                                // as a plain, unclickable label.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(row.depth as f32 * 14.0);
+                                    ui.label(egui::RichText::new(&row.label).weak());
+                                });
+                                continue;
+                            };
+                            let is_selected = self.selected_mailbox == *full_name;
+                            let unread = self.unread_counts.get(full_name).copied().unwrap_or(0);
+                            let label = if unread > 0 {
+                                format!("{}  ({unread})", row.label)
+                            } else {
+                                row.label.clone()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.add_space(row.depth as f32 * 14.0);
+                                if ui.add(egui::Button::selectable(is_selected, label)).clicked() {
+                                    clicked_mailbox = Some(full_name.clone());
+                                }
+                            });
                         }
                         if let Some(mb) = clicked_mailbox {
                             self.selected_mailbox = mb.clone();
                             self.selected_uid = None;
+                            self.selected_uids.clear();
+                            self.select_anchor = None;
                             self.current_page = 1;
                             self.fetch_headers(mb, 1);
                         }
                     });
                 });
-                
+
                 ui.separator();
                 let title = if self.search_results.is_some() { "Search Results" } else { "Inbox" };
                 ui.horizontal(|ui| {
@@ -980,7 +1307,34 @@ impl eframe::App for EsMailApp {
                         }
                     }
                 });
-                
+
+                // Bulk actions (B8): act on the multi-selection when
+                // non-empty, otherwise the single open message. Always
+                // shown (rather than only once something's selected) so
+                // their availability doesn't jump around as selection
+                // changes -- each is simply a no-op send if there's nothing
+                // to act on.
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Mark read").clicked() {
+                        self.store_flags_on_selection(vec![imap::FLAG_SEEN.to_string()], vec![]);
+                    }
+                    if ui.button("Mark unread").clicked() {
+                        self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);
+                    }
+                    if ui.button("★ Star").clicked() {
+                        self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
+                    }
+                    if ui.button("☆ Unstar").clicked() {
+                        self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
+                    }
+                    if ui.button("Archive").clicked() {
+                        self.move_selection(ARCHIVE_MAILBOX);
+                    }
+                    if ui.button("Delete").clicked() {
+                        self.move_selection(TRASH_MAILBOX);
+                    }
+                });
+
                 if self.search_results.is_none() {
                     egui::Panel::bottom("pagination_panel").show_inside(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -999,7 +1353,7 @@ impl eframe::App for EsMailApp {
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        // `clicked_uid` defers the FetchBody/FetchMail send
+                        // `clicked` defers the FetchBody/FetchMail send
                         // until after `list`'s borrow of self.headers /
                         // self.search_results ends below: fetch_body takes
                         // &mut self, which the borrow checker won't allow
@@ -1007,32 +1361,36 @@ impl eframe::App for EsMailApp {
                         // still alive across the loop.
                         let list = self.search_results.as_ref().unwrap_or(&self.headers);
                         let is_search = self.search_results.is_some();
-                        let mut clicked_uid = None;
+                        let mut clicked: Option<(u32, egui::Modifiers)> = None;
                         for header in list {
-                            let is_selected = self.selected_uid == Some(header.uid);
-                            let text = format!("{}\n{}", header.from, header.subject);
+                            let is_selected = self.selected_uids.contains(&header.uid) || self.selected_uid == Some(header.uid);
+                            let unread_mark = if header.is_seen() { "\u{2003}" } else { "\u{25cf} " };
+                            let star_mark = if header.is_flagged() { "\u{2605} " } else { "" };
+                            let text = format!("{unread_mark}{star_mark}{}\n{}", header.from, header.subject);
                             let resp = ui.add(egui::Button::selectable(is_selected, text));
                             if resp.clicked() {
-                                self.selected_uid = Some(header.uid);
-                                clicked_uid = Some(header.uid);
-                                // A new message defaults to blocked remote
-                                // content, same as any other mail client;
-                                // "Load remote images" opts back in per view.
-                                self.message_view_handler.borrow_mut().allow_remote = false;
-                                self.current_attachments.clear();
-                                self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
+                                clicked = Some((header.uid, ui.input(|i| i.modifiers)));
                             }
                         }
-                        if let Some(uid) = clicked_uid {
-                            if is_search {
-                                let _ = self.db_tx.try_send(DbCommand::FetchMail {
-                                    account_id: self.account_id(),
-                                    mailbox: self.selected_mailbox.clone(),
-                                    uid,
-                                });
+                        if let Some((uid, modifiers)) = clicked {
+                            if modifiers.shift && self.select_anchor.is_some() {
+                                let anchor = self.select_anchor.expect("just checked is_some");
+                                self.selected_uids = select_range(list, anchor, uid);
+                            } else if modifiers.command || modifiers.ctrl {
+                                if self.selected_uids.is_empty() {
+                                    if let Some(prev) = self.selected_uid {
+                                        self.selected_uids.insert(prev);
+                                    }
+                                }
+                                if !self.selected_uids.remove(&uid) {
+                                    self.selected_uids.insert(uid);
+                                }
+                                self.select_anchor = Some(uid);
                             } else {
-                                self.fetch_body(self.selected_mailbox.clone(), uid);
+                                self.selected_uids.clear();
+                                self.select_anchor = Some(uid);
                             }
+                            self.open_message(uid, is_search);
                         }
                     });
                 });
@@ -1090,6 +1448,31 @@ impl eframe::App for EsMailApp {
                                 if ui.button("Forward").clicked() {
                                     self.compose = Some(compose::ComposeState::forward(&header, &self.current_message_html));
                                     self.compose_status.clear();
+                                }
+                                ui.separator();
+                                // Single-message flag/move shortcuts (B8) --
+                                // the toolbar in the left panel does the same
+                                // thing but over `action_targets()` (the
+                                // multi-selection, falling back to this one
+                                // open message), so these exist for the
+                                // common "just this one" case without first
+                                // needing to select it in the list.
+                                let star_label = if header.is_flagged() { "☆ Unstar" } else { "★ Star" };
+                                if ui.button(star_label).clicked() {
+                                    if header.is_flagged() {
+                                        self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
+                                    } else {
+                                        self.store_flags_on_selection(vec![imap::FLAG_FLAGGED.to_string()], vec![]);
+                                    }
+                                }
+                                if ui.button("Mark unread").clicked() {
+                                    self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);
+                                }
+                                if ui.button("Archive").clicked() {
+                                    self.move_selection(ARCHIVE_MAILBOX);
+                                }
+                                if ui.button("Delete").clicked() {
+                                    self.move_selection(TRASH_MAILBOX);
                                 }
                             });
                         });
@@ -1174,6 +1557,18 @@ const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// for the real gap this leaves (an account whose Sent folder isn't
 /// literally named "Sent" gets a new mailbox silently created instead).
 const SENT_MAILBOX: &str = "Sent";
+/// Delete-to-Trash's destination (B8). Same hardcoded-name-not-special-use-
+/// discovery gap as `SENT_MAILBOX` above -- see `imap::SpecialUse` for the
+/// real special-use/name-fallback classification `mailbox_tree` (the
+/// left-panel tree) uses; this constant is only where "Delete" sends a
+/// message, independent of how the tree renders it.
+const TRASH_MAILBOX: &str = "Trash";
+/// Archive's destination (B8). Same caveat as `TRASH_MAILBOX`.
+const ARCHIVE_MAILBOX: &str = "Archive";
+/// How long a message must stay open before B8 marks it `\Seen` -- long
+/// enough that quickly arrowing past messages with `j`/`k` doesn't mark them
+/// all read, short enough that actually reading one still marks it promptly.
+const MARK_SEEN_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 
 /// Background watcher for B10 (new-mail notifications). Forwards every
 /// `ImapEvent` from `ImapActor` to the UI channel (bumping a repaint) --
@@ -1354,6 +1749,22 @@ fn safe_attachment_filename(filename: &str) -> String {
     match filename.rsplit(['/', '\\']).next() {
         Some(name) if !name.is_empty() && name != "." && name != ".." => name.to_string(),
         _ => "attachment".to_string(),
+    }
+}
+
+/// The set of UIDs between `anchor` and `uid` (inclusive) in `list`'s
+/// current order, for shift-click range selection (B8). Falls back to just
+/// `{uid}` if either isn't actually in `list` (e.g. the anchor was on a page
+/// that's since been paged away from).
+fn select_range(list: &[MailHeader], anchor: u32, uid: u32) -> std::collections::BTreeSet<u32> {
+    let idx_a = list.iter().position(|h| h.uid == anchor);
+    let idx_b = list.iter().position(|h| h.uid == uid);
+    match (idx_a, idx_b) {
+        (Some(a), Some(b)) => {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            list[lo..=hi].iter().map(|h| h.uid).collect()
+        }
+        _ => std::iter::once(uid).collect(),
     }
 }
 

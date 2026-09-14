@@ -62,6 +62,27 @@ pub enum DbCommand {
         uid_validity: u32,
         uid_next: u32,
     },
+    /// Mirror an IMAP `STORE`'s resulting flags into the local cache (B8) —
+    /// sent once `ImapEvent::FlagsUpdated` confirms the server accepted a
+    /// `\Seen`/`\Flagged`/`\Deleted` change, so a page rendered from the
+    /// cache (or a later `search`) reflects it without waiting for the next
+    /// full header re-fetch. Best-effort: silently a no-op if this
+    /// `(account_id, mailbox, uid)` was never cached (nothing to update).
+    UpdateFlags {
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+        flags: Vec<String>,
+    },
+    /// Drop a message from the local cache (B8) — sent once
+    /// `ImapEvent::Moved` confirms a move-to-Trash/Archive succeeded, so the
+    /// cache doesn't keep showing a message under a mailbox it no longer
+    /// lives in.
+    RemoveMessage {
+        account_id: String,
+        mailbox: String,
+        uid: u32,
+    },
 }
 
 pub enum DbEvent {
@@ -167,6 +188,16 @@ impl DbActor {
                         }
                     }
                 }
+                DbCommand::UpdateFlags { account_id, mailbox, uid, flags } => {
+                    if let Err(e) = update_flags(&self.conn, &account_id, &mailbox, uid, &flags) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
+                DbCommand::RemoveMessage { account_id, mailbox, uid } => {
+                    if let Err(e) = remove_message(&self.conn, &account_id, &mailbox, uid) {
+                        let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                    }
+                }
             }
         }
     }
@@ -253,15 +284,16 @@ fn index_headers(
 ) -> rusqlite::Result<()> {
     for header in headers {
         conn.execute(
-            "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+            "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size, flags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)
              ON CONFLICT (account_id, mailbox, uid) DO UPDATE SET
                 subject = excluded.subject,
                 from_addr = excluded.from_addr,
                 to_addr = excluded.to_addr,
                 date = excluded.date,
-                message_id = excluded.message_id",
-            params![account_id, mailbox, header.uid, header.subject, header.from, header.to, header.date, header.message_id],
+                message_id = excluded.message_id,
+                flags = excluded.flags",
+            params![account_id, mailbox, header.uid, header.subject, header.from, header.to, header.date, header.message_id, flags_column(header)],
         )?;
     }
     Ok(())
@@ -278,15 +310,16 @@ fn index_mail(
     body: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO messages (account_id, mailbox, uid, subject, from_addr, to_addr, date, message_id, size, flags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (account_id, mailbox, uid) DO UPDATE SET
             subject = excluded.subject,
             from_addr = excluded.from_addr,
             to_addr = excluded.to_addr,
             date = excluded.date,
             message_id = excluded.message_id,
-            size = excluded.size",
+            size = excluded.size,
+            flags = excluded.flags",
         params![
             account_id,
             mailbox,
@@ -297,6 +330,7 @@ fn index_mail(
             header.date,
             header.message_id,
             body.len() as i64,
+            flags_column(header),
         ],
     )?;
 
@@ -352,7 +386,7 @@ fn search(
     // containing a `'` alter the query. IMAP mailbox names are server-
     // controlled, so this was reachable from an untrusted source.
     let mut stmt = conn.prepare(
-        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id
+        "SELECT m.uid, m.subject, m.from_addr, m.to_addr, m.date, m.message_id, m.flags
          FROM messages_fts f
          JOIN messages m ON m.account_id = f.account_id
             AND m.mailbox = f.mailbox AND m.uid = f.uid
@@ -362,6 +396,7 @@ fn search(
          ORDER BY f.rank",
     )?;
     let rows = stmt.query_map(params![account_id, mailbox, query], |row| {
+        let flags_str: String = row.get(6)?;
         Ok(MailHeader {
             uid: row.get(0)?,
             subject: row.get(1)?,
@@ -369,6 +404,7 @@ fn search(
             to: row.get(3)?,
             date: row.get(4)?,
             message_id: row.get(5)?,
+            flags: parse_flags_column(&flags_str),
         })
     })?;
 
@@ -386,12 +422,13 @@ fn fetch_mail(
     uid: u32,
 ) -> rusqlite::Result<(MailHeader, String)> {
     conn.query_row(
-        "SELECT m.subject, m.from_addr, m.to_addr, m.date, m.message_id, b.body
+        "SELECT m.subject, m.from_addr, m.to_addr, m.date, m.message_id, b.body, m.flags
          FROM messages m JOIN bodies b
             ON b.account_id = m.account_id AND b.mailbox = m.mailbox AND b.uid = m.uid
          WHERE m.account_id = ?1 AND m.mailbox = ?2 AND m.uid = ?3",
         params![account_id, mailbox, uid],
         |row| {
+            let flags_str: String = row.get(6)?;
             Ok((
                 MailHeader {
                     uid,
@@ -400,11 +437,23 @@ fn fetch_mail(
                     to: row.get(2)?,
                     date: row.get(3)?,
                     message_id: row.get(4)?,
+                    flags: parse_flags_column(&flags_str),
                 },
                 row.get(5)?,
             ))
         },
     )
+}
+
+/// `messages.flags` (B8) stores a space-separated list of raw IMAP flags
+/// (e.g. `"\Seen \Flagged"`) -- splitting on whitespace round-trips cleanly
+/// since no legal IMAP flag atom itself contains a space.
+fn parse_flags_column(s: &str) -> Vec<String> {
+    s.split_whitespace().map(|f| f.to_string()).collect()
+}
+
+fn flags_column(header: &MailHeader) -> String {
+    header.flags.join(" ")
 }
 
 fn report_mailbox_state(
@@ -449,6 +498,26 @@ fn report_mailbox_state(
     )?;
 
     Ok(plan)
+}
+
+/// Overwrite the cached `flags` for one message (B8), if it's cached at all.
+/// A no-op (not an error) when the row doesn't exist — the message may never
+/// have been indexed (see `DbCommand::IndexHeaders`'s doc on what does and
+/// doesn't populate `messages`).
+fn update_flags(conn: &Connection, account_id: &str, mailbox: &str, uid: u32, flags: &[String]) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE messages SET flags = ?1 WHERE account_id = ?2 AND mailbox = ?3 AND uid = ?4",
+        params![flags.join(" "), account_id, mailbox, uid],
+    )?;
+    Ok(())
+}
+
+/// Drop a moved-away message from every table that might hold it (B8).
+fn remove_message(conn: &Connection, account_id: &str, mailbox: &str, uid: u32) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM messages WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
+    conn.execute("DELETE FROM bodies WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
+    conn.execute("DELETE FROM messages_fts WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3", params![account_id, mailbox, uid])?;
+    Ok(())
 }
 
 /// The pure decision behind [`report_mailbox_state`]: given what was stored
@@ -496,6 +565,7 @@ mod tests {
             to: "bob@example.com".to_string(),
             date: "2026-01-01".to_string(),
             message_id: format!("<msg{uid}@example.com>"),
+            flags: Vec::new(),
         }
     }
 
@@ -618,6 +688,49 @@ mod tests {
 
         let (_, body) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
         assert_eq!(body, "<p>already cached</p>");
+    }
+
+    // ── flags (B8) ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_mail_round_trips_flags() {
+        let conn = test_conn();
+        let mut header = test_header(1);
+        header.flags = vec!["\\Seen".to_string(), "\\Flagged".to_string()];
+        index_mail(&conn, "acc", "INBOX", &header, "body").unwrap();
+
+        let (fetched, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(fetched.flags, vec!["\\Seen", "\\Flagged"]);
+    }
+
+    #[test]
+    fn update_flags_overwrites_a_cached_messages_flags() {
+        let conn = test_conn();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body").unwrap();
+
+        update_flags(&conn, "acc", "INBOX", 1, &["\\Seen".to_string()]).unwrap();
+
+        let (header, _) = fetch_mail(&conn, "acc", "INBOX", 1).unwrap();
+        assert_eq!(header.flags, vec!["\\Seen"]);
+    }
+
+    #[test]
+    fn update_flags_on_an_uncached_message_is_a_harmless_no_op() {
+        let conn = test_conn();
+        // No index_mail/index_headers call for uid 1 -- nothing cached.
+        update_flags(&conn, "acc", "INBOX", 1, &["\\Seen".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn remove_message_deletes_from_every_table() {
+        let conn = test_conn();
+        index_mail(&conn, "acc", "INBOX", &test_header(1), "body text").unwrap();
+
+        remove_message(&conn, "acc", "INBOX", 1).unwrap();
+
+        assert!(fetch_mail(&conn, "acc", "INBOX", 1).is_err());
+        let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(fts, 0);
     }
 
     // ── search ────────────────────────────────────────────────────────────────

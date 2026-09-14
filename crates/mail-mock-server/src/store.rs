@@ -16,6 +16,11 @@ pub struct StoredMessage {
     pub uid: u32,
     pub raw: Vec<u8>,
     pub envelope: Envelope,
+    /// IMAP flags on this message (e.g. `"\Seen"`, `"\Flagged"`, `"\Deleted"`),
+    /// mutated by `STORE`/`UID STORE` (B8) and consulted by `EXPUNGE`/`STATUS
+    /// (UNSEEN)`. Empty for a freshly delivered message -- nothing marks
+    /// anything `\Seen` on arrival, matching a real server.
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,8 +50,42 @@ impl Mailbox {
     pub fn append(&mut self, raw: Vec<u8>, envelope: Envelope) -> u32 {
         let uid = self.uid_next;
         self.uid_next += 1;
-        self.messages.push(StoredMessage { uid, raw, envelope });
+        self.messages.push(StoredMessage { uid, raw, envelope, flags: Vec::new() });
         uid
+    }
+
+    /// Messages with no `\Seen` flag -- what `STATUS (UNSEEN)` (B8) counts.
+    pub fn unseen_count(&self) -> u32 {
+        self.messages.iter().filter(|m| !m.flags.iter().any(|f| f == "\\Seen")).count() as u32
+    }
+
+    /// Applies `add`/`remove` to the flags of the message with the given
+    /// `uid`, returning its resulting flag list. `None` if no message in
+    /// this mailbox has that UID.
+    pub fn store_flags(&mut self, uid: u32, add: &[String], remove: &[String]) -> Option<Vec<String>> {
+        let msg = self.messages.iter_mut().find(|m| m.uid == uid)?;
+        for flag in add {
+            if !msg.flags.iter().any(|f| f.eq_ignore_ascii_case(flag)) {
+                msg.flags.push(flag.clone());
+            }
+        }
+        msg.flags.retain(|f| !remove.iter().any(|r| r.eq_ignore_ascii_case(f)));
+        Some(msg.flags.clone())
+    }
+
+    /// Removes every message flagged `\Deleted` from this mailbox (`EXPUNGE`,
+    /// B8) -- the fallback path `imap.rs::move_message` uses when a server
+    /// doesn't support `MOVE`. Returns the removed UIDs.
+    pub fn expunge(&mut self) -> Vec<u32> {
+        let mut removed = Vec::new();
+        self.messages.retain(|m| {
+            let deleted = m.flags.iter().any(|f| f == "\\Deleted");
+            if deleted {
+                removed.push(m.uid);
+            }
+            !deleted
+        });
+        removed
     }
 }
 
@@ -106,6 +145,22 @@ impl Store {
         let uid = mailbox.append(raw, envelope);
         let _ = self.notify.send(recipient_mailbox.to_string());
         uid
+    }
+
+    /// `COPY`/`UID COPY` (B8): duplicates the message `uid` from `src` into
+    /// `dest` (creating `dest` if it doesn't exist yet, same as `deliver`),
+    /// with a fresh UID and its flags carried over. Used by
+    /// `imap.rs::move_message`'s COPY+STORE+EXPUNGE fallback for servers
+    /// without `MOVE`. Returns the new UID, or `None` if `src`/`uid` doesn't
+    /// exist.
+    pub fn copy_message(&mut self, src: &str, uid: u32, dest: &str) -> Option<u32> {
+        let msg = self.mailboxes.get(src)?.messages.iter().find(|m| m.uid == uid)?.clone();
+        let dest_mailbox = self.mailboxes.entry(dest.to_string()).or_insert_with(|| Mailbox::new(dest, 1));
+        let new_uid = dest_mailbox.uid_next;
+        dest_mailbox.uid_next += 1;
+        dest_mailbox.messages.push(StoredMessage { uid: new_uid, flags: msg.flags.clone(), ..msg });
+        let _ = self.notify.send(dest.to_string());
+        Some(new_uid)
     }
 }
 

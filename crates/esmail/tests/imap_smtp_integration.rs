@@ -88,9 +88,17 @@ async fn connect_and_fetch_mailboxes() {
 
     h.imap_cmd.send(ImapCommand::FetchMailboxes).await.unwrap();
     match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
-        ImapEvent::Mailboxes(names) => {
-            assert!(names.contains(&"INBOX".to_string()));
-            assert!(names.contains(&"Sent".to_string()));
+        ImapEvent::Mailboxes(mailboxes) => {
+            let names: Vec<&str> = mailboxes.iter().map(|m| m.name.as_str()).collect();
+            assert!(names.contains(&"INBOX"));
+            assert!(names.contains(&"Sent"));
+            // B8: the mock server advertises RFC 6154 special-use
+            // attributes for the well-known mailboxes `Store::add_user`
+            // seeds -- `imap.rs::fetch_mailboxes` should have picked those
+            // up rather than falling back to name-based guessing for them.
+            let sent = mailboxes.iter().find(|m| m.name == "Sent").expect("Sent present");
+            assert_eq!(sent.special_use, Some(esmail::imap::SpecialUse::Sent));
+            assert_eq!(sent.delimiter.as_deref(), Some("/"));
         }
         other => panic!("expected Mailboxes, got {other:?}"),
     }
@@ -258,6 +266,147 @@ async fn bulk_download_does_not_block_a_concurrent_header_fetch() {
     );
 }
 
+// ── B8: flags, move-to-Trash/Archive, unread counts ─────────────────────────
+
+/// `StoreFlags` (B8): `+FLAGS`/`-FLAGS` round trip, exercising both add and
+/// remove in the same call the way `main.rs::store_flags_on_selection` never
+/// actually needs to (each button only ever adds or only removes) but
+/// `ImapActor::store_flags` is written to support either combination.
+#[tokio::test]
+async fn store_flags_adds_and_removes_in_one_call() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    let headers = match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => headers,
+        other => panic!("expected Headers, got {other:?}"),
+    };
+    let uid = headers[0].uid;
+    assert!(!headers[0].is_seen(), "a freshly delivered message starts unseen");
+
+    h.imap_cmd
+        .send(ImapCommand::StoreFlags {
+            mailbox: "INBOX".to_string(),
+            uid,
+            add: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+            remove: vec![],
+            req_id: 99,
+        })
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::FlagsUpdated { uid: got_uid, flags, req_id: 99, .. } => {
+            assert_eq!(got_uid, uid);
+            assert!(flags.iter().any(|f| f == "\\Seen"));
+            assert!(flags.iter().any(|f| f == "\\Flagged"));
+        }
+        other => panic!("expected FlagsUpdated, got {other:?}"),
+    }
+
+    // Now remove \Seen only -- \Flagged should survive.
+    h.imap_cmd
+        .send(ImapCommand::StoreFlags {
+            mailbox: "INBOX".to_string(),
+            uid,
+            add: vec![],
+            remove: vec!["\\Seen".to_string()],
+            req_id: 100,
+        })
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::FlagsUpdated { flags, req_id: 100, .. } => {
+            assert!(!flags.iter().any(|f| f == "\\Seen"));
+            assert!(flags.iter().any(|f| f == "\\Flagged"));
+        }
+        other => panic!("expected FlagsUpdated, got {other:?}"),
+    }
+}
+
+/// `MoveMessage` (B8) against this mock server, which has no `MOVE`
+/// extension -- so this exercises the COPY+STORE+EXPUNGE fallback path
+/// specifically, not real `MOVE` (see `ImapActor::move_message`'s doc for
+/// why the fallback is the one this mock can actually prove works). After
+/// the move, the message must be gone from INBOX and present in Trash.
+#[tokio::test]
+async fn move_message_falls_back_to_copy_store_expunge_and_the_message_relocates() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    let headers = match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => headers,
+        other => panic!("expected Headers, got {other:?}"),
+    };
+    let uid = headers[0].uid;
+    let subject = headers[0].subject.clone();
+
+    h.imap_cmd
+        .send(ImapCommand::MoveMessage { mailbox: "INBOX".to_string(), uid, dest: "Trash".to_string(), req_id: 7 })
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Moved { mailbox, uid: got_uid, dest, req_id: 7 } => {
+            assert_eq!(mailbox, "INBOX");
+            assert_eq!(got_uid, uid);
+            assert_eq!(dest, "Trash");
+        }
+        other => panic!("expected Moved, got {other:?}"),
+    }
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 2 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => {
+            assert!(!headers.iter().any(|h| h.uid == uid), "moved message must no longer be in INBOX");
+        }
+        other => panic!("expected Headers, got {other:?}"),
+    }
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "Trash".to_string(), page: 1, req_id: 3 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => {
+            assert!(headers.iter().any(|h| h.subject == subject), "moved message must now be in Trash");
+        }
+        other => panic!("expected Headers, got {other:?}"),
+    }
+}
+
+/// `FetchUnreadCounts` (B8's `STATUS (UNSEEN)`): starts equal to the
+/// mailbox's full message count (nothing is `\Seen` on delivery) and drops
+/// by one once a message is marked `\Seen`.
+#[tokio::test]
+async fn fetch_unread_counts_reflects_seen_flags() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(3).await; // 2 fixtures + 3 = 5 in INBOX
+
+    h.imap_cmd.send(ImapCommand::FetchUnreadCounts { mailboxes: vec!["INBOX".to_string()] }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::UnreadCounts(counts) => assert_eq!(counts.get("INBOX"), Some(&5)),
+        other => panic!("expected UnreadCounts, got {other:?}"),
+    }
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    let uid = match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => headers[0].uid,
+        other => panic!("expected Headers, got {other:?}"),
+    };
+    h.imap_cmd
+        .send(ImapCommand::StoreFlags { mailbox: "INBOX".to_string(), uid, add: vec!["\\Seen".to_string()], remove: vec![], req_id: 2 })
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap(),
+        ImapEvent::FlagsUpdated { .. }
+    ));
+
+    h.imap_cmd.send(ImapCommand::FetchUnreadCounts { mailboxes: vec!["INBOX".to_string()] }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::UnreadCounts(counts) => assert_eq!(counts.get("INBOX"), Some(&4)),
+        other => panic!("expected UnreadCounts, got {other:?}"),
+    }
+}
+
 /// The real round trip this whole server exists to make testable: esmail's
 /// `SmtpActor` sends a message, and esmail's `ImapActor` can then see it.
 #[tokio::test]
@@ -379,8 +528,8 @@ async fn disconnected_session_reconnects_and_serves_the_next_request() {
         match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
             ImapEvent::Disconnected => saw_disconnected = true,
             ImapEvent::Connected => {}
-            ImapEvent::Mailboxes(names) => {
-                assert!(names.contains(&"INBOX".to_string()));
+            ImapEvent::Mailboxes(mailboxes) => {
+                assert!(mailboxes.iter().any(|m| m.name == "INBOX"));
                 break;
             }
             other => panic!("unexpected event while reconnecting: {other:?}"),
