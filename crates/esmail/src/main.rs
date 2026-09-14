@@ -1199,12 +1199,19 @@ fn open_attachment(attachment: &render::Attachment) -> std::io::Result<()> {
 /// name if that leaves nothing usable) keeps a crafted `"../../../whatever"`
 /// or an absolute path from writing outside the caller's chosen directory,
 /// since `Path::join` would otherwise honor either verbatim.
+///
+/// Splits on `/` *and* `\` manually rather than using `std::path::Path`:
+/// `Path`'s separator handling is host-OS-dependent, so on a Linux build
+/// `Path::new(r"C:\Windows\System32\evil.dll").file_name()` treats the
+/// whole string as one component (`\` isn't a separator on Unix) and
+/// returns it unstripped. A sender-controlled filename is untrusted
+/// regardless of which OS esmail happens to be running on, so the
+/// stripping has to be too.
 fn safe_attachment_filename(filename: &str) -> String {
-    std::path::Path::new(filename)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "attachment".to_string())
+    match filename.rsplit(['/', '\\']).next() {
+        Some(name) if !name.is_empty() && name != "." && name != ".." => name.to_string(),
+        _ => "attachment".to_string(),
+    }
 }
 
 /// A human-readable size, e.g. `"4.2 KB"`. Only goes up to MB since a mail
