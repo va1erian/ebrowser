@@ -43,6 +43,7 @@ pub enum SmtpCommand {
     Send { account: SmtpAccount, compose: ComposeState },
 }
 
+#[derive(Debug)]
 pub enum SmtpEvent {
     Sent,
     Error(String),

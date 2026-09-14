@@ -1,0 +1,27 @@
+# Standalone mail-mock-server, for manually exercising the real esmail GUI
+# against a fake IMAP/SMTP server. Not used by CI (see
+# .github/workflows/ci.yml's test-linux job, which runs the server
+# in-process from the test binary instead). See
+# crates/mail-mock-server/README.md for the full picture, including how to
+# trust its TLS certificate.
+#
+# Usage:
+#   docker compose up mail-mock-server
+# Then point esmail's login screen at:
+#   IMAP: localhost, port 1993, TLS "SSL/implicit"
+#   SMTP: localhost, port 1025, TLS "None"
+#   account: alice@example.com / hunter2
+
+services:
+  mail-mock-server:
+    build:
+      context: .
+      dockerfile: crates/mail-mock-server/Dockerfile
+    ports:
+      - "1993:1993"
+      - "1025:1025"
+    environment:
+      INBOX_COUNT: "60"
+      CA_OUT: "/ca/ca.crt"
+    volumes:
+      - ./tmp/mail-mock-server-ca:/ca

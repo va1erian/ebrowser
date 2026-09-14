@@ -1,0 +1,318 @@
+//! A minimal IMAP4rev1 server -- just enough of the protocol for esmail's
+//! `imap.rs` to drive: `LOGIN`, `LIST`, `EXAMINE`, `FETCH (UID ENVELOPE)`,
+//! `UID FETCH RFC822`, `LOGOUT`. Nothing else esmail sends is implemented.
+//!
+//! Every response that carries a string uses IMAP's `{n}\r\n<bytes>` literal
+//! syntax instead of quoted strings. Literals need no escaping for any
+//! content (including CRLF, quotes, non-ASCII), which sidesteps needing a
+//! byte-perfect quoted-string quoter to satisfy `imap-proto`'s parser --
+//! verified against the vendored `imap-proto-0.16.7` grammar
+//! (`parser/core.rs::literal`).
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio_native_tls::TlsAcceptor;
+use tokio_native_tls::native_tls::{Identity, TlsAcceptor as NativeTlsAcceptor};
+
+use crate::store::SharedStore;
+
+pub async fn spawn(store: SharedStore, bind_addr: &str, pkcs12: &[u8], pkcs12_password: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let identity = Identity::from_pkcs12(pkcs12, pkcs12_password)?;
+    let acceptor: TlsAcceptor = NativeTlsAcceptor::new(identity)?.into();
+    let listener = TcpListener::bind(bind_addr).await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("imap accept error: {e}");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let store = store.clone();
+            tokio::spawn(async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls) => {
+                        if let Err(e) = handle_connection(tls, store).await {
+                            log::debug!("imap session {peer} ended: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("imap TLS handshake with {peer} failed: {e}"),
+                }
+            });
+        }
+    });
+
+    Ok(addr)
+}
+
+/// Wraps a byte string as an IMAP literal: `{n}\r\n<bytes>`.
+fn literal(bytes: &[u8]) -> Vec<u8> {
+    let mut out = format!("{{{}}}\r\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn nstring(s: &str) -> Vec<u8> {
+    if s.is_empty() { b"NIL".to_vec() } else { literal(s.as_bytes()) }
+}
+
+/// One address structure: `(name adl mailbox host)`, or `NIL` if absent.
+fn address(addr: &Option<(String, String, String)>) -> Vec<u8> {
+    match addr {
+        None => b"NIL".to_vec(),
+        Some((name, mailbox, host)) => {
+            let mut out = b"((".to_vec();
+            out.extend_from_slice(&nstring(name));
+            out.push(b' ');
+            out.extend_from_slice(b"NIL ");
+            out.extend_from_slice(&nstring(mailbox));
+            out.push(b' ');
+            out.extend_from_slice(&nstring(host));
+            out.extend_from_slice(b"))");
+            out
+        }
+    }
+}
+
+async fn handle_connection<S>(stream: S, store: SharedStore) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+
+    write_half.write_all(b"* OK esmail mail-mock-server ready\r\n").await?;
+
+    let mut authenticated_user: Option<String> = None;
+    let mut selected_mailbox: Option<String> = None;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(()); // client closed the connection
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            continue;
+        }
+
+        let tokens = tokenize(line);
+        let Some(tag) = tokens.first() else { continue };
+        let tag = tag.clone();
+        let verb = tokens.get(1).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+
+        match verb.as_str() {
+            "LOGIN" => {
+                let (Some(user), Some(pass)) = (tokens.get(2), tokens.get(3)) else {
+                    write_half.write_all(format!("{tag} BAD LOGIN needs two arguments\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let ok = store.lock().unwrap().check_login(user, pass);
+                if ok {
+                    authenticated_user = Some(user.clone());
+                    write_half.write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes()).await?;
+                } else {
+                    write_half.write_all(format!("{tag} NO LOGIN failed\r\n").as_bytes()).await?;
+                }
+            }
+            "LIST" => {
+                if authenticated_user.is_none() {
+                    write_half.write_all(format!("{tag} NO not authenticated\r\n").as_bytes()).await?;
+                    continue;
+                }
+                let names = store.lock().unwrap().mailbox_names();
+                for name in names {
+                    let mut resp = b"* LIST (\\HasNoChildren) \"/\" ".to_vec();
+                    resp.extend_from_slice(&literal(name.as_bytes()));
+                    resp.extend_from_slice(b"\r\n");
+                    write_half.write_all(&resp).await?;
+                }
+                write_half.write_all(format!("{tag} OK LIST completed\r\n").as_bytes()).await?;
+            }
+            "EXAMINE" | "SELECT" => {
+                if authenticated_user.is_none() {
+                    write_half.write_all(format!("{tag} NO not authenticated\r\n").as_bytes()).await?;
+                    continue;
+                }
+                let Some(mailbox_name) = tokens.get(2).cloned() else {
+                    write_half.write_all(format!("{tag} BAD {verb} needs a mailbox\r\n").as_bytes()).await?;
+                    continue;
+                };
+                // Scoped so the `MutexGuard` (not `Send`) is dropped before
+                // any `.await` below -- otherwise the connection-handling
+                // future itself stops being `Send`, which `tokio::spawn`
+                // requires.
+                let found = {
+                    let guard = store.lock().unwrap();
+                    guard.mailbox(&mailbox_name).map(|mb| (mb.messages.len(), mb.uid_validity, mb.uid_next))
+                };
+                let Some((exists, uid_validity, uid_next)) = found else {
+                    write_half.write_all(format!("{tag} NO mailbox does not exist\r\n").as_bytes()).await?;
+                    continue;
+                };
+
+                selected_mailbox = Some(mailbox_name);
+                let readonly = if verb == "EXAMINE" { " [READ-ONLY]" } else { "" };
+                write_half.write_all(b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n").await?;
+                write_half.write_all(b"* OK [PERMANENTFLAGS ()] Flags permitted.\r\n").await?;
+                write_half.write_all(format!("* {exists} EXISTS\r\n").as_bytes()).await?;
+                write_half.write_all(b"* 0 RECENT\r\n").await?;
+                write_half.write_all(format!("* OK [UIDVALIDITY {uid_validity}] UIDs valid\r\n").as_bytes()).await?;
+                write_half.write_all(format!("* OK [UIDNEXT {uid_next}] Predicted next UID\r\n").as_bytes()).await?;
+                write_half.write_all(format!("{tag} OK{readonly} {verb} completed\r\n").as_bytes()).await?;
+            }
+            "FETCH" => {
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let Some(seq_set) = tokens.get(2).cloned() else {
+                    write_half.write_all(format!("{tag} BAD FETCH needs a sequence set\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let (start, end) = parse_range(&seq_set);
+                let responses = {
+                    let guard = store.lock().unwrap();
+                    guard.mailbox(&mailbox_name).map(|mailbox| {
+                        let total = mailbox.messages.len() as u32;
+                        let end = end.min(total);
+                        let mut responses = Vec::new();
+                        for seq in start.max(1)..=end {
+                            if let Some(msg) = mailbox.messages.get((seq - 1) as usize) {
+                                let mut r = format!("* {seq} FETCH (UID {} ENVELOPE (", msg.uid).into_bytes();
+                                r.extend_from_slice(&nstring(&msg.envelope.date));
+                                r.push(b' ');
+                                r.extend_from_slice(&nstring(&msg.envelope.subject));
+                                r.push(b' ');
+                                r.extend_from_slice(&address(&msg.envelope.from));
+                                r.push(b' ');
+                                r.extend_from_slice(&address(&msg.envelope.from)); // sender
+                                r.push(b' ');
+                                r.extend_from_slice(&address(&msg.envelope.from)); // reply-to
+                                r.push(b' ');
+                                r.extend_from_slice(&address(&msg.envelope.to));
+                                r.extend_from_slice(b" NIL NIL NIL "); // cc bcc in-reply-to
+                                r.extend_from_slice(&nstring(&msg.envelope.message_id));
+                                r.extend_from_slice(b"))\r\n");
+                                responses.push(r);
+                            }
+                        }
+                        responses
+                    })
+                };
+                let Some(responses) = responses else {
+                    write_half.write_all(format!("{tag} NO mailbox gone\r\n").as_bytes()).await?;
+                    continue;
+                };
+                for r in responses {
+                    write_half.write_all(&r).await?;
+                }
+                write_half.write_all(format!("{tag} OK FETCH completed\r\n").as_bytes()).await?;
+            }
+            "UID" if tokens.get(2).map(|s| s.eq_ignore_ascii_case("FETCH")).unwrap_or(false) => {
+                let Some(mailbox_name) = selected_mailbox.clone() else {
+                    write_half.write_all(format!("{tag} NO no mailbox selected\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let Some(uid_str) = tokens.get(3) else {
+                    write_half.write_all(format!("{tag} BAD UID FETCH needs a UID\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let Ok(uid) = uid_str.parse::<u32>() else {
+                    write_half.write_all(format!("{tag} BAD invalid UID\r\n").as_bytes()).await?;
+                    continue;
+                };
+                let found = {
+                    let guard = store.lock().unwrap();
+                    guard.mailbox(&mailbox_name).and_then(|mb| mb.messages.iter().find(|m| m.uid == uid).cloned())
+                };
+
+                if let Some(msg) = found {
+                    let mut r = format!("* 1 FETCH (UID {} RFC822 ", msg.uid).into_bytes();
+                    r.extend_from_slice(&literal(&msg.raw));
+                    r.extend_from_slice(b")\r\n");
+                    write_half.write_all(&r).await?;
+                }
+                write_half.write_all(format!("{tag} OK UID FETCH completed\r\n").as_bytes()).await?;
+            }
+            "LOGOUT" => {
+                write_half.write_all(b"* BYE logging out\r\n").await?;
+                write_half.write_all(format!("{tag} OK LOGOUT completed\r\n").as_bytes()).await?;
+                return Ok(());
+            }
+            "CAPABILITY" => {
+                write_half.write_all(b"* CAPABILITY IMAP4rev1\r\n").await?;
+                write_half.write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes()).await?;
+            }
+            "NOOP" => {
+                write_half.write_all(format!("{tag} OK NOOP completed\r\n").as_bytes()).await?;
+            }
+            _ => {
+                write_half.write_all(format!("{tag} BAD unknown or unsupported command\r\n").as_bytes()).await?;
+            }
+        }
+    }
+}
+
+/// Splits an IMAP command line into tokens, treating a `"..."` run
+/// (unescaping `\"` and `\\`) as a single token -- enough for the small,
+/// self-controlled command set esmail's client actually sends (see
+/// `async-imap`'s `quote!` macro, which always double-quotes its string
+/// arguments).
+fn tokenize(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c == ' ' {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut s = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        if let Some(next) = chars.next() {
+                            s.push(next);
+                        }
+                    }
+                    _ => s.push(c),
+                }
+            }
+            tokens.push(s);
+        } else {
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                s.push(c);
+                chars.next();
+            }
+            tokens.push(s);
+        }
+    }
+    tokens
+}
+
+/// Parses a `FETCH` sequence set of the shapes esmail's client sends:
+/// a single number (`"5"`) or an inclusive range (`"1:50"`).
+fn parse_range(spec: &str) -> (u32, u32) {
+    if let Some((a, b)) = spec.split_once(':') {
+        let a: u32 = a.parse().unwrap_or(1);
+        let b: u32 = b.parse().unwrap_or(a);
+        (a, b)
+    } else {
+        let n: u32 = spec.parse().unwrap_or(1);
+        (n, n)
+    }
+}
+

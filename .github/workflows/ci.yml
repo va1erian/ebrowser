@@ -21,6 +21,33 @@ jobs:
       - name: Build
         run: cargo build
 
+      - name: Run unit tests
+        run: cargo test --workspace
+
+      # mail-mock-server's TLS identity is a committed, throwaway test
+      # certificate (crates/mail-mock-server/certs/) -- trusting its CA as
+      # an extra system root lets esmail's real (unmodified) TLS code in
+      # imap.rs connect to it, the same way it would a real IMAPS server.
+      # See crates/mail-mock-server/README.md for the full rationale and
+      # for how to do this on a local dev machine instead of CI.
+      - name: Trust the mail-mock-server test CA
+        run: |
+          sudo cp crates/mail-mock-server/certs/ca.crt /usr/local/share/ca-certificates/esmail-test-ca.crt
+          sudo update-ca-certificates
+
+      - name: Run IMAP/SMTP simulation tests (esmail against mail-mock-server)
+        run: cargo test --workspace -- --include-ignored
+        env:
+          ESMAIL_TEST_CA_TRUSTED: "1"
+
+  # Build-only on Windows: trusting an extra root CA there means the
+  # Windows certificate store, not a files-on-disk step like Linux's
+  # update-ca-certificates, and whether that's reliably non-interactive on
+  # a hosted runner wasn't confirmed -- see
+  # crates/mail-mock-server/README.md's Windows section for the (manual,
+  # interactive, already-approved-once-for-this-repo) local-dev version.
+  # The IMAP/SMTP simulation suite itself is platform-agnostic Rust, so
+  # build-linux's coverage already exercises the code paths that matter.
   build-windows:
     name: Build Windows
     runs-on: windows-latest

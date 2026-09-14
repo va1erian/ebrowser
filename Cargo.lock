@@ -2246,6 +2246,7 @@ dependencies = [
  "keyring",
  "lettre",
  "log",
+ "mail-mock-server",
  "mailparse",
  "opener",
  "rfd",
@@ -4583,6 +4584,23 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
+name = "mail-mock-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-imap",
+ "base64 0.22.1",
+ "env_logger",
+ "futures",
+ "lettre",
+ "log",
+ "mailparse",
+ "secrecy",
+ "tokio",
+ "tokio-native-tls",
+]
 
 [[package]]
 name = "mailparse"

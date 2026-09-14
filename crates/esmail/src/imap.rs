@@ -84,6 +84,7 @@ pub enum ImapCommand {
     FetchNewHeaders { mailbox: String, first_uid: u32 },
 }
 
+#[derive(Debug)]
 pub enum ImapEvent {
     Connected,
     /// The connection was lost (or a command needed a reconnect). Followed by

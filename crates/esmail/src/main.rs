@@ -1,18 +1,9 @@
-mod imap;
-mod db;
-mod screenshot;
-mod config;
-mod secrets;
-mod search_query;
-mod render;
-mod compose;
-mod smtp;
-mod notify;
+use esmail::{compose, config, db, imap, notify, render, screenshot, search_query, secrets, smtp};
 /// Tray icon + Windows toast notifications (B10). Windows-only: see
 /// notify.rs's module doc for why the pure detection logic lives separately
 /// and builds everywhere.
 #[cfg(target_os = "windows")]
-mod tray;
+use esmail::tray;
 
 use egui_servo_webview::{
     InterceptOutcome, NavigationPolicy, WebResourceRequest, WebView, WebViewConfig, WebViewHandler,

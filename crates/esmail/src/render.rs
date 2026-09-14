@@ -56,6 +56,7 @@ pub fn render_message(raw: &[u8]) -> String {
 /// resolved `cid:` reference. Holds the decoded bytes directly rather than a
 /// path — nothing has been written to disk yet; that's the save/open UI's job
 /// in `main.rs`.
+#[derive(Debug)]
 pub struct Attachment {
     pub filename: String,
     pub mime_type: String,
