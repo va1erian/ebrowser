@@ -130,6 +130,35 @@ async fn fetch_headers_paginates_the_seeded_inbox() {
     }
 }
 
+/// Regression test for GitHub issue #13 ("Message body sometimes gets
+/// permanently stuck on 'Loading message...'"). The root cause: a failed
+/// `FetchBody` used to come back as a generic `ImapEvent::Error` with no
+/// `uid`/`req_id` on it, so `main.rs` had no way to tell it apart from an
+/// unrelated error and clear the "Loading message..." placeholder
+/// `open_message` sets before the fetch -- the placeholder stayed up
+/// forever. Fetching a UID that doesn't exist is the simplest way to force
+/// `ImapActor::fetch_body`'s "Message not found" error path (the same code
+/// path a dropped connection or an exhausted worker reconnect would hit);
+/// this asserts the reply is a `BodyFailed` carrying the exact `uid`/
+/// `req_id` the request went out with, which `main.rs` now matches the same
+/// way it matches a successful `Body` reply.
+#[tokio::test]
+async fn fetch_body_for_a_missing_uid_reports_a_matchable_body_failure() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    let missing_uid = 999_999;
+    h.imap_cmd.send(ImapCommand::FetchBody { mailbox: "INBOX".to_string(), uid: missing_uid, req_id: 7 }).await.unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::BodyFailed { uid, req_id, error } => {
+            assert_eq!(uid, missing_uid);
+            assert_eq!(req_id, 7);
+            assert!(!error.is_empty());
+        }
+        other => panic!("expected BodyFailed, got {other:?} -- a plain Error here is exactly the bug issue #13 describes: main.rs can't attribute it to this request and clear the loading placeholder"),
+    }
+}
+
 #[tokio::test]
 async fn fetch_body_renders_html_resolves_cid_and_finds_the_attachment() {
     skip_unless_ca_trusted!();

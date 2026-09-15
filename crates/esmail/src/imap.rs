@@ -357,6 +357,18 @@ pub enum ImapEvent {
     Mailboxes(Vec<MailboxInfo>),
     Headers { mailbox: String, headers: Vec<MailHeader>, page: u32, total_pages: u32, req_id: u64, mailbox_state: MailboxState },
     Body { uid: u32, html: String, attachments: Vec<crate::render::Attachment>, req_id: u64 },
+    /// `FetchBody` failed -- a separate variant from `Error` for the same
+    /// reason `FlagsUpdateFailed`/`MoveFailed` are: without `uid`/`req_id`
+    /// attribution, `main.rs` cannot tell a failed body fetch from any other
+    /// unrelated error, so it had no way to resolve the "Loading message..."
+    /// placeholder `open_message` sets -- the placeholder stayed up forever
+    /// on any failure (a dropped connection mid-fetch, a reconnect that
+    /// exhausted its retries, a message that no longer exists on the
+    /// server), even though a banner correctly reported the error. This is
+    /// what closes that gap: `main.rs` matches `req_id`/`uid` the same way
+    /// it does for `Body` and replaces the placeholder with a real message
+    /// instead of leaving it stuck.
+    BodyFailed { uid: u32, req_id: u64, error: String },
     DownloadProgress { current: u32, total: u32 },
     MailData { mailbox: String, header: MailHeader, body: String },
     /// Reply to `PollMailbox` (B10).
@@ -500,7 +512,7 @@ impl ImapActor {
                     // `FetchMailboxes` waiting behind it in this actor's own
                     // command queue.
                     let Some(worker) = &self.worker_tx else {
-                        let _ = self.event_tx.send(ImapEvent::Error("not connected".to_string())).await;
+                        let _ = self.event_tx.send(ImapEvent::BodyFailed { uid, req_id, error: "not connected".to_string() }).await;
                         continue;
                     };
                     let _ = worker.send(WorkerCommand::FetchBody { mailbox, uid, req_id }).await;
@@ -1067,7 +1079,26 @@ fn spawn_body_worker(
                 match ensure_worker_connected(&credentials).await {
                     Ok(s) => session = Some(s),
                     Err(e) => {
-                        let _ = event_tx.send(ImapEvent::Error(format!("could not open a connection for this request: {e}"))).await;
+                        // Report against the specific request that hit this,
+                        // not a generic `Error`, so a `FetchBody` whose
+                        // connection attempt failed still gets a reply
+                        // `main.rs` can match against `current_body_req` and
+                        // use to clear "Loading message..." -- see
+                        // `ImapEvent::BodyFailed`'s doc. `BulkDownload` has
+                        // no single uid/req_id to attribute to, so it keeps
+                        // the generic `Error`.
+                        match cmd {
+                            WorkerCommand::FetchBody { uid, req_id, .. } => {
+                                let _ = event_tx.send(ImapEvent::BodyFailed {
+                                    uid,
+                                    req_id,
+                                    error: format!("could not open a connection for this request: {e}"),
+                                }).await;
+                            }
+                            WorkerCommand::BulkDownload { .. } => {
+                                let _ = event_tx.send(ImapEvent::Error(format!("could not open a connection for this request: {e}"))).await;
+                            }
+                        }
                         continue;
                     }
                 }
@@ -1082,7 +1113,7 @@ fn spawn_body_worker(
                         }
                         Err(e) => {
                             session = None; // let the next command's ensure_worker_connected retry
-                            let _ = event_tx.send(ImapEvent::Error(e.to_string())).await;
+                            let _ = event_tx.send(ImapEvent::BodyFailed { uid, req_id, error: e.to_string() }).await;
                         }
                     }
                 }

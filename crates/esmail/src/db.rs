@@ -88,6 +88,14 @@ pub enum DbCommand {
 pub enum DbEvent {
     SearchResult { headers: Vec<MailHeader> },
     MailFetched { header: MailHeader, body: String },
+    /// `FetchMail` (a cached search-result open) found no cached body --
+    /// typically because `MAX_CACHED_BODIES`'s LRU cap evicted it since it
+    /// was indexed, which is routine on a large mailbox. Carries `uid` (not
+    /// just a generic `Error`) so `main.rs` can tell this apart from an
+    /// unrelated DB error and fall back to a live `FetchBody` instead of
+    /// leaving "Loading message..." on screen forever -- see the root-cause
+    /// writeup on `main.rs`'s `DbEvent::MailFetchFailed` arm.
+    MailFetchFailed { uid: u32, error: String },
     SyncPlan { account_id: String, mailbox: String, plan: SyncPlan },
     Error(String),
 }
@@ -174,7 +182,7 @@ impl DbActor {
                             let _ = self.event_tx.blocking_send(DbEvent::MailFetched { header, body });
                         }
                         Err(e) => {
-                            let _ = self.event_tx.blocking_send(DbEvent::Error(e.to_string()));
+                            let _ = self.event_tx.blocking_send(DbEvent::MailFetchFailed { uid, error: e.to_string() });
                         }
                     }
                 }
@@ -664,6 +672,23 @@ mod tests {
         assert_eq!(header.uid, 1);
         assert_eq!(header.subject, "Subject 1");
         assert_eq!(body, "<p>hello</p>");
+    }
+
+    #[test]
+    fn fetch_mail_errors_when_metadata_is_cached_but_the_body_was_evicted() {
+        // Reproduces the scenario behind GitHub issue #13 ("Loading
+        // message..." stuck forever): `messages` has a row (from
+        // `index_headers`, or an `index_mail` whose body later fell out of
+        // `MAX_CACHED_BODIES`'s LRU cap -- routine on a mailbox bigger than
+        // the cap) but `bodies` doesn't, since `fetch_mail`'s query is an
+        // INNER JOIN across the two tables. This must return `Err` (mapped
+        // to `DbEvent::MailFetchFailed` in `run`, carrying the uid so
+        // `main.rs` can fall back to a live `FetchBody` instead of getting
+        // stuck) rather than panicking or silently returning nothing.
+        let conn = test_conn();
+        index_headers(&conn, "acc", "INBOX", &[test_header(1)]).unwrap();
+
+        assert!(fetch_mail(&conn, "acc", "INBOX", 1).is_err());
     }
 
     #[test]
