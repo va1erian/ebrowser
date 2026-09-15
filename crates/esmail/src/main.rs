@@ -1520,9 +1520,15 @@ impl eframe::App for EsMailApp {
                 });
             });
         } else {
-            egui::Panel::left("left_panel").resizable(true).default_size(300.0).show_inside(ui, |ui| {
+            // Mailbox tree (B8) as its own column, separate from the
+            // message-list column below -- previously both lived stacked in
+            // one narrow `left_panel`, which squeezed the tree into a
+            // `max_height(220.0)` scroll area regardless of how much vertical
+            // room the window actually had. As its own resizable panel, the
+            // tree gets the full column width and full available height.
+            egui::Panel::left("mailbox_panel").resizable(true).default_size(240.0).show_inside(ui, |ui| {
                 ui.heading("Mailboxes");
-                egui::ScrollArea::vertical().id_salt("mailboxes_scroll").max_height(220.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("mailboxes_scroll").show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                         // Deferred past the loop for the same reason as the
                         // message list below: fetch_headers needs &mut self,
@@ -1533,7 +1539,12 @@ impl eframe::App for EsMailApp {
                             let Some(full_name) = &row.full_name else {
                                 // A hierarchy node with no mailbox of its own
                                 // (see MailboxNode::full_name's doc) -- shown
-                                // as a plain, unclickable label.
+                                // as a plain, unclickable label. Also covers
+                                // a real `LIST`ed name the server marked
+                                // `\Noselect` (e.g. Gmail's `[Gmail]`) --
+                                // `mailbox_tree` leaves `full_name` unset for
+                                // those too, since neither can be
+                                // `SELECT`/`EXAMINE`d.
                                 ui.horizontal(|ui| {
                                     ui.add_space(row.depth as f32 * 14.0);
                                     ui.label(egui::RichText::new(&row.label).weak());
@@ -1564,11 +1575,17 @@ impl eframe::App for EsMailApp {
                         }
                     });
                 });
+            });
 
-                ui.separator();
-                let title = if self.search_results.is_some() { "Search Results" } else { "Inbox" };
+            // Message list, as its own column next to the mailbox tree.
+            egui::Panel::left("message_list_panel").resizable(true).default_size(320.0).show_inside(ui, |ui| {
+                let title = if self.search_results.is_some() {
+                    "Search Results".to_string()
+                } else {
+                    self.selected_mailbox.clone()
+                };
                 ui.horizontal(|ui| {
-                    ui.heading(title);
+                    ui.heading(&title);
                     if self.search_results.is_none() {
                         if ui.button("Refresh").clicked() {
                             self.fetch_headers(self.selected_mailbox.clone(), self.current_page);
