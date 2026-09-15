@@ -5,49 +5,61 @@ use esmail::{compose, config, db, idle_watch, imap, notify, render, screenshot, 
 #[cfg(target_os = "windows")]
 use esmail::tray;
 
-use egui_servo_webview::{
-    InterceptOutcome, NavigationPolicy, WebResourceRequest, WebView, WebViewConfig, WebViewHandler,
-    WebViewHost, WebViewSource,
+use egui_litehtml_webview::{
+    ImageRequest, InterceptOutcome, WebView, WebViewConfig, WebViewHandler, WebViewHost,
+    WebViewSource,
 };
 use imap::{ImapActor, ImapCommand, ImapEvent, MailHeader};
 use db::{DbActor, DbCommand, DbEvent};
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
-use egui_servo_webview::dpi::PhysicalSize;
 use secrecy::SecretString;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::mpsc;
 
-/// Navigation/interception policy for the single [`WebView`] esmail reuses to
-/// show every message body.
+/// Image-loading policy for the single [`WebView`] esmail reuses to show
+/// every message body.
 ///
-/// - Navigation is always denied: a clicked link is reported as
-///   [`egui_servo_webview::WebViewEvent::LinkClicked`] and opened in the
-///   system browser instead (see below), so the view showing untrusted mail
-///   HTML never navigates itself away from the message (B5 in PLAN.md).
-/// - Remote `http(s)` resources are blocked unless `allow_remote` is set,
-///   which the "Load remote images" button flips for the message currently
-///   showing. This is the real blocking mechanism B5 calls for — markup
-///   alone can't stop a network fetch, so `render.rs` leaves every remote
-///   URL in the message's HTML exactly as it was, and this is what actually
-///   decides whether the request happens at all.
+/// litehtml has no navigation concept at all (a message body view never
+/// "navigates" anywhere) -- every link click unconditionally becomes a
+/// [`egui_litehtml_webview::WebViewEvent::LinkClicked`], opened in the
+/// system browser (see below), which is the same behavior the Servo-backed
+/// predecessor had (it always denied in-view navigation and reported it the
+/// same way), just without a policy decision left to make.
+///
+/// Remote `http(s)` images are blocked unless `allow_remote` is set, which
+/// the "Load remote images" button flips for the message currently showing.
+/// This is the real blocking mechanism B5 calls for — markup alone can't
+/// stop a network fetch, so `render.rs` leaves every remote URL in the
+/// message's HTML exactly as it was, and this is what actually decides
+/// whether the request happens at all. Unlike the Servo-backed predecessor
+/// (which had its own browser-engine network stack to allow/deny), litehtml
+/// has none, so when a remote image *is* allowed, this handler fetches it
+/// itself with `ureq` and hands the bytes back via
+/// `InterceptOutcome::Serve` — there is no "let the engine fetch it"
+/// option to fall back on.
 struct MessageViewHandler {
     allow_remote: bool,
 }
 
 impl WebViewHandler for MessageViewHandler {
-    fn navigation(&mut self, _url: &egui_servo_webview::url::Url) -> NavigationPolicy {
-        NavigationPolicy::Deny
-    }
-
-    fn intercept(&mut self, request: &WebResourceRequest) -> InterceptOutcome {
-        if self.allow_remote {
-            return InterceptOutcome::Allow;
+    fn intercept(&mut self, request: &ImageRequest) -> InterceptOutcome {
+        if !self.allow_remote {
+            return InterceptOutcome::Block;
         }
-        match request.url.scheme() {
-            "http" | "https" => InterceptOutcome::Block,
-            _ => InterceptOutcome::Allow,
+        match ureq::get(&request.url).call() {
+            Ok(response) => match response.into_body().read_to_vec() {
+                Ok(bytes) => InterceptOutcome::Serve(bytes),
+                Err(e) => {
+                    log::warn!("could not read remote image body {}: {e}", request.url);
+                    InterceptOutcome::Block
+                }
+            },
+            Err(e) => {
+                log::warn!("could not fetch remote image {}: {e}", request.url);
+                InterceptOutcome::Block
+            }
         }
     }
 }
@@ -65,10 +77,21 @@ struct Banner {
 }
 
 struct EsMailApp {
-    // Field order is drop order: the view must be torn down before the engine
-    // that backs it, so it stays declared above the host.
+    // Field order was drop order under the Servo-backed predecessor (the
+    // view had to be torn down before the engine backing it). litehtml's
+    // `WebViewHost` owns no engine/GL state any view actually depends on at
+    // drop time, so this no longer matters -- kept in this order anyway for
+    // minimal diff churn.
     web_view: WebView,
-    /// Owns the Servo engine; one per window. Outlives every view.
+    /// Creates views; see `egui_litehtml_webview::WebViewHost`'s own doc for
+    /// why this is little more than a texture-id counter now. Kept as a
+    /// field (rather than a local dropped right after `new_view`) for the
+    /// same reason it existed under the Servo-backed predecessor: a second
+    /// view (a compose preview, say) would be created from this same host,
+    /// so its lifetime should match the app's, not just the constructor's.
+    /// Unread today since nothing currently creates a second view --
+    /// allowed explicitly rather than silently dropping the field.
+    #[allow(dead_code)]
     web_view_host: WebViewHost,
     /// Bound to `web_view` at construction. Toggled per-message by the "Load
     /// remote images" button; reset to blocked whenever a new message is
@@ -298,7 +321,18 @@ impl EsMailApp {
                     .to_string(),
             ),
             Some("demo") => WebViewSource::Html(preview_demo_html()),
-            Some(target) if target.starts_with("http") => WebViewSource::Url(target.to_string()),
+            // litehtml has no network layer of its own (see
+            // egui-litehtml-webview's module doc) -- a URL preview target
+            // fetches synchronously with ureq and hands the result in as
+            // plain HTML, rather than a `WebViewSource::Url` variant that no
+            // longer exists.
+            Some(target) if target.starts_with("http") => match ureq::get(target).call() {
+                Ok(response) => match response.into_body().read_to_string() {
+                    Ok(html) => WebViewSource::Html(html),
+                    Err(e) => WebViewSource::Html(format!("<h1>could not read body of {target}</h1><p>{e}</p>")),
+                },
+                Err(e) => WebViewSource::Html(format!("<h1>could not fetch {target}</h1><p>{e}</p>")),
+            },
             Some(path) => match std::fs::read_to_string(path) {
                 Ok(html) => WebViewSource::Html(html),
                 Err(e) => WebViewSource::Html(format!("<h1>could not read {path}</h1><p>{e}</p>")),
@@ -350,10 +384,12 @@ impl EsMailApp {
             };
         let initial_status = "Ready".to_string();
 
-        // One engine per window; the view borrows it to start up. A second view
-        // (a compose preview, say) would come from this same host.
-        let web_view_host = WebViewHost::from_eframe(cc, PhysicalSize::new(1280, 720))
-            .expect("failed to initialise the Servo engine");
+        // One host per window; a second view (a compose preview, say) would
+        // come from this same host. litehtml's `pixbuf` backend needs
+        // nothing from `cc` (no window handle, no GL context -- see
+        // egui-litehtml-webview's `WebViewHost` doc), unlike the Servo-backed
+        // predecessor's `WebViewHost::from_eframe`, so this is infallible.
+        let web_view_host = WebViewHost::new();
         let message_view_handler = Rc::new(RefCell::new(MessageViewHandler { allow_remote: false }));
         let web_view = web_view_host.new_view(
             &cc.egui_ctx,
@@ -1352,8 +1388,9 @@ impl eframe::App for EsMailApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drive Servo once per frame, independent of how many views are drawn.
-        self.web_view_host.spin();
+        // litehtml's `pixbuf` backend has no engine/event loop to drive --
+        // unlike the Servo-backed predecessor, there is nothing to do here
+        // once per frame before the views are drawn.
 
         self.screenshotter.update(ui.ctx());
 
@@ -1386,9 +1423,12 @@ impl eframe::App for EsMailApp {
         if self.preview {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 for event in self.web_view.show(ui) {
-                    if let egui_servo_webview::WebViewEvent::LinkClicked(url) = event {
-                        log::info!("preview: link clicked -> {url}");
-                    }
+                    // `WebViewEvent` has one variant today (LinkClicked) --
+                    // matched with `let` rather than `if let` since the
+                    // latter is a no-op refutability check. Restore `if let`
+                    // if a second variant is ever added.
+                    let egui_litehtml_webview::WebViewEvent::LinkClicked(url) = event;
+                    log::info!("preview: link clicked -> {url}");
                 }
             });
             return;
@@ -1895,9 +1935,10 @@ impl eframe::App for EsMailApp {
 
                 let events = self.web_view.show(ui);
                 for event in events {
-                    if let egui_servo_webview::WebViewEvent::LinkClicked(url) = event {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    }
+                    // See the preview-mode match arm above for why this is
+                    // `let` rather than `if let`.
+                    let egui_litehtml_webview::WebViewEvent::LinkClicked(url) = event;
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
             });
         }
@@ -2214,22 +2255,19 @@ fn preview_demo_html() -> String {
     .to_string()
 }
 
-/// Install the logger, quietening Servo's known-benign chatter by default.
+/// Install the logger.
 ///
-/// These are engine-internal and not caused by (or fixable from) the embedder:
-///
-/// * `webrender::device::gl` warns "Cropping texture upload Box2D((0,0),(0,1))"
-///   six times while its GPU cache warms up over the first two paints, and
-///   reports missing optimised shader sources.
-/// * `profile_traits::mem` warns that the memory profiler thread disconnected,
-///   once per component, while Servo tears itself down on drop. This happens
-///   even when no webview is ever drawn.
-/// * `fontdb` complains about individual malformed fonts installed on the
-///   system, which says nothing about this application.
-///
-/// Setting RUST_LOG overrides all of it, so nothing is permanently hidden.
+/// Was also quietening Servo's own known-benign log chatter
+/// (`webrender::device::gl`, `profile_traits::mem`) by default under the
+/// Servo-backed predecessor; neither crate is linked any more (litehtml's
+/// `pixbuf` backend is pure CPU, no GPU/compositor layer of its own to log
+/// from), so that filtering was dropped rather than kept as a no-op.
+/// `fontdb` (a `cosmic-text` dependency, still linked) can still complain
+/// about individual malformed fonts installed on the system, which says
+/// nothing about this application -- `RUST_LOG` overrides the default if
+/// that gets noisy.
 fn init_logging() {
-    const QUIET: &str = "warn,webrender::device::gl=error,profile_traits::mem=error,fontdb=error";
+    const QUIET: &str = "warn,fontdb=error";
 
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| QUIET.to_string());
     let _ = env_logger::Builder::new().parse_filters(&filter).try_init();

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/egui-servo-webview", "crates/esmail", "crates/mail-mock-server"]
+members = ["crates/egui-litehtml-webview", "crates/esmail", "crates/mail-mock-server"]
 resolver = "3"
 
 [workspace.package]
@@ -13,15 +13,13 @@ eframe = { version = "0.34.1", default-features = false, features = ["glow", "de
 egui = "0.34.1"
 egui_glow = "0.34.1"
 
-# Web engine
-servo = { version = "0.1" }
-dpi = "0.1"
-# Pinned to what servo-embedder-traits depends on, so WebResourceResponse's
-# StatusCode/HeaderMap are the same type as ours.
-http = "1.4"
-raw-window-handle = "0.6"
-euclid = "0.22"
-keyboard-types = "0.8"
+# HTML/CSS rendering engine for message bodies (litehtml migration -- see
+# PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML
+# email anyway, and dropping the JS engine (Servo) is what makes the binary
+# dramatically smaller. `va1erian/litehtml-rs`'s `master` branch carries a
+# Windows/MSVC build fix on top of upstream `franzos/litehtml-rs`, found and
+# merged in a prior session -- not yet released upstream, hence the git dep.
+litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", features = ["pixbuf", "email"] }
 
 # Async / IO
 tokio = { version = "1", features = ["full"] }
@@ -70,8 +68,17 @@ url = "2.5"
 log = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
-# Screenshot dumps; pinned to the version servo already pulls in.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Screenshot dumps and message-body inline images. `["png"]` was pinned
+# narrower only because that's what Servo happened to pull in -- litehtml
+# doesn't constrain this at all, and attachments/inline images are commonly
+# jpeg/gif too.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+# Synchronous HTTP client. litehtml has no network layer of its own by
+# design (see the `litehtml` dependency above) -- this is what main.rs uses
+# to fetch a dev-only ESMAIL_PREVIEW=<http url> page, and what
+# MessageViewHandler uses to fetch a remote image once the user has opted
+# in via "Load remote images" (B5 in PLAN.md).
+ureq = "3"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

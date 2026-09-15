@@ -6,12 +6,11 @@
 //! * **F12** — writes `esmail-screenshot-<n>.png` into the current directory.
 //! * **`ESMAIL_SCREENSHOT=<path>`** — captures automatically once the UI has
 //!   settled and then exits. `ESMAIL_SCREENSHOT_FRAMES` (default 30) controls
-//!   how many frames to let pass first, which matters because Servo needs a
-//!   few frames before it has painted a page.
+//!   how many frames to let pass first.
 //!
 //! The capture goes through egui's own `ViewportCommand::Screenshot`, so it is
-//! the composited window — egui chrome *and* the blitted webview — not just
-//! the page.
+//! the composited window — egui chrome *and* the webview's texture — not
+//! just the page.
 
 use std::path::PathBuf;
 
