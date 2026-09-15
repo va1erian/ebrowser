@@ -238,6 +238,7 @@ impl WebViewHost {
             content_height: DEFAULT_VIEWPORT_HEIGHT as f32,
             pixels_per_point: scale,
             dirty: true,
+            total_images_loaded: 0,
         }
     }
 }
@@ -300,6 +301,14 @@ pub struct WebView {
     /// the predecessor crate's frame-dirty gating in spirit even though the
     /// underlying engine is completely different.
     dirty: bool,
+    /// Cumulative count of `load_image_data` calls over this `WebView`'s
+    /// whole lifetime (i.e. across every message ever opened in it, not
+    /// just the current one) -- diagnostic only, logged by `relayout`. See
+    /// that method's doc: `PixbufContainer`'s internal decoded-image cache
+    /// is never purged (no eviction API exists to call), so this is a
+    /// proxy for how large that cache has grown, to see whether relayout
+    /// time correlates with it across a real session.
+    total_images_loaded: u64,
 }
 
 impl WebView {
@@ -384,22 +393,65 @@ impl WebView {
 
     /// Run the full measure -> resize -> draw -> resolve-images sequence
     /// described in the crate module doc.
+    ///
+    /// Instrumented with `log::debug!` timing at every phase -- diagnostic
+    /// for a live-usage report of multi-second freezes after browsing a
+    /// handful of messages. Enable with `RUST_LOG=egui_litehtml_webview=debug`.
+    /// The `total_images_loaded` count is the prime suspect: `PixbufContainer`
+    /// exposes no eviction API for its internal decoded-image cache (see
+    /// the crate's PLAN.md-tracked known limitation), so it's worth seeing
+    /// whether relayout time trends upward alongside it across messages in
+    /// the same run, rather than staying roughly flat.
     fn relayout(&mut self, ctx: &egui::Context) {
         let width = self.logical_width.max(1.0);
         let scale = self.pixels_per_point.max(0.1);
+        let t_total = std::time::Instant::now();
 
+        let t = std::time::Instant::now();
         let height = self.layout_only(width).unwrap_or(1.0);
-        self.resize_container(width, height, scale);
-        self.content_height = self.layout_and_draw(width).unwrap_or(height);
+        let t_measure = t.elapsed();
 
-        if self.load_pending_images() {
+        let t = std::time::Instant::now();
+        self.resize_container(width, height, scale);
+        let t_resize = t.elapsed();
+
+        let t = std::time::Instant::now();
+        self.content_height = self.layout_and_draw(width).unwrap_or(height);
+        let t_draw = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let images_loaded_this_pass = self.load_pending_images();
+        let t_images = t.elapsed();
+
+        let mut t_remeasure = std::time::Duration::ZERO;
+        let mut t_redraw = std::time::Duration::ZERO;
+        if images_loaded_this_pass {
+            let t = std::time::Instant::now();
             let height2 = self.layout_only(width).unwrap_or(self.content_height);
+            t_remeasure = t.elapsed();
+
             self.resize_container(width, height2, scale);
+
+            let t = std::time::Instant::now();
             self.content_height = self.layout_and_draw(width).unwrap_or(height2);
+            t_redraw = t.elapsed();
         }
 
+        let t = std::time::Instant::now();
         self.upload_texture(ctx);
+        let t_upload = t.elapsed();
+
         self.dirty = false;
+
+        log::debug!(
+            "relayout: total={:?} (measure={:?} resize={:?} draw={:?} \
+             resolve_images={:?} [loaded_any={images_loaded_this_pass}] \
+             remeasure={:?} redraw={:?} upload={:?}) html_len={} \
+             content_height={:.0} total_images_loaded={}",
+            t_total.elapsed(), t_measure, t_resize, t_draw, t_images,
+            t_remeasure, t_redraw, t_upload,
+            self.html.len(), self.content_height, self.total_images_loaded,
+        );
     }
 
     /// Parse + lay out (no draw) and return the content height. Used both
@@ -473,6 +525,7 @@ impl WebView {
             if let Some(bytes) = resolve_image_bytes(&url, &mut *self.handler.borrow_mut()) {
                 self.container.load_image_data(&url, &bytes);
                 any_loaded = true;
+                self.total_images_loaded += 1;
             }
         }
         any_loaded
