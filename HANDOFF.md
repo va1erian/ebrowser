@@ -161,7 +161,13 @@ to `show()`, the delegate, or sizing.
 
 Each of these cost real time. They are not hypothetical.
 
-### 3.1 Servo's hooks fail OPEN
+### 3.1 Servo's hooks fail OPEN — no longer applies
+
+Kept for the reasoning (and because the bug it describes is a good general
+lesson), but this is Servo-specific: litehtml has no navigation/resource
+hooks at all to fail open or closed (see PLAN.md's Track C — Servo → litehtml
+migration, "`WebViewHandler::navigation`/`NavigationPolicy` were dropped
+entirely"). Nothing here is live guidance for the current code.
 
 `NavigationRequest::drop` sends **allow**. An unhandled `WebResourceLoad` sends
 **DoNotIntercept**. Dropping either permits the thing you meant to block, and
@@ -174,7 +180,12 @@ navigation *and* emitting `LinkClicked`, so links opened twice. Fixed in
 A3 is precisely about doing this properly. Every path through your handler must
 end in an explicit `allow()` / `deny()` / `intercept()` / `cancel()`.
 
-### 3.2 Do NOT resize the offscreen rendering context
+### 3.2 Do NOT resize the offscreen rendering context — no longer applies
+
+Kept for the reasoning, but Servo-specific: litehtml's `pixbuf` backend has
+no `OffscreenRenderingContext` at all (it renders into an in-memory pixel
+buffer, not a GPU-backed rendering context), so there is nothing analogous
+to double-resize here. Nothing here is live guidance for the current code.
 
 `WebView::resize` already calls `resize_rendering_context` internally
 (`servo-0.1.0/webview.rs:393`). Calling `offscreen_ctx.resize()` yourself first
@@ -185,16 +196,26 @@ This was tried, looked plausible, compiled, changed no warning counts, and was
 caught only by the screenshot. There is a comment at the call site in
 `show()`. Leave it alone.
 
-### 3.3 `stop()` does not exist
+### 3.3 `stop()` does not exist — no longer applies
 
 `servo::WebView` in 0.1.0 has `load`, `reload`, `can_go_back`, `go_back(amount)`,
 `can_go_forward`, `go_forward(amount)` — but **no** `stop()`. Do not plan around
 cancelling an in-flight load. The only control points are up front.
 
-### 3.4 Field declaration order is drop order
+Kept for the reasoning, but Servo-specific: litehtml's rendering is
+synchronous (no async page load to be mid-flight when a `stop()` might be
+called), so there is no analogous gap in the current API.
+
+### 3.4 Field declaration order is drop order — no longer strictly matters
 
 In `EsMailApp`, `web_view` is declared **before** `web_view_host` on purpose: the
 view must be torn down before the engine backing it. Do not reorder.
+
+Servo-specific reasoning, now historical: litehtml's `WebViewHost` owns no
+engine/GL state any view actually depends on at drop time, so this ordering
+no longer matters functionally — see the comment at the field declaration in
+`crates/esmail/src/main.rs` (`EsMailApp`), which keeps the same order anyway
+for minimal diff churn rather than because it is still load-bearing.
 
 ### 3.5 `egui::Panel::top` is current; `TopBottomPanel` is deprecated
 
@@ -214,40 +235,53 @@ io.open(p, "w", encoding="utf-8", newline="\n").write(s)
 
 Prefer the Edit tool where you can.
 
-### 3.7 `rusqlite` must stay at 0.37
+### 3.7 `rusqlite` — the `0.37` pin no longer applies
 
-`servo-storage` depends on `rusqlite ^0.37`, which pins `libsqlite3-sys ^0.35`.
-`libsqlite3-sys` sets `links = "sqlite3"`, so Cargo permits exactly one copy in
-the graph. Bumping rusqlite makes the workspace unresolvable. Documented at the
-declaration in the root `Cargo.toml`.
+*(Resolved by deletion, not just historical: the constraint this section
+described is gone, and so is the pin itself.)*
 
-### 3.8 Servo's log noise is not yours
+This used to require staying at exactly `0.37`: `servo-storage` depended on
+`rusqlite ^0.37`, which pinned `libsqlite3-sys ^0.35`, and `libsqlite3-sys`
+sets `links = "sqlite3"` so Cargo permits exactly one copy in the graph —
+bumping rusqlite made the workspace unresolvable. Now that servo/
+servo-storage are gone from the dependency tree entirely (confirmed via
+`cargo tree -i libsqlite3-sys`, which shows only `esmail` depending on
+`rusqlite`), that constraint no longer applies. The root `Cargo.toml` now
+declares `rusqlite = { version = ">=0.37", ... }` with no upper bound; `cargo
+update -p rusqlite` resolves to a newer version (0.40.2 as of this writing)
+and the workspace builds and tests clean against it.
+
+### 3.8 Servo's log noise is not yours — no longer applies
 
 Six `webrender::device::gl` "Cropping texture upload" warnings during the first
 two paints are its GPU cache warming up. Seven `profile_traits::mem`
 "Disconnected" warnings at exit are Servo tearing itself down — they appear even
 when no view is ever drawn. Both were investigated and are not embedder bugs.
-`init_logging()` in `main.rs` filters them; `RUST_LOG` overrides it. Do not go
-hunting for them again.
 
-### 3.9 The exe needs `libEGL.dll` / `libGLESv2.dll` next to it, not just built
+Kept for the reasoning, but Servo-specific and already resolved at the
+source rather than just historical: neither `webrender` nor `profile_traits`
+is linked any more, so `init_logging()` in `main.rs` dropped the filtering
+for them (see that function's own doc comment for what replaced it —
+`fontdb`, a `cosmic-text`/litehtml dependency, is the one thing that can
+still be noisy, and is a different, unrelated crate).
 
-`ESMAIL_PREVIEW` screenshotting panics with `egl function was not loaded` at
-`surfman`'s `egl_bindings.rs` unless `libEGL.dll` and `libGLESv2.dll` are next
-to `esmail.exe` (or on `PATH`). Cargo does not copy them there. They exist
-untracked at the *repo* root (`C:\Users\hadri\Documents\repos\ebrowser`, one
-level above `src`) — copy them into `target/debug` (or `target/release`)
-before running the binary in a fresh worktree:
+### 3.9 GL/EGL runtime DLLs — no longer applies
 
-```bash
-cp "$(git rev-parse --show-toplevel)/../libEGL.dll" \
-   "$(git rev-parse --show-toplevel)/../libGLESv2.dll" ./target/debug/
-```
+*(Resolved by deletion: this section described a real runtime requirement
+under Servo that has no litehtml equivalent, not just historical color, so
+it is removed rather than kept — see PLAN.md's working convention of
+preserving reasoning only where it still explains something about the
+current code.)*
 
-This is the same untracked-DLL situation noted in [PLAN.md](PLAN.md)'s Risks
-section; that section still owns the packaging decision (gitignore vs. commit
-vs. fetch-at-build-time). This entry just saves you from re-diagnosing the
-panic.
+This used to require copying `libEGL.dll`/`libGLESv2.dll` next to
+`esmail.exe` before `ESMAIL_PREVIEW` screenshotting would work (Servo's
+`surfman` GL/EGL rendering path). litehtml's `pixbuf` backend is pure
+CPU/software — there is no GL/EGL dependency to ship, confirmed during the
+migration by running the same `ESMAIL_PREVIEW=demo` screenshot check
+successfully with neither DLL present next to the binary (see PLAN.md's
+Track C verification notes). The untracked-DLL packaging question this
+section pointed at in PLAN.md's Risks section is resolved the same way — see
+that section.
 
 ---
 
