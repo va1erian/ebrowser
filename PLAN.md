@@ -1687,6 +1687,31 @@ diverging):
   enough for `WebViewEvent::LinkClicked` without needing a persistent,
   self-referential `Document`/`PixbufContainer` pair.
 
+**Found and fixed in review, after the phases above landed:**
+
+- **The page background was transparent, not opaque white.**
+  `PixbufContainer::new_with_scale`'s own doc comment says it "initializes a
+  transparent pixmap" — unlike a real browser (or the Servo-backed
+  predecessor, which always painted an opaque white canvas), litehtml only
+  paints where CSS actually says to. A message with no explicit `body {
+  background }` (the overwhelming common case for real mail) showed
+  whatever egui panel color sat behind the texture bleeding through every
+  unpainted region — confirmed visually via `ESMAIL_PREVIEW=demo` against a
+  dark theme: plain text rendered dark-on-dark instead of dark-on-white.
+  Fixed in `WebView::upload_texture` by flattening the container's
+  premultiplied pixels onto opaque white before handing them to egui
+  (`out = src_channel + (255 - alpha)` per channel — the general "over"
+  formula collapses to this once the background is pure white), rather than
+  trying to get litehtml to paint a canvas background it has no concept of.
+- **Zero unit tests, despite the approved plan asking for pure-logic
+  coverage mirroring the predecessor crate.** Extracted the pending-image
+  resolution decision (`data:` decode / unmatched `cid:` passthrough /
+  `handler.intercept` for everything else) out of `load_pending_images` into
+  a pure `resolve_image_bytes` function and added 4 unit tests covering it
+  (data-URI decode, unmatched-`cid:` never reaching the handler, a remote
+  URL being handed to the handler and its `Serve` bytes applied, and
+  `Allow`/`Block` both resolving to nothing).
+
 **Known limitation — `vh` CSS units are relative to this render's own
 content height, not a real browser viewport.** `PixbufContainer` ties
 "viewport size" and "canvas size" to the same `resize_with_scale` call, and
@@ -1707,13 +1732,22 @@ for the full reasoning.
 
 **What did not land / deliberately out of scope for this pass:**
 
-- **Text selection (Phase 4)** — `litehtml::selection::Selection` and
-  `PixbufContainer::draw_selection_rects` exist in the vendored crate and are
-  untouched; nothing in this pass wires them up, per the plan's explicit
-  scoping. The one-shot-render design (fresh `Document` per interaction, not
-  a persisted one) will need revisiting for this, since a drag-select
-  gesture needs the same `Document` alive across a sequence of frames, not
-  just for one instantaneous click.
+- **Text selection (Phase 4) — investigated, confirmed real, not wired
+  up.** `litehtml::selection::Selection` is a genuine, working, well-tested
+  API in the vendored crate (`start_at`/`extend_to`/`clear`/`is_active`/
+  `selected_text`/`rectangles`, 20+ of the crate's own unit tests exercising
+  it), and `PixbufContainer::draw_selection_rects` exists to paint the
+  resulting highlight — this is a real functional capability litehtml has
+  that Servo's pinned 0.1.0 never did (see issue #21: Servo never fires a
+  repaint in response to a selection drag at all, root-caused to the engine
+  itself having no selection-UI implementation, still true as of Servo
+  0.5.0 per that issue's own investigation). Nothing in this pass wires it
+  up, per the plan's explicit scoping — the one-shot-render design (fresh
+  `Document` per interaction, not a persisted one) will need revisiting for
+  this specifically, since a drag-select gesture needs the same `Document`
+  alive across a sequence of frames (mousedown through mouseup), not just
+  for one instantaneous click the way link-detection's hit-test `Document`
+  is used today.
 - **Hover cursor / `:hover` styling** — `PixbufContainer::cursor()` and
   `Document::on_mouse_over` exist but are not called; only click (not
   hover/move) triggers a `Document` build. Not required by any current
@@ -1731,28 +1765,33 @@ for the full reasoning.
 **Verification actually run:** `cargo check --workspace` (clean, no
 warnings, `--examples --tests` too), `cargo test --workspace`
 (`ESMAIL_TEST_CA_TRUSTED=1`) — 115 `esmail` lib tests + 10 `main.rs` tests +
-15 `mail-mock-server` integration tests (2 `#[ignore]`d stress tests) + 2
-`mail-mock-server` lib tests + 2 smoke tests, all passing, none of them
-exercising litehtml itself (none existed before this pass either — the
-widget crate has no unit tests of its own yet, same as the gap this
-migration inherited rather than introduced). `ESMAIL_PREVIEW=demo
+**4 `egui-litehtml-webview` unit tests** (added in review, see above) + 15
+`mail-mock-server` integration tests (2 `#[ignore]`d stress tests) + 2
+`mail-mock-server` lib tests + 2 smoke tests, all passing. `ESMAIL_PREVIEW=demo
 ESMAIL_SCREENSHOT=... ESMAIL_SCREENSHOT_FRAMES=90` against the debug binary,
-twice — the first screenshot caught the `master_css` bug above, the second
-(after the fix) shows correct layout: heading, accented UTF-8 text, the
-link, the `From`/`Subject` table, and the `.tall` gradient block extending
-well past the visible window (confirming the `ScrollArea` has real content
-to scroll, replacing the old overlay-scrollbar polling entirely). `cargo
-build --release --bin esmail` succeeded; the resulting `esmail.exe` is
-**12,817,920 bytes (≈12.2 MiB)** — down from Servo's 100-300MB+DLLs, though
-larger than the 3.96MB fully-static build measured in the prior
-hands-on-validation session (that number came from a minimal standalone
-binary linking only `litehtml`/`tiny-skia`/`cosmic-text`, not the full
-`esmail` binary with `rusqlite` bundled, `eframe`/`egui_glow`, async-imap/
-tokio, keyring backends, etc. all still linked in). Not verified: the
-`libEGL.dll`/`libGLESv2.dll` copy step in HANDOFF.md §3.9 is confirmed
-*unnecessary* now (the screenshot run above succeeded without them present
-next to the binary) — litehtml's `pixbuf` backend is pure CPU, no
-GL/EGL dependency at all.
+three times across the two review passes — the first caught the
+`master_css` bug above, the second (after that fix) caught the transparent-
+background bug above (visible only because the demo screenshot happened to
+run against a dark theme — a lighter theme would have hidden it), the third
+(after both fixes) matches the pre-migration Servo baseline pixel-for-pixel
+in layout: heading, accented UTF-8 text, the link, the `From`/`Subject`
+table, and the `.tall` block extending well past the visible window
+(confirming the `ScrollArea` has real content to scroll, replacing the old
+overlay-scrollbar polling entirely) all render correctly against an opaque
+white page background. `cargo build --release --bin esmail` succeeded; the
+resulting `esmail.exe` is **12,817,920 bytes (≈12.2 MiB)** — down from
+Servo's 100-300MB+DLLs, though larger than the 3.96MB fully-static build
+measured in the prior hands-on-validation session (that number came from a
+minimal standalone binary linking only `litehtml`/`tiny-skia`/`cosmic-text`,
+not the full `esmail` binary with `rusqlite` bundled, `eframe`/`egui_glow`,
+async-imap/tokio, keyring backends, etc. all still linked in). Not verified:
+the `libEGL.dll`/`libGLESv2.dll` copy step in HANDOFF.md §3.9 is confirmed
+*unnecessary* now (the screenshot runs above all succeeded without them
+present next to the binary) — litehtml's `pixbuf` backend is pure CPU, no
+GL/EGL dependency at all. (Phase 5 removes this section from HANDOFF.md
+properly, along with the now-unnecessary Servo-era CI/Docker package lists
+and the `rusqlite` version pin that existed only to unify with
+`servo-storage`'s own requirement — in progress as of this writing.)
 
 ## Risks
 
