@@ -716,7 +716,8 @@ impl EsMailApp {
                     // ImapEvent::Error path), it doesn't reopen the compose
                     // window or otherwise imply the send itself failed,
                     // since it didn't.
-                    let _ = self.imap_tx.try_send(ImapCommand::Append { mailbox: SENT_MAILBOX.to_string(), raw });
+                    let mailbox = self.special_use_mailbox(imap::SpecialUse::Sent, SENT_MAILBOX);
+                    let _ = self.imap_tx.try_send(ImapCommand::Append { mailbox, raw });
                 }
                 smtp::SmtpEvent::Error(e) => {
                     self.compose_status = format!("Send failed: {e}");
@@ -932,6 +933,38 @@ impl EsMailApp {
         }
     }
 
+    /// The real mailbox for a special-use role (B8's `imap::SpecialUse`
+    /// discovery -- real `LIST` attributes with a name-based fallback,
+    /// already used to sort/label the mailbox tree), falling back to
+    /// `default` when no mailbox in the account currently classifies as
+    /// that role -- e.g. before `Mailboxes` has arrived at all, or a server
+    /// that advertises no special-use attributes and has no
+    /// conventionally-named folder either. This is what closes the gap
+    /// `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX`'s own doc comments
+    /// named: those hardcoded names are now only the fallback, not the only
+    /// option, so an account whose folders aren't literally named "Sent"/
+    /// "Trash"/"Archive" (Gmail's `[Gmail]/Sent Mail`, say) gets its real
+    /// folder instead of a spurious new top-level mailbox.
+    fn special_use_mailbox(&self, want: imap::SpecialUse, default: &str) -> String {
+        find_special_use_mailbox(&self.mailbox_rows, want, default)
+    }
+
+    /// Archive every target in [`Self::action_targets`] to the account's
+    /// real Archive mailbox (special-use-discovered, falling back to
+    /// `ARCHIVE_MAILBOX`).
+    fn archive_selection(&mut self) {
+        let dest = self.special_use_mailbox(imap::SpecialUse::Archive, ARCHIVE_MAILBOX);
+        self.move_selection(&dest);
+    }
+
+    /// Delete (move to Trash) every target in [`Self::action_targets`], to
+    /// the account's real Trash mailbox (special-use-discovered, falling
+    /// back to `TRASH_MAILBOX`).
+    fn delete_selection(&mut self) {
+        let dest = self.special_use_mailbox(imap::SpecialUse::Trash, TRASH_MAILBOX);
+        self.move_selection(&dest);
+    }
+
     /// Fill the login form from a saved account and pull its password back
     /// out of the OS keyring, if there is one.
     fn select_account(&mut self, account: &AccountConfig) {
@@ -1102,10 +1135,10 @@ impl EsMailApp {
             }
         }
         if archive {
-            self.move_selection(ARCHIVE_MAILBOX);
+            self.archive_selection();
         }
         if delete {
-            self.move_selection(TRASH_MAILBOX);
+            self.delete_selection();
         }
         if star {
             self.toggle_star_on_selection();
@@ -1613,10 +1646,10 @@ impl eframe::App for EsMailApp {
                         self.store_flags_on_selection(vec![], vec![imap::FLAG_FLAGGED.to_string()]);
                     }
                     if ui.button("Archive").clicked() {
-                        self.move_selection(ARCHIVE_MAILBOX);
+                        self.archive_selection();
                     }
                     if ui.button("Delete").clicked() {
-                        self.move_selection(TRASH_MAILBOX);
+                        self.delete_selection();
                     }
                 });
 
@@ -1750,10 +1783,10 @@ impl eframe::App for EsMailApp {
                                     self.store_flags_on_selection(vec![], vec![imap::FLAG_SEEN.to_string()]);
                                 }
                                 if ui.button("Archive").clicked() {
-                                    self.move_selection(ARCHIVE_MAILBOX);
+                                    self.archive_selection();
                                 }
                                 if ui.button("Delete").clicked() {
-                                    self.move_selection(TRASH_MAILBOX);
+                                    self.delete_selection();
                                 }
                             });
                         });
@@ -1832,17 +1865,18 @@ const NEW_MAIL_POLL_MAILBOX: &str = "INBOX";
 /// How often `spawn_new_mail_watch` asks `ImapActor` to check
 /// [`NEW_MAIL_POLL_MAILBOX`] for new mail.
 const NEW_MAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-/// Where a sent message is `APPEND`ed after sending (B7). A hardcoded name
-/// rather than `\Sent` special-use-flag discovery with a name-based
-/// fallback -- see `ImapCommand::Append`'s doc in imap.rs and PLAN.md §B7
-/// for the real gap this leaves (an account whose Sent folder isn't
-/// literally named "Sent" gets a new mailbox silently created instead).
+/// Fallback for where a sent message is `APPEND`ed after sending (B7), used
+/// only when [`EsMailApp::special_use_mailbox`] finds no `\Sent`-classified
+/// mailbox (via real `LIST` attributes or the name-based fallback in
+/// `imap::SpecialUse::from_name`) in the account -- e.g. before
+/// `FetchMailboxes`'s reply has arrived at all. See issue #9: this constant
+/// used to be the *only* destination, silently creating a new top-level
+/// mailbox on any account whose Sent folder wasn't literally named "Sent"
+/// (Gmail's `[Gmail]/Sent Mail`, say).
 const SENT_MAILBOX: &str = "Sent";
-/// Delete-to-Trash's destination (B8). Same hardcoded-name-not-special-use-
-/// discovery gap as `SENT_MAILBOX` above -- see `imap::SpecialUse` for the
-/// real special-use/name-fallback classification `mailbox_tree` (the
-/// left-panel tree) uses; this constant is only where "Delete" sends a
-/// message, independent of how the tree renders it.
+/// Delete-to-Trash's fallback destination (B8). Same
+/// only-used-when-special-use-discovery-comes-up-empty caveat as
+/// `SENT_MAILBOX` above.
 const TRASH_MAILBOX: &str = "Trash";
 /// Archive's destination (B8). Same caveat as `TRASH_MAILBOX`.
 const ARCHIVE_MAILBOX: &str = "Archive";
@@ -2049,6 +2083,20 @@ fn select_range(list: &[MailHeader], anchor: u32, uid: u32) -> std::collections:
     }
 }
 
+/// The real mailbox name for a special-use role, from whichever
+/// `MailboxRow` in `rows` classifies as `want` -- pure half of
+/// `EsMailApp::special_use_mailbox`, pulled out so it's testable without
+/// constructing a whole `EsMailApp`. Falls back to `default` if no row
+/// matches (e.g. before `Mailboxes` has arrived, or a server that
+/// advertises no special-use attributes and has no conventionally-named
+/// folder for `want` either -- see `imap::SpecialUse::from_name`).
+fn find_special_use_mailbox(rows: &[imap::MailboxRow], want: imap::SpecialUse, default: &str) -> String {
+    rows.iter()
+        .find(|row| row.special_use == Some(want))
+        .and_then(|row| row.full_name.clone())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// A human-readable size, e.g. `"4.2 KB"`. Only goes up to MB since a mail
 /// attachment in the GB range would be unusual enough to want the exact byte
 /// count anyway.
@@ -2178,6 +2226,35 @@ mod tests {
             safe_attachment_filename(r"C:\Windows\System32\evil.dll"),
             "evil.dll"
         );
+    }
+
+    // ── find_special_use_mailbox ─────────────────────────────────────────────
+
+    fn row(full_name: Option<&str>, special_use: Option<imap::SpecialUse>) -> imap::MailboxRow {
+        imap::MailboxRow { depth: 0, label: full_name.unwrap_or("").to_string(), full_name: full_name.map(str::to_string), special_use }
+    }
+
+    #[test]
+    fn find_special_use_mailbox_prefers_a_classified_mailbox_over_the_default() {
+        // Regression test for issue #9: Gmail's Sent folder is
+        // "[Gmail]/Sent Mail", not "Sent" -- special-use discovery must
+        // pick the real name over the hardcoded fallback.
+        let rows = vec![
+            row(Some("INBOX"), Some(imap::SpecialUse::Inbox)),
+            row(Some("[Gmail]/Sent Mail"), Some(imap::SpecialUse::Sent)),
+        ];
+        assert_eq!(find_special_use_mailbox(&rows, imap::SpecialUse::Sent, "Sent"), "[Gmail]/Sent Mail");
+    }
+
+    #[test]
+    fn find_special_use_mailbox_falls_back_to_default_when_nothing_matches() {
+        let rows = vec![row(Some("INBOX"), Some(imap::SpecialUse::Inbox))];
+        assert_eq!(find_special_use_mailbox(&rows, imap::SpecialUse::Trash, "Trash"), "Trash");
+    }
+
+    #[test]
+    fn find_special_use_mailbox_falls_back_when_mailboxes_have_not_loaded_yet() {
+        assert_eq!(find_special_use_mailbox(&[], imap::SpecialUse::Archive, "Archive"), "Archive");
     }
 
     #[test]
