@@ -4,38 +4,66 @@ Read this before touching anything. [PLAN.md](PLAN.md) is the full design; this
 is what you need to actually work, plus the mistakes already made so you do not
 repeat them.
 
-**Phase 7 is now essentially done.** A5 is fully done; A6, A7, B8, and B9
-are each landed or partially landed — see §5's table and their own PLAN.md
-sections. Phases 0-2, B1, B5, B10, B11 (IMAP push), B2's worker-session
-split, B3's incremental-fetch half, and B7's `APPEND`-to-Sent half are
-done. B3 (its UID-based cache-paging half), B4, B6, B7 (its still-open
-pieces), A6, B8, and B9 are each partially done — see their PLAN.md
-sections for exactly what landed vs. what's deliberately deferred.
+**The webview engine changed: Servo is gone, replaced by litehtml.** See
+[PLAN.md](PLAN.md)'s "Track C — Servo → litehtml migration" section for the
+full story. `crates/egui-servo-webview` no longer exists — it was deleted,
+not feature-flagged, in favor of `crates/egui-litehtml-webview`, a JS-less
+HTML/CSS renderer (no legitimate mail client executes JS in HTML email, and
+dropping the JS engine — the single largest component of any full browser
+engine — is what makes the binary dramatically smaller: ~12.2 MiB release
+`esmail.exe`, vs. Servo's 100-300MB+DLLs). **Everything below this notice
+that mentions Servo, `egui-servo-webview`, A3/A5/A6's resource-interception/
+input-forwarding/rendering-path work, or the overlay scrollbar (issue
+#15/#22) describes that now-deleted crate** — kept for historical reasoning
+per this file's own established convention (nothing here has ever been
+deleted just because it stopped being current work), not as work remaining.
+Track C's own "what landed / what did not" writeup in PLAN.md is the
+current source of truth for the webview layer.
 
-**Your next task is one of the small mechanical follow-ups phase 7 itself
-surfaced, or picking up a still-open item from an earlier phase** — nothing
-here blocks anything else, so pick whichever is most useful:
-- **B7's `\Sent`/`\Trash`/`\Archive` wiring.** B8 built the special-use
-  discovery infrastructure B7 was waiting on (`imap::SpecialUse`, from real
-  `LIST` attributes with a name-based fallback) but did not wire it into
-  `main.rs`'s hardcoded `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX`
-  constants — that's now a small, mechanical follow-up rather than a
-  research question. Drafts (`APPEND` with `\Draft`), a real retry queue,
-  rich-text composing, and recipient autocomplete are still open too.
-- **B9's per-operation progress** (generalizing `download_progress`) —
-  deliberately left for its own commit until B8's concurrent `main.rs`
-  changes landed; they now have, so this is unblocked.
-- **B8's IDLE-on-selected-mailbox.** B11's `idle_watch` already covers
-  "new-mail push" but stays INBOX-only, same as B10 — see §B8 for the full
-  "what landed / what didn't" writeup. A real collapsible mailbox-tree
-  widget (currently a flat indented list) and wiring `is:unread` into
-  search (B4's gap) are noted there too.
-- **A6's zero-copy GL blit** (see its PLAN.md section for why it was
-  reverted) — real, deep surgery on shared GL contexts between Servo and
-  eframe's `glutin` context, not a quick follow-up.
-- Any of B3/B4/B6/B7's still-open live-IMAP-protocol pieces (UID-based
-  cache paging, server-side `UID SEARCH`, lazy `BODY.PEEK[n]`) — all
-  verifiable now via `crates/mail-mock-server`, see below.
+**Your next task, now that Track C's core migration (Phases 0-3) has
+landed:**
+- **Track C Phase 4 — text selection.** Investigated and confirmed real:
+  litehtml has a genuine, working, well-tested `Selection` API
+  (`start_at`/`extend_to`/`selected_text`/`rectangles`, 20+ upstream unit
+  tests) that Servo's pinned 0.1.0 never had working at all (see the old
+  issue #21 this superseded). Not yet wired into
+  `egui-litehtml-webview` — needs the one-shot-render design (a fresh
+  `Document` per interaction) revisited, since a drag-select gesture needs
+  the same `Document` alive across a sequence of frames. See PLAN.md's
+  Track C section for the full detail.
+- **Track C Phase 5 — CI/Docker/`rusqlite` cleanup.** The Servo-era apt
+  package lists in `.github/workflows/*.yml`/`Dockerfile.*` (nasm, Mesa/EGL
+  dev packages, GStreamer, etc.) and the `rusqlite = "0.37"` pin (which
+  existed only to unify with `servo-storage`'s own requirement) are both
+  now-unnecessary leftovers.
+- **Track C Phase 6 — rewrite this file's/PLAN.md's Servo-era framing**
+  once Phase 4/5 land, so a fresh reader doesn't have to mentally
+  find-and-replace "Servo" with "litehtml" through the older sections below.
+- **Everything below this notice from the pre-migration phase-7 backlog is
+  still open and unaffected by the webview swap** (it's all IMAP/SMTP/DB
+  layer work, orthogonal to which engine renders a message body) — pick
+  whichever is most useful:
+  - **B7's `\Sent`/`\Trash`/`\Archive` wiring.** B8 built the special-use
+    discovery infrastructure B7 was waiting on (`imap::SpecialUse`, from real
+    `LIST` attributes with a name-based fallback) but did not wire it into
+    `main.rs`'s hardcoded `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX`
+    constants — that's now a small, mechanical follow-up rather than a
+    research question. Drafts (`APPEND` with `\Draft`), a real retry queue,
+    rich-text composing, and recipient autocomplete are still open too.
+  - **B9's per-operation progress** (generalizing `download_progress`) —
+    deliberately left for its own commit until B8's concurrent `main.rs`
+    changes landed; they now have, so this is unblocked.
+  - **B8's IDLE-on-selected-mailbox.** B11's `idle_watch` already covers
+    "new-mail push" but stays INBOX-only, same as B10 — see §B8 for the full
+    "what landed / what didn't" writeup. A real collapsible mailbox-tree
+    widget (currently a flat indented list) and wiring `is:unread` into
+    search (B4's gap) are noted there too.
+  - Any of B3/B4/B6/B7's still-open live-IMAP-protocol pieces (UID-based
+    cache paging, server-side `UID SEARCH`, lazy `BODY.PEEK[n]`) — all
+    verifiable now via `crates/mail-mock-server`, see below.
+
+  (A6's zero-copy GL blit and A3/A5's Servo-specific input/resource-hook
+  work are no longer applicable at all — that engine is gone.)
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
@@ -97,14 +125,17 @@ Branch `claude/esmail-implementation-plan-a05e38` (this worktree's own —
 text, was an earlier worktree whose work is long since merged). The layout:
 
 ```
-Cargo.toml                            workspace root
-crates/egui-servo-webview/src/lib.rs  the widget
-crates/esmail/src/main.rs             the app
-crates/esmail/src/imap.rs             IMAP actor
-crates/esmail/src/idle_watch.rs       dedicated IMAP IDLE connection (B11)
-crates/esmail/src/db.rs               SQLite actor
-crates/esmail/src/screenshot.rs       screenshot dumps
-crates/mail-mock-server/              in-process IMAP+SMTP server for tests
+Cargo.toml                               workspace root
+crates/egui-litehtml-webview/src/lib.rs  the widget (litehtml-backed; see
+                                          PLAN.md's Track C for why this
+                                          replaced the Servo-backed
+                                          egui-servo-webview)
+crates/esmail/src/main.rs                the app
+crates/esmail/src/imap.rs                IMAP actor
+crates/esmail/src/idle_watch.rs          dedicated IMAP IDLE connection (B11)
+crates/esmail/src/db.rs                  SQLite actor
+crates/esmail/src/screenshot.rs          screenshot dumps
+crates/mail-mock-server/                 in-process IMAP+SMTP server for tests
 crates/esmail/tests/imap_smtp_integration.rs  drives the app against it
 ```
 
@@ -113,7 +144,8 @@ Commands, with real timings on this machine:
 ```bash
 cargo check --workspace          # ~2s warm, ~2min cold
 cargo test --workspace           # ~5s warm; run this, not just the widget's own tests
-cargo build --bin esmail         # ~25s warm, ~3min cold
+cargo build --bin esmail         # ~25s warm, well under a minute cold now that
+                                  # the widget is litehtml-backed, not Servo
 ```
 
 `cargo test --workspace` needs `mail-mock-server`'s test CA trusted once per
@@ -121,8 +153,11 @@ machine and `ESMAIL_TEST_CA_TRUSTED=1` set to actually run the integration
 suite against it rather than skip with a note — see
 `crates/mail-mock-server/README.md`; already done in this worktree.
 
-A cold build compiles Servo and takes minutes. Run long builds in the
-background rather than blocking on them.
+A cold build no longer compiles Servo (see PLAN.md's Track C) — litehtml is
+a much smaller C++ dependency, and a cold build should be minutes faster
+than the old "Servo takes minutes" baseline this line used to warn about.
+Still worth running long builds in the background rather than blocking on
+them out of habit.
 
 ---
 
