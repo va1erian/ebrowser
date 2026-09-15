@@ -274,6 +274,13 @@ struct Delegate {
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _webview: ServoWebView) {
+        // Diagnostic for issue #21: if a text-selection drag never
+        // produces one of these, Servo itself never repainted in response
+        // to the selection (cursor icon changing separately just proves
+        // hover/hit-testing works, not that a selection highlight was
+        // ever computed/painted) -- that would point at Servo's own
+        // selection machinery, not this crate's readback path below.
+        log::debug!("notify_new_frame_ready fired -- marking frame_dirty");
         self.frame_dirty.set(true);
         self.egui_ctx.request_repaint();
     }
@@ -704,9 +711,16 @@ impl WebView {
         );
 
         if self.frame_dirty.get() {
+            // Diagnostic for issue #21: pairs with `notify_new_frame_ready`'s
+            // log above. If that fires but this doesn't (or `rgba` comes
+            // back `None`/zero-sized), the framebuffer readback itself is
+            // the gap -- Servo signaled a repaint but we never actually
+            // pulled the new pixels (or pulled an empty/stale surface).
+            log::debug!("frame_dirty -- re-reading framebuffer");
             if let Some(rgba) = self.offscreen_ctx.read_to_image(read_rect) {
                 let w = rgba.width() as usize;
                 let h = rgba.height() as usize;
+                log::debug!("read_to_image returned {w}x{h}");
                 if w > 0 && h > 0 {
                     let color_image =
                         egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
@@ -723,7 +737,11 @@ impl WebView {
                             ));
                         }
                     }
+                } else {
+                    log::debug!("read_to_image returned a zero-sized image, texture not updated");
                 }
+            } else {
+                log::debug!("read_to_image returned None, texture not updated");
             }
             self.frame_dirty.set(false);
         }
@@ -875,6 +893,14 @@ impl WebView {
                     resp.request_focus();
                 }
                 for (_, servo_button) in &buttons_down {
+                    // Diagnostic for issue #21 (text selection/copy not
+                    // working): confirms whether a mousedown that should
+                    // start a drag-select actually reaches Servo at all, and
+                    // at what device-pixel coordinate. `log::debug!` so it's
+                    // opt-in via `RUST_LOG=egui_servo_webview=debug` rather
+                    // than on by default (`main.rs::init_logging`'s default
+                    // filter is `warn`).
+                    log::debug!("forwarding MouseButton::Down({servo_button:?}) at {dp:?}");
                     self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Down,
@@ -883,6 +909,7 @@ impl WebView {
                         )));
                 }
                 for (_, servo_button) in &buttons_up {
+                    log::debug!("forwarding MouseButton::Up({servo_button:?}) at {dp:?}");
                     self.servo_view
                         .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             MouseButtonAction::Up,
@@ -890,6 +917,18 @@ impl WebView {
                             dp,
                         )));
                 }
+            } else if !buttons_down.is_empty() || !buttons_up.is_empty() {
+                // A button transition happened but the guard above
+                // suppressed it (outside the widget and not dragging, over
+                // the scrollbar, or the scrollbar itself is being dragged) —
+                // logged because "nothing happened" and "the event was
+                // silently dropped here" look identical from the outside,
+                // and issue #21's investigation specifically flagged this
+                // guard as a place a real drag could get lost.
+                log::debug!(
+                    "suppressed MouseButton event(s) at {pos:?}: in_bounds={} dragged={} scrollbar_dragging={} over_scrollbar={}",
+                    widget_rect.contains(pos), resp.dragged(), scrollbar_dragging, over_scrollbar(pos)
+                );
             }
         }
 
@@ -901,10 +940,21 @@ impl WebView {
             {
                 if self.last_mouse_pos != Some(pos) {
                     let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
+                    // `trace!`, not `debug!` -- this fires on every changed
+                    // position while dragging, which would otherwise flood
+                    // the log. Enable with `RUST_LOG=egui_servo_webview=trace`
+                    // to see the full move sequence for a drag-select attempt
+                    // (issue #21) alongside the Down/Up `debug!` lines above.
+                    log::trace!("forwarding MouseMove to {dp:?}");
                     self.servo_view
                         .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(dp)));
                     self.last_mouse_pos = Some(pos);
                 }
+            } else if resp.dragged() {
+                log::debug!(
+                    "suppressed MouseMove during a drag at {pos:?}: scrollbar_dragging={scrollbar_dragging} over_scrollbar={}",
+                    over_scrollbar(pos)
+                );
             }
         } else {
             // A5: tell the page the pointer left, so :hover state doesn't
@@ -949,6 +999,17 @@ impl WebView {
         // with the pointer merely resting over this widget leaked keystrokes
         // into the page underneath it.
         let has_focus = resp.has_focus();
+        // Diagnostic for issue #21: Ctrl/Cmd+C is only ever evaluated inside
+        // this `if has_focus` block, so if a drag-select never gives the
+        // widget egui focus (e.g. the click that started the drag landed
+        // outside `widget_rect`, or something else grabbed focus first),
+        // Copy is silently never even considered -- this line's absence in
+        // the log during a select-then-Ctrl+C attempt is itself the
+        // diagnostic. `trace!`, not `debug!`, since it fires every frame the
+        // widget lacks focus, which is routine and not itself interesting.
+        if !has_focus {
+            log::trace!("webview does not have egui focus this frame -- keyboard/EditingAction forwarding skipped");
+        }
         if has_focus {
             // Line-height in device pixels for arrow key steps.
             let line_px = (24.0 * dpi) as f32;
@@ -1030,6 +1091,19 @@ impl WebView {
                             None
                         };
                         if let Some(action) = action {
+                            // Diagnostic for issue #21: confirms the
+                            // Ctrl/Cmd+C/X/V shortcut was actually seen and
+                            // forwarded as an EditingAction. If Copy never
+                            // does anything, this line appearing (or not)
+                            // tells you whether the problem is "the
+                            // shortcut never reached this code" (missing
+                            // log -- check `has_focus`/the widget not
+                            // having keyboard focus, logged below) vs. "it
+                            // was sent, but there was nothing selected to
+                            // copy, or Servo's own clipboard handling
+                            // didn't act on it" (log present, still no
+                            // clipboard content).
+                            log::debug!("forwarding EditingAction::{action:?}");
                             self.servo_view
                                 .notify_input_event(InputEvent::EditingAction(action));
                         }
