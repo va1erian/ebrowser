@@ -72,6 +72,14 @@ pub struct MailboxInfo {
     pub name: String,
     pub delimiter: Option<String>,
     pub special_use: Option<SpecialUse>,
+    /// `\Noselect` from `LIST`'s response attributes: a real mailbox name
+    /// the server returned, but one that can't itself be `SELECT`/`EXAMINE`d
+    /// -- purely a hierarchy container for its children (Gmail's `[Gmail]`
+    /// is the canonical example). `mailbox_tree` treats this the same as a
+    /// name that was never `LIST`ed at all (`MailboxNode::full_name` stays
+    /// `None`), so the tree UI already renders it as a plain, unclickable
+    /// label rather than sending a doomed `SELECT` when clicked.
+    pub noselect: bool,
 }
 
 /// RFC 6154 special-use roles this cares about sorting specially, plus a
@@ -153,14 +161,14 @@ pub fn mailbox_tree(mailboxes: &[MailboxInfo]) -> Vec<MailboxNode> {
             Some(d) => mb.name.split(d).filter(|s| !s.is_empty()).collect(),
             None => vec![mb.name.as_str()],
         };
-        insert_path(&mut roots, &segments, &mb.name, mb.special_use);
+        insert_path(&mut roots, &segments, &mb.name, mb.special_use, mb.noselect);
     }
 
     sort_tree(&mut roots);
     roots
 }
 
-fn insert_path(nodes: &mut Vec<MailboxNode>, segments: &[&str], full_name: &str, special_use: Option<SpecialUse>) {
+fn insert_path(nodes: &mut Vec<MailboxNode>, segments: &[&str], full_name: &str, special_use: Option<SpecialUse>, noselect: bool) {
     let Some((first, rest)) = segments.split_first() else { return };
     let is_leaf = rest.is_empty();
 
@@ -174,10 +182,17 @@ fn insert_path(nodes: &mut Vec<MailboxNode>, segments: &[&str], full_name: &str,
     };
 
     if is_leaf {
-        node.full_name = Some(full_name.to_string());
+        // A `\Noselect` mailbox (e.g. Gmail's `[Gmail]`) is a real name the
+        // server returned, but not one `SELECT`/`EXAMINE` will accept --
+        // leave `full_name` unset so the tree UI treats it exactly like a
+        // hierarchy node that was never `LIST`ed at all (a plain,
+        // unclickable label) instead of sending a doomed `SELECT`.
+        if !noselect {
+            node.full_name = Some(full_name.to_string());
+        }
         node.special_use = special_use;
     } else {
-        insert_path(&mut node.children, rest, full_name, special_use);
+        insert_path(&mut node.children, rest, full_name, special_use, noselect);
     }
 }
 
@@ -678,10 +693,15 @@ impl ImapActor {
                     .iter()
                     .find_map(SpecialUse::from_attribute)
                     .or_else(|| SpecialUse::from_name(name.name()));
+                let noselect = name
+                    .attributes()
+                    .iter()
+                    .any(|a| matches!(a, async_imap::imap_proto::types::NameAttribute::NoSelect));
                 mailboxes.push(MailboxInfo {
                     name: name.name().to_string(),
                     delimiter: name.delimiter().map(|d| d.to_string()),
                     special_use,
+                    noselect,
                 });
             }
         }
@@ -1107,7 +1127,11 @@ mod tests {
     use super::*;
 
     fn mb(name: &str, delimiter: &str, special_use: Option<SpecialUse>) -> MailboxInfo {
-        MailboxInfo { name: name.to_string(), delimiter: Some(delimiter.to_string()), special_use }
+        MailboxInfo { name: name.to_string(), delimiter: Some(delimiter.to_string()), special_use, noselect: false }
+    }
+
+    fn mb_noselect(name: &str, delimiter: &str) -> MailboxInfo {
+        MailboxInfo { name: name.to_string(), delimiter: Some(delimiter.to_string()), special_use: None, noselect: true }
     }
 
     // ── MailHeader::is_seen / is_flagged ─────────────────────────────────────
@@ -1190,12 +1214,27 @@ mod tests {
         // A server with no hierarchy (delimiter NIL, `MailboxInfo::delimiter`
         // as `None`) must not be split at all, even if a mailbox name
         // happens to contain a `/`.
-        let mailboxes = vec![MailboxInfo { name: "A/B".to_string(), delimiter: None, special_use: None }];
+        let mailboxes = vec![MailboxInfo { name: "A/B".to_string(), delimiter: None, special_use: None, noselect: false }];
         let tree = mailbox_tree(&mailboxes);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].label, "A/B");
         assert_eq!(tree[0].full_name.as_deref(), Some("A/B"));
         assert!(tree[0].children.is_empty());
+    }
+
+    #[test]
+    fn mailbox_tree_treats_a_noselect_mailbox_like_one_never_listed_at_all() {
+        // Regression test for issue #10: Gmail advertises `[Gmail]` itself
+        // via LIST, but marked `\Noselect` -- SELECT/EXAMINE-ing it fails
+        // server-side. It must render as a plain hierarchy label (full_name
+        // unset), the same as a name that was never LISTed, not as a
+        // clickable mailbox that then throws a NONEXISTENT error on click.
+        let mailboxes = vec![mb_noselect("[Gmail]", "/"), mb("[Gmail]/Sent Mail", "/", Some(SpecialUse::Sent))];
+        let tree = mailbox_tree(&mailboxes);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].label, "[Gmail]");
+        assert_eq!(tree[0].full_name, None, "a \\Noselect mailbox must not be selectable");
+        assert_eq!(tree[0].children[0].full_name.as_deref(), Some("[Gmail]/Sent Mail"));
     }
 
     #[test]
