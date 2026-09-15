@@ -486,14 +486,38 @@ impl EsMailApp {
                     });
                 }
                 ImapEvent::Body { uid, html, attachments, req_id } => {
-                    if req_id == self.current_body_req
-                        && self.selected_uid == Some(uid)
-                        && self.search_results.is_none()
-                    {
+                    // Matching `req_id`+`uid` is sufficient on its own now
+                    // that `open_message` bumps `current_body_req` on every
+                    // open (including a cache-served search result) -- a
+                    // stale live reply from before a search-result open can
+                    // no longer slip through just because `uid` happens to
+                    // coincide, since its `req_id` is guaranteed stale too.
+                    // (This used to also require `self.search_results.is_none()`,
+                    // which incidentally also blocked the *legitimate* case
+                    // fixed here: a live fallback fetch issued while the
+                    // search results list is still showing, from a DB cache
+                    // miss -- see the `DbEvent::MailFetchFailed` arm below.)
+                    if req_id == self.current_body_req && self.selected_uid == Some(uid) {
                         self.current_message_html = html.clone();
                         self.web_view.load(WebViewSource::Html(html));
                         self.current_attachments = attachments;
                     }
+                }
+                ImapEvent::BodyFailed { uid, req_id, error } => {
+                    // Without this, a failed body fetch (dropped connection,
+                    // exhausted reconnect retries, message no longer on the
+                    // server) left `open_message`'s "Loading message..."
+                    // placeholder on screen forever: the generic `Error`
+                    // variant this used to arrive as carries no uid/req_id,
+                    // so nothing could tell it apart from an unrelated error
+                    // and resolve the pending fetch. This is the actual fix
+                    // for the "stuck on Loading message..." bug (issue #13).
+                    if req_id == self.current_body_req && self.selected_uid == Some(uid) {
+                        let msg = format!("<i>Could not load message: {}</i>", ammonia::clean_text(&error));
+                        self.current_message_html = msg.clone();
+                        self.web_view.load(WebViewSource::Html(msg));
+                    }
+                    self.push_banner(format!("Could not load message: {error}"));
                 }
                 ImapEvent::DownloadProgress { current, total } => {
                     self.download_progress = Some((current, total));
@@ -665,6 +689,25 @@ impl EsMailApp {
                         self.web_view.load(WebViewSource::Html(body));
                     }
                 }
+                DbEvent::MailFetchFailed { uid, error } => {
+                    // Most commonly a cache miss: `open_message`'s `is_search`
+                    // branch reads the body from the local cache, but
+                    // `db.rs`'s `MAX_CACHED_BODIES` LRU cap means a search
+                    // result's body can have been evicted since it was
+                    // indexed -- routine on a mailbox with more messages
+                    // than the cap (e.g. this was reproduced with a 2585-
+                    // message Gmail account against a 2000-body cap). This
+                    // used to be indistinguishable from any other DB error
+                    // (`DbEvent::Error`, just a banner, nothing else), so
+                    // "Loading message..." never got resolved either way --
+                    // this is what root-caused issue #13. Falling back to a
+                    // real `FetchBody` here both fixes that and actually
+                    // loads the message rather than just reporting failure.
+                    if self.selected_uid == Some(uid) {
+                        log::debug!("cached body for uid {uid} unavailable ({error}); falling back to a live fetch");
+                        self.fetch_body(self.selected_mailbox.clone(), uid);
+                    }
+                }
                 DbEvent::SyncPlan { account_id, mailbox, plan } => {
                     // B3: turn a `FetchFrom`/`Resync` decision into an
                     // actual incremental fetch, so the cache accumulates
@@ -833,6 +876,16 @@ impl EsMailApp {
         self.current_attachments.clear();
         self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
         if is_search {
+            // Bump (invalidate) `current_body_req` even though this request
+            // itself goes out over `db_tx`, not `imap_tx` -- otherwise a
+            // still-in-flight live `FetchBody` from *before* this open would
+            // keep matching `current_body_req` (unchanged) and, now that its
+            // `uid` happens to equal this one too, could get applied here
+            // once the guard below stopped gating on `search_results` (see
+            // the `ImapEvent::Body` arm's doc). A cache miss below still
+            // falls back to a real live fetch through `fetch_body`, which
+            // hands out its own fresh id and legitimately updates this.
+            self.current_body_req = self.next_req_id();
             let _ = self.db_tx.try_send(DbCommand::FetchMail {
                 account_id: self.account_id(),
                 mailbox: self.selected_mailbox.clone(),
