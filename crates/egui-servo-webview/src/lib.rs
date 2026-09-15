@@ -274,6 +274,13 @@ struct Delegate {
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _webview: ServoWebView) {
+        // Diagnostic for issue #21: if a text-selection drag never
+        // produces one of these, Servo itself never repainted in response
+        // to the selection (cursor icon changing separately just proves
+        // hover/hit-testing works, not that a selection highlight was
+        // ever computed/painted) -- that would point at Servo's own
+        // selection machinery, not this crate's readback path below.
+        log::debug!("notify_new_frame_ready fired -- marking frame_dirty");
         self.frame_dirty.set(true);
         self.egui_ctx.request_repaint();
     }
@@ -704,9 +711,16 @@ impl WebView {
         );
 
         if self.frame_dirty.get() {
+            // Diagnostic for issue #21: pairs with `notify_new_frame_ready`'s
+            // log above. If that fires but this doesn't (or `rgba` comes
+            // back `None`/zero-sized), the framebuffer readback itself is
+            // the gap -- Servo signaled a repaint but we never actually
+            // pulled the new pixels (or pulled an empty/stale surface).
+            log::debug!("frame_dirty -- re-reading framebuffer");
             if let Some(rgba) = self.offscreen_ctx.read_to_image(read_rect) {
                 let w = rgba.width() as usize;
                 let h = rgba.height() as usize;
+                log::debug!("read_to_image returned {w}x{h}");
                 if w > 0 && h > 0 {
                     let color_image =
                         egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
@@ -723,7 +737,11 @@ impl WebView {
                             ));
                         }
                     }
+                } else {
+                    log::debug!("read_to_image returned a zero-sized image, texture not updated");
                 }
+            } else {
+                log::debug!("read_to_image returned None, texture not updated");
             }
             self.frame_dirty.set(false);
         }
