@@ -112,12 +112,12 @@ impl SpecialUse {
     }
 
     /// Name-based fallback for a server that doesn't advertise RFC 6154
-    /// special-use attributes (many don't) -- the same "hardcoded name,
-    /// documented gap" tradeoff `main.rs::SENT_MAILBOX` already makes for
-    /// picking a Sent folder to `APPEND` to (B7). Case-insensitive exact
-    /// match only, not a substring search, so a mailbox that merely
-    /// contains "sent" in a longer name (a filter folder called "Sent to
-    /// Boss", say) isn't misclassified.
+    /// special-use attributes (many don't) -- this is what lets
+    /// `main.rs::special_use_mailbox` (issue #9) still find a Sent/Trash/
+    /// Archive folder on such a server, provided it's conventionally named.
+    /// Case-insensitive exact match only, not a substring search, so a
+    /// mailbox that merely contains "sent" in a longer name (a filter
+    /// folder called "Sent to Boss", say) isn't misclassified.
     fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "inbox" => Some(SpecialUse::Inbox),
