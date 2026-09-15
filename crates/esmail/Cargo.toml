@@ -1,6 +1,6 @@
 [package]
 name = "esmail"
-description = "IMAP mail client with HTML rendering via an embedded Servo webview."
+description = "IMAP mail client with HTML rendering via an embedded litehtml webview."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -14,7 +14,8 @@ name = "esmail"
 path = "src/main.rs"
 
 [dependencies]
-egui-servo-webview = { path = "../egui-servo-webview" }
+egui-litehtml-webview = { path = "../egui-litehtml-webview" }
+ureq.workspace = true
 
 eframe.workspace = true
 egui.workspace = true
