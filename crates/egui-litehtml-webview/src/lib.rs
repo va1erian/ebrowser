@@ -237,6 +237,9 @@ impl WebViewHost {
             logical_width: 1.0,
             content_height: DEFAULT_VIEWPORT_HEIGHT as f32,
             pixels_per_point: scale,
+            container_width: 1.0,
+            container_height: DEFAULT_VIEWPORT_HEIGHT as f32,
+            container_scale: scale,
             dirty: true,
             total_images_loaded: 0,
         }
@@ -291,10 +294,34 @@ pub struct WebView {
     logical_width: f32,
     /// The document's content height after the last `relayout`, in egui
     /// logical points -- what [`WebView::show`] sizes the displayed image
-    /// to.
+    /// to. May be smaller than `container_height` (the container is
+    /// allowed to be taller than the content actually needs -- see
+    /// `container_height`'s own doc).
     content_height: f32,
     /// `egui::Context::pixels_per_point` last laid out at.
     pixels_per_point: f32,
+    /// The width `self.container` is currently allocated/sized for.
+    /// Distinct from `logical_width` (the width `relayout` most recently
+    /// laid out *at*) only for one frame at a time -- `relayout` resizes
+    /// the container to match `logical_width` before doing anything else
+    /// whenever they differ, so outside of `relayout` itself these two are
+    /// always equal.
+    container_width: f32,
+    /// The height `self.container`'s pixel buffer is currently allocated
+    /// for -- a *capacity*, not necessarily equal to `content_height` (the
+    /// actual content height). `relayout` deliberately never shrinks this:
+    /// reusing a too-tall buffer from a previous, longer message costs
+    /// nothing but some unused canvas space, and avoids resizing (which
+    /// forces a full extra parse+layout+draw pass -- litehtml's own layout
+    /// pass measured 3+ seconds on real-world message HTML in this
+    /// session's live testing) on every single message open. Only grows,
+    /// via `relayout` noticing the freshly-drawn content actually
+    /// overflowed it.
+    container_height: f32,
+    /// The `pixels_per_point` `self.container` is currently allocated for.
+    /// See `container_width`'s doc -- same "only resize when it's actually
+    /// necessary" reasoning applies to a DPI change as to a width change.
+    container_scale: f32,
     /// Set by [`WebView::load`]/[`WebView::reload`] and by a width/DPI
     /// change noticed in `show()`; cleared once `relayout` has run. Keeps a
     /// `show()` on an unchanged view cheap (no reparse/relayout), matching
@@ -391,49 +418,64 @@ impl WebView {
 
     // ── Private: render sequence ──────────────────────────────────────────
 
-    /// Run the full measure -> resize -> draw -> resolve-images sequence
+    /// Run the draw -> (grow-and-redraw if it overflowed) ->
+    /// resolve-images -> (grow-and-redraw again if needed) sequence
     /// described in the crate module doc.
     ///
-    /// Instrumented with `log::debug!` timing at every phase -- diagnostic
-    /// for a live-usage report of multi-second freezes after browsing a
-    /// handful of messages. Enable with `RUST_LOG=egui_litehtml_webview=debug`.
-    /// The `total_images_loaded` count is the prime suspect: `PixbufContainer`
-    /// exposes no eviction API for its internal decoded-image cache (see
-    /// the crate's PLAN.md-tracked known limitation), so it's worth seeing
-    /// whether relayout time trends upward alongside it across messages in
-    /// the same run, rather than staying roughly flat.
+    /// **No longer does a separate "measure" pass before drawing.** The
+    /// original design always did two full parse+layout passes (measure,
+    /// then draw) even in the common case, on the reasoning that the
+    /// container has to be the right size *before* `draw()` runs. Live
+    /// usage testing (real account, real messages) showed each full
+    /// parse+layout pass costing 3+ seconds on some real-world message
+    /// HTML — litehtml has open, unresolved upstream reports of exactly
+    /// this ("slow rendering on complex real-world pages") — so paying
+    /// for two (or four, once image-loading's own remeasure+redraw pair is
+    /// included) of those on every single message open was the actual
+    /// cause of multi-second UI freezes, not anything specific to this
+    /// codebase's own logic. Fixed by no longer *requiring* the container
+    /// to already be correctly sized: draw straight into whatever buffer
+    /// already exists (reusing the previous message's, grown only when a
+    /// new message's content actually doesn't fit — see
+    /// `container_height`'s doc), and only pay for a second pass on the
+    /// rarer occasions that guess undershoots. A same-or-shorter message
+    /// right after a longer one now costs exactly one pass, not two.
+    ///
+    /// Instrumented with `log::debug!` timing at every phase — enable with
+    /// `RUST_LOG=egui_litehtml_webview=debug`.
     fn relayout(&mut self, ctx: &egui::Context) {
         let width = self.logical_width.max(1.0);
         let scale = self.pixels_per_point.max(0.1);
         let t_total = std::time::Instant::now();
 
         let t = std::time::Instant::now();
-        let height = self.layout_only(width).unwrap_or(1.0);
-        let t_measure = t.elapsed();
-
-        let t = std::time::Instant::now();
-        self.resize_container(width, height, scale);
+        if (self.container_width - width).abs() > 0.5 || (self.container_scale - scale).abs() > 0.001 {
+            // A width or DPI change invalidates the existing buffer's
+            // layout regardless of height -- litehtml lays out for a
+            // specific width, and the pixel buffer's physical size bakes
+            // in the scale factor. Keep whatever height capacity we
+            // already had (still just a guess, still may need to grow
+            // below) rather than dropping back to a 1px-tall buffer.
+            self.resize_container(width, self.container_height, scale);
+        }
         let t_resize = t.elapsed();
 
         let t = std::time::Instant::now();
-        self.content_height = self.layout_and_draw(width).unwrap_or(height);
+        let (height, grew) = self.draw_growing_as_needed(width, scale);
+        self.content_height = height;
         let t_draw = t.elapsed();
 
         let t = std::time::Instant::now();
         let images_loaded_this_pass = self.load_pending_images();
         let t_images = t.elapsed();
 
-        let mut t_remeasure = std::time::Duration::ZERO;
         let mut t_redraw = std::time::Duration::ZERO;
+        let mut grew_for_images = false;
         if images_loaded_this_pass {
             let t = std::time::Instant::now();
-            let height2 = self.layout_only(width).unwrap_or(self.content_height);
-            t_remeasure = t.elapsed();
-
-            self.resize_container(width, height2, scale);
-
-            let t = std::time::Instant::now();
-            self.content_height = self.layout_and_draw(width).unwrap_or(height2);
+            let (height2, grew2) = self.draw_growing_as_needed(width, scale);
+            self.content_height = height2;
+            grew_for_images = grew2;
             t_redraw = t.elapsed();
         }
 
@@ -444,24 +486,28 @@ impl WebView {
         self.dirty = false;
 
         log::debug!(
-            "relayout: total={:?} (measure={:?} resize={:?} draw={:?} \
+            "relayout: total={:?} (resize={:?} draw={:?} [grew={grew}] \
              resolve_images={:?} [loaded_any={images_loaded_this_pass}] \
-             remeasure={:?} redraw={:?} upload={:?}) html_len={} \
-             content_height={:.0} total_images_loaded={}",
-            t_total.elapsed(), t_measure, t_resize, t_draw, t_images,
-            t_remeasure, t_redraw, t_upload,
-            self.html.len(), self.content_height, self.total_images_loaded,
+             redraw={:?} [grew={grew_for_images}] upload={:?}) html_len={} \
+             content_height={:.0} container_height={:.0} total_images_loaded={}",
+            t_total.elapsed(), t_resize, t_draw, t_images, t_redraw, t_upload,
+            self.html.len(), self.content_height, self.container_height,
+            self.total_images_loaded,
         );
     }
 
-    /// Parse + lay out (no draw) and return the content height. Used both
-    /// for the initial measurement pass and to re-measure after images
-    /// load (an image without explicit dimensions can change the
-    /// document's height).
-    fn layout_only(&mut self, width: f32) -> Option<f32> {
-        let mut doc = self.parse()?;
-        let _ = doc.render(width);
-        Some(doc.height().max(1.0))
+    /// Draw into the current container buffer; if the content turns out to
+    /// be taller than the buffer's current capacity (a real, if
+    /// increasingly rare, possibility — see `container_height`'s doc),
+    /// grow it and draw once more. Returns `(content_height, grew)`.
+    fn draw_growing_as_needed(&mut self, width: f32, scale: f32) -> (f32, bool) {
+        let height = self.layout_and_draw(width).unwrap_or(self.container_height);
+        if height <= self.container_height + 0.5 {
+            return (height, false);
+        }
+        self.resize_container(width, height, scale);
+        let height2 = self.layout_and_draw(width).unwrap_or(height);
+        (height2, true)
     }
 
     /// Parse + lay out + draw into `self.container`'s current pixel buffer.
@@ -510,6 +556,15 @@ impl WebView {
         let w = width.ceil().max(1.0) as u32;
         let h = height.ceil().max(1.0) as u32;
         self.container.resize_with_scale(w, h, scale);
+        // Keep the capacity-tracking fields in lockstep with the actual
+        // buffer, unconditionally, so every call site (there are several:
+        // a width/DPI change, and either of `relayout`'s two
+        // draw-then-maybe-grow passes) automatically keeps
+        // `container_width`/`container_height`/`container_scale`
+        // accurate without each one having to remember to.
+        self.container_width = width;
+        self.container_height = height;
+        self.container_scale = scale;
     }
 
     /// Drain pending image URLs and resolve as many as possible. Returns
