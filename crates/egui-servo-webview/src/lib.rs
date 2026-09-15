@@ -34,6 +34,7 @@ pub use servo::{LoadStatus, WebResourceRequest, Image};
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose};
 use dpi::PhysicalSize;
@@ -42,10 +43,10 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use url::Url;
 
 use servo::{
-    Cursor as ServoCursor, DevicePixel, DeviceVector2D, InputEvent, OffscreenRenderingContext,
-    RenderingContext, Scroll, Servo, ServoBuilder, WebViewBuilder, WebViewDelegate,
-    WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest, WebResourceLoad,
-    WebResourceResponse,
+    Cursor as ServoCursor, DevicePixel, DeviceVector2D, InputEvent, JSValue,
+    OffscreenRenderingContext, RenderingContext, Scroll, Servo, ServoBuilder, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WebViewVector, WindowRenderingContext, NavigationRequest,
+    WebResourceLoad, WebResourceResponse,
 };
 // `servo::WebView` is the engine-side view. Ours (below) wraps it, so alias the
 // engine type to keep the two unambiguous at every use site.
@@ -187,6 +188,68 @@ pub trait WebViewHandler {
 /// both methods run their documented defaults.
 struct DefaultHandler;
 impl WebViewHandler for DefaultHandler {}
+
+// ─── Overlay scrollbar (issue #15) ──────────────────────────────────────────
+//
+// Servo 0.1.0 exposes no scroll-position/content-height getter and no
+// absolute "scroll to Y" setter on `servo::WebView` (`notify_scroll_event` is
+// write-only and relative), and the engine paints no scrollbar of its own
+// into the framebuffer at all -- confirmed against the vendored source and
+// against servoshell, Servo's own reference embedder, which also has none.
+// See the investigation posted on the GitHub issue for the full writeup.
+//
+// The only available lever is `WebView::evaluate_javascript`, a real,
+// already-exposed, callback-based API that was simply unused until now. This
+// section polls `document.scrollingElement`'s three numbers through it and
+// paints an ordinary egui track+thumb from the result -- no Servo/vendored
+// patching. Two caveats worth keeping in mind (not solved here, just not
+// surprising): this is polling, not push-driven, so there is a frame or two
+// of lag right after a wheel-scroll; and `document.scrollingElement` will not
+// track a page that overrides the default scrolling element (a nested
+// `overflow:auto` container) -- fine for typical mail bodies, not general.
+
+/// The three numbers the overlay scrollbar is drawn from, polled off
+/// `document.scrollingElement` via `evaluate_javascript`. All in CSS pixels,
+/// as the DOM reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ScrollInfo {
+    scroll_top: f64,
+    scroll_height: f64,
+    client_height: f64,
+}
+
+/// The script polled each `show_impl` tick (throttled by
+/// [`WebView::SCROLL_POLL_INTERVAL`]). `document.scrollingElement` is null
+/// only in edge cases (e.g. no `<body>` yet), hence the `documentElement`
+/// fallback -- either way this always returns a 3-element array so
+/// [`js_value_to_scroll_info`] has one shape to parse.
+const SCROLL_INFO_SCRIPT: &str = "(() => { \
+    const el = document.scrollingElement || document.documentElement; \
+    if (!el) { return [0, 0, 0]; } \
+    return [el.scrollTop, el.scrollHeight, el.clientHeight]; \
+})()";
+
+/// Parse the `[scrollTop, scrollHeight, clientHeight]` array
+/// [`SCROLL_INFO_SCRIPT`] returns out of the raw [`JSValue`]
+/// `evaluate_javascript`'s callback hands back. `None` for any shape other
+/// than the exact one expected -- a page-side error or a future engine change
+/// should leave the last-known scrollbar state alone, not panic or draw
+/// garbage.
+fn js_value_to_scroll_info(value: &JSValue) -> Option<ScrollInfo> {
+    let JSValue::Array(items) = value else {
+        return None;
+    };
+    let [top, height, client] = <[JSValue; 3]>::try_from(items.clone()).ok()?;
+    let as_f64 = |v: &JSValue| match v {
+        JSValue::Number(n) => Some(*n),
+        _ => None,
+    };
+    Some(ScrollInfo {
+        scroll_top: as_f64(&top)?,
+        scroll_height: as_f64(&height)?,
+        client_height: as_f64(&client)?,
+    })
+}
 
 // ─── Internal delegate ───────────────────────────────────────────────────────
 
@@ -438,6 +501,8 @@ impl WebViewHost {
             texture_name: format!("egui_servo_webview_{view_id}"),
             last_phys_size: config.size,
             last_mouse_pos: None,
+            scroll_info: Rc::new(Cell::new(ScrollInfo::default())),
+            last_scroll_poll: None,
         }
     }
 
@@ -501,6 +566,15 @@ pub struct WebView {
     texture_name: String,
     last_phys_size: PhysicalSize<u32>,
     last_mouse_pos: Option<egui::Pos2>,
+    /// Last-polled `document.scrollingElement` numbers. Shared (`Rc<Cell<_>>`,
+    /// the same pattern `frame_dirty`/`cursor` use) because
+    /// [`WebView::poll_scroll_info`]'s `evaluate_javascript` callback writes
+    /// into it asynchronously, from outside `show_impl`'s `&mut self`. See
+    /// the "Overlay scrollbar" section above.
+    scroll_info: Rc<Cell<ScrollInfo>>,
+    /// When [`WebView::poll_scroll_info`] last fired, so it can be throttled
+    /// to [`WebView::SCROLL_POLL_INTERVAL`] instead of once per `show_impl`.
+    last_scroll_poll: Option<Instant>,
 }
 
 impl WebView {
@@ -673,6 +747,92 @@ impl WebView {
                 .rect_filled(widget_rect, 0.0, egui::Color32::from_gray(20));
         }
 
+        // ── Overlay scrollbar (issue #15) ─────────────────────────────────────
+        // See the "Overlay scrollbar" doc comment near `ScrollInfo` above for
+        // why this exists and why it's a JS-bridge poll rather than a native
+        // Servo getter/setter.
+        self.poll_scroll_info();
+
+        let scroll_info = self.scroll_info.get();
+        let track_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                widget_rect.right() - Self::SCROLLBAR_WIDTH - Self::SCROLLBAR_MARGIN,
+                widget_rect.top() + Self::SCROLLBAR_MARGIN,
+            ),
+            egui::pos2(
+                widget_rect.right() - Self::SCROLLBAR_MARGIN,
+                widget_rect.bottom() - Self::SCROLLBAR_MARGIN,
+            ),
+        );
+        let thumb_metrics = Self::scrollbar_thumb_metrics(
+            scroll_info.scroll_top,
+            scroll_info.scroll_height,
+            scroll_info.client_height,
+            track_rect.height(),
+        );
+        let mut scrollbar_dragging = false;
+
+        if let Some((thumb_top, thumb_height)) = thumb_metrics {
+            let thumb_rect = egui::Rect::from_min_size(
+                egui::pos2(track_rect.left(), track_rect.top() + thumb_top),
+                egui::vec2(track_rect.width(), thumb_height),
+            );
+            // Hit-test the whole track, not just the thumb -- a thin strip is
+            // an easy target to miss, and there is no separate "click track
+            // to jump" behaviour to conflict with here.
+            let scrollbar_resp =
+                ui.interact(track_rect, resp.id.with("scrollbar_thumb"), egui::Sense::drag());
+            let scrollbar_hovered = scrollbar_resp.hovered();
+            scrollbar_dragging = scrollbar_resp.dragged();
+
+            if scrollbar_dragging {
+                if let Some(pointer) = scrollbar_resp.interact_pointer_pos() {
+                    let new_scroll_top = Self::scroll_top_for_thumb_center(
+                        pointer.y,
+                        track_rect.top(),
+                        track_rect.height(),
+                        thumb_height,
+                        scroll_info.scroll_height,
+                        scroll_info.client_height,
+                    );
+                    // Optimistic local update so the thumb tracks the pointer
+                    // immediately -- waiting for `poll_scroll_info`'s own
+                    // round trip would lag noticeably mid-drag.
+                    self.scroll_info.set(ScrollInfo { scroll_top: new_scroll_top, ..scroll_info });
+                    // Fire-and-forget, matching `evaluate_javascript`'s async
+                    // style elsewhere. `window.scrollTo` is the only "jump to
+                    // an absolute position" lever available -- Servo's own
+                    // `notify_scroll_event` is relative-delta only.
+                    self.servo_view
+                        .evaluate_javascript(format!("window.scrollTo(0, {new_scroll_top})"), |_| {});
+                }
+            }
+
+            let alpha = if scrollbar_dragging {
+                160
+            } else if scrollbar_hovered {
+                130
+            } else {
+                90
+            };
+            ui.painter().rect_filled(
+                track_rect,
+                Self::SCROLLBAR_WIDTH / 2.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
+            );
+            ui.painter().rect_filled(
+                thumb_rect,
+                Self::SCROLLBAR_WIDTH / 2.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
+            );
+        }
+
+        // A pointer over the scrollbar track (dragging it or not) must not
+        // also forward clicks/moves to the page underneath -- without this a
+        // click on the thumb both drags it and lands on whatever page
+        // element happens to be there.
+        let over_scrollbar = |pos: egui::Pos2| thumb_metrics.is_some() && track_rect.contains(pos);
+
         // ── Input forwarding to Servo ─────────────────────────────────────────
         // Buttons other than Primary added per A5 (PLAN.md) — nothing upstream
         // needed to teach us those, servoshell just forwards all of winit's.
@@ -698,8 +858,12 @@ impl WebView {
         let primary_up = buttons_up.iter().any(|(b, _)| *b == egui::PointerButton::Primary);
 
         if let Some(pos) = interact_pos {
-            // We only send clicks to servo if the mouse is over the webview
-            if widget_rect.contains(pos) || resp.dragged() {
+            // We only send clicks to servo if the mouse is over the webview,
+            // and not while it's over/dragging the overlay scrollbar.
+            if (widget_rect.contains(pos) || resp.dragged())
+                && !scrollbar_dragging
+                && !over_scrollbar(pos)
+            {
                 let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
 
                 if !buttons_down.is_empty() {
@@ -731,7 +895,10 @@ impl WebView {
 
         // Mouse move - send AFTER button events so Down is seen before the first drag-move
         if let Some(pos) = interact_pos {
-            if widget_rect.contains(pos) || resp.dragged() || primary_up {
+            if (widget_rect.contains(pos) || resp.dragged() || primary_up)
+                && !scrollbar_dragging
+                && !over_scrollbar(pos)
+            {
                 if self.last_mouse_pos != Some(pos) {
                     let dp = Self::egui_to_servo_point(pos, widget_rect.min, dpi);
                     self.servo_view
@@ -908,6 +1075,104 @@ impl WebView {
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
+
+    /// Width of the overlay scrollbar's track, in logical points.
+    const SCROLLBAR_WIDTH: f32 = 10.0;
+    /// Gap between the scrollbar and the widget's edges, in logical points.
+    const SCROLLBAR_MARGIN: f32 = 2.0;
+    /// Thumb never shrinks below this, in logical points, so a very long page
+    /// doesn't collapse it to an unclickable sliver.
+    const MIN_THUMB_HEIGHT: f32 = 24.0;
+    /// How often [`WebView::poll_scroll_info`] actually issues a new
+    /// `evaluate_javascript` call. `show_impl` runs far more often than this
+    /// (every repaint), and a scroll position doesn't need sub-frame
+    /// freshness -- see the "Overlay scrollbar" section's note on polling lag.
+    const SCROLL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+    /// Kick off (throttled) an async `evaluate_javascript` re-read of
+    /// `document.scrollingElement`'s scroll position/content height, writing
+    /// the result into `self.scroll_info` once Servo calls back. Fire-and-
+    /// forget: a dropped/errored evaluation just leaves the last-known value
+    /// in place for this frame's paint, same as a slow one.
+    fn poll_scroll_info(&mut self) {
+        let now = Instant::now();
+        let due = match self.last_scroll_poll {
+            None => true,
+            Some(last) => now.duration_since(last) >= Self::SCROLL_POLL_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        self.last_scroll_poll = Some(now);
+
+        let scroll_info = self.scroll_info.clone();
+        self.servo_view.evaluate_javascript(SCROLL_INFO_SCRIPT, move |result| {
+            if let Ok(value) = result {
+                if let Some(info) = js_value_to_scroll_info(&value) {
+                    scroll_info.set(info);
+                }
+            }
+        });
+    }
+
+    /// Compute the thumb's offset from the track's top and its height, both
+    /// in the track's own logical-point coordinate space. `None` when the
+    /// page doesn't scroll (nothing to show a scrollbar for) or the reported
+    /// content height is degenerate.
+    ///
+    /// Kept pure and free of any egui/Servo types so it can be unit tested
+    /// directly against hand-picked scroll numbers, the same way
+    /// `physical_size`/`egui_to_servo_point` are above.
+    fn scrollbar_thumb_metrics(
+        scroll_top: f64,
+        scroll_height: f64,
+        client_height: f64,
+        track_height: f32,
+    ) -> Option<(f32, f32)> {
+        // A one-pixel slop: `scroll_height` and `client_height` are rarely
+        // exactly equal even on a non-scrolling page (subpixel layout), so a
+        // strict `>` would flicker a scrollbar in and out for a static page.
+        if client_height <= 0.0 || scroll_height <= client_height + 1.0 || track_height <= 0.0 {
+            return None;
+        }
+
+        let raw_thumb_height = (client_height / scroll_height) as f32 * track_height;
+        let thumb_height = raw_thumb_height.clamp(Self::MIN_THUMB_HEIGHT.min(track_height), track_height);
+
+        let max_scroll = scroll_height - client_height;
+        let thumb_travel = (track_height - thumb_height).max(0.0);
+        let fraction = if max_scroll > 0.0 {
+            (scroll_top / max_scroll).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let thumb_top = fraction as f32 * thumb_travel;
+
+        Some((thumb_top, thumb_height))
+    }
+
+    /// Invert [`WebView::scrollbar_thumb_metrics`]: given where the pointer
+    /// is while dragging the thumb, compute the `scrollTop` to send the page
+    /// to via `window.scrollTo`. `pointer_y` and `track_top`/`track_height`
+    /// are all in the same (widget-local, logical-point) space `show_impl`
+    /// already works in.
+    fn scroll_top_for_thumb_center(
+        pointer_y: f32,
+        track_top: f32,
+        track_height: f32,
+        thumb_height: f32,
+        scroll_height: f64,
+        client_height: f64,
+    ) -> f64 {
+        let max_scroll = (scroll_height - client_height).max(0.0);
+        let thumb_travel = (track_height - thumb_height).max(1.0);
+        // Treat `pointer_y` as where the thumb's *center* should end up,
+        // which is what makes dragging feel like it's grabbing the thumb
+        // rather than snapping its top edge to the cursor.
+        let desired_thumb_top = pointer_y - track_top - thumb_height / 2.0;
+        let fraction = (desired_thumb_top / thumb_travel).clamp(0.0, 1.0);
+        fraction as f64 * max_scroll
+    }
 
     /// Widget size in logical points -> physical pixels, clamped to at least
     /// 1x1 so a collapsed or zero-sized layout never asks for an empty surface.
@@ -1573,6 +1838,134 @@ mod tests {
     }
 
     // ── clipboard shortcut mapping ───────────────────────────────────────────
+
+    // ── overlay scrollbar (issue #15) ────────────────────────────────────────
+
+    #[test]
+    fn no_thumb_when_content_fits_the_viewport() {
+        // scrollHeight <= clientHeight: nothing to scroll, so no scrollbar.
+        assert_eq!(WebView::scrollbar_thumb_metrics(0.0, 400.0, 400.0, 300.0), None);
+        assert_eq!(WebView::scrollbar_thumb_metrics(0.0, 300.0, 400.0, 300.0), None);
+    }
+
+    #[test]
+    fn no_thumb_for_degenerate_inputs() {
+        assert_eq!(WebView::scrollbar_thumb_metrics(0.0, 2000.0, 0.0, 300.0), None);
+        assert_eq!(WebView::scrollbar_thumb_metrics(0.0, 2000.0, 400.0, 0.0), None);
+    }
+
+    #[test]
+    fn thumb_height_is_proportional_to_the_visible_fraction() {
+        // 400 of 2000 visible (20%) on a 300pt track -> a 60pt thumb.
+        let (top, height) = WebView::scrollbar_thumb_metrics(0.0, 2000.0, 400.0, 300.0).unwrap();
+        assert_eq!(top, 0.0);
+        assert_eq!(height, 60.0);
+    }
+
+    #[test]
+    fn thumb_height_never_shrinks_below_the_minimum() {
+        // 40 of 20000 visible (0.2%) would compute to a sub-pixel thumb --
+        // must clamp to MIN_THUMB_HEIGHT instead of vanishing.
+        let (_, height) = WebView::scrollbar_thumb_metrics(0.0, 20000.0, 40.0, 300.0).unwrap();
+        assert_eq!(height, WebView::MIN_THUMB_HEIGHT);
+    }
+
+    #[test]
+    fn thumb_position_tracks_scroll_fraction() {
+        // 400 visible of 2000 total -> max_scroll = 1600, thumb_height = 60,
+        // thumb_travel = 240. Halfway scrolled (800/1600) -> thumb at 120.
+        let (top, height) = WebView::scrollbar_thumb_metrics(800.0, 2000.0, 400.0, 300.0).unwrap();
+        assert_eq!(height, 60.0);
+        assert_eq!(top, 120.0);
+    }
+
+    #[test]
+    fn thumb_reaches_the_track_s_bottom_at_max_scroll() {
+        let (top, height) = WebView::scrollbar_thumb_metrics(1600.0, 2000.0, 400.0, 300.0).unwrap();
+        assert_eq!(top + height, 300.0);
+    }
+
+    #[test]
+    fn scroll_top_for_thumb_center_is_the_inverse_of_the_thumb_metrics() {
+        // Same page as the tests above: max_scroll = 1600, thumb_height = 60,
+        // thumb_travel = 240, track spans logical y in [10, 310).
+        let track_top = 10.0;
+        let track_height = 300.0;
+        let thumb_height = 60.0;
+
+        // Dragging the thumb's center to the track's own top -> scrollTop 0.
+        let at_top = WebView::scroll_top_for_thumb_center(
+            track_top, track_top, track_height, thumb_height, 2000.0, 400.0,
+        );
+        assert_eq!(at_top, 0.0);
+
+        // Dragging to the track's bottom -> clamped to the max scroll.
+        let at_bottom = WebView::scroll_top_for_thumb_center(
+            track_top + track_height,
+            track_top,
+            track_height,
+            thumb_height,
+            2000.0,
+            400.0,
+        );
+        assert_eq!(at_bottom, 1600.0);
+
+        // Pointer out of bounds (dragged above/below the track) clamps
+        // rather than producing a negative or out-of-range scrollTop.
+        let above = WebView::scroll_top_for_thumb_center(
+            track_top - 500.0,
+            track_top,
+            track_height,
+            thumb_height,
+            2000.0,
+            400.0,
+        );
+        assert_eq!(above, 0.0);
+        let below = WebView::scroll_top_for_thumb_center(
+            track_top + track_height + 500.0,
+            track_top,
+            track_height,
+            thumb_height,
+            2000.0,
+            400.0,
+        );
+        assert_eq!(below, 1600.0);
+    }
+
+    #[test]
+    fn js_value_to_scroll_info_parses_the_polled_array_shape() {
+        let value = JSValue::Array(vec![
+            JSValue::Number(123.5),
+            JSValue::Number(2000.0),
+            JSValue::Number(400.0),
+        ]);
+        assert_eq!(
+            js_value_to_scroll_info(&value),
+            Some(ScrollInfo { scroll_top: 123.5, scroll_height: 2000.0, client_height: 400.0 })
+        );
+    }
+
+    #[test]
+    fn js_value_to_scroll_info_rejects_any_other_shape() {
+        assert_eq!(js_value_to_scroll_info(&JSValue::Undefined), None);
+        assert_eq!(js_value_to_scroll_info(&JSValue::Number(1.0)), None);
+        // Wrong length.
+        assert_eq!(
+            js_value_to_scroll_info(&JSValue::Array(vec![JSValue::Number(1.0), JSValue::Number(2.0)])),
+            None
+        );
+        // Right length, wrong element type -- e.g. a page whose
+        // `document.scrollingElement` is unexpectedly null and the script's
+        // own guard didn't run as expected.
+        assert_eq!(
+            js_value_to_scroll_info(&JSValue::Array(vec![
+                JSValue::Null,
+                JSValue::Number(2000.0),
+                JSValue::Number(400.0)
+            ])),
+            None
+        );
+    }
 
     #[test]
     fn clipboard_shortcut_keys_map_to_the_matching_editing_action() {
