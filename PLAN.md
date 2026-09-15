@@ -1637,7 +1637,7 @@ forwarding, A6's rendering path, the overlay scrollbar) — turned out to be in
 service of a JS engine nothing needed. This is a clean cutover, not a
 dual-path migration: `egui-servo-webview` is deleted, not feature-flagged.
 
-**Approved plan's phases 0-3, what landed:**
+**Approved plan's phases, what landed:**
 
 | Phase | Content | Status |
 |---|---|---|
@@ -1645,6 +1645,7 @@ dual-path migration: `egui-servo-webview` is deleted, not feature-flagged.
 | 1 | New crate `egui-litehtml-webview` (Cargo.toml exactly as specified: `egui`/`litehtml`/`url`/`log` deps, `eframe`/`env_logger` dev-deps, `two_views` example) | **DONE** |
 | 2 | Core render pipeline: `PixbufContainer` (persistent) + fresh `litehtml::Document` per render (never stored — see the crate's own module doc for the self-referential-struct reasoning), the measure→resize→draw→resolve-images sequence, `WebViewHost`/`WebView`/`WebViewConfig`/`WebViewSource::Html`/`WebViewEvent::LinkClicked`/`WebViewHandler`/`InterceptOutcome` public API | **DONE** |
 | 3 | `crates/esmail/src/main.rs` wiring (`MessageViewHandler` now fetches allowed remote images itself via `ureq`, since litehtml has no network layer to delegate to), `egui-servo-webview` deleted, verification | **DONE** |
+| 5 (partial) | Dead Servo-era infrastructure removed: `.github/workflows/ci.yml`/`build.yml`'s Linux apt lists trimmed from ~22 packages to `build-essential pkg-config libssl-dev libdbus-1-dev` (verified by a clean `cargo build --workspace`/`cargo test --workspace --no-run` against exactly that set in a bare `rust:slim-bookworm` container — see those files' own comments for the reasoning per package, including the openssl-sys/native-tls requirement this uncovered that was previously only working by accident); Windows jobs' `choco install nasm` step removed (`ring`/litehtml/the rest of the graph built clean on this Windows dev machine with no `nasm` on `PATH`); `Dockerfile.linux`/`Dockerfile.windows` given the same trim plus `libssl-dev` added to `Dockerfile.linux` (a real, previously-missing requirement, not a Servo leftover); root `Cargo.toml`'s `rusqlite` pin relaxed from `"0.37"` to `">=0.37"` (confirmed via `cargo tree -i libsqlite3-sys` that only `esmail` depends on it now that servo-storage is gone; `cargo update -p rusqlite` resolves to 0.40.2 and the workspace builds/tests clean). HANDOFF.md §3.9 (the `libEGL.dll`/`libGLESv2.dll` runtime-DLL story) removed as no-longer-applicable; §3's other Servo-specific landmines (3.1-3.4, 3.7, 3.8) and this file's own Risks section marked historical/resolved rather than deleted, per this file's own "kept for the reasoning" convention. Not done: Phase 6 (rewriting the Servo-era narrative in PLAN.md/HANDOFF.md wholesale) — deliberately separate, later scope. | **DONE** |
 
 **API deviations from the plan's sketch, and why** (per HANDOFF.md §6's
 working agreement: fix the plan in the same commit rather than silently
@@ -1752,9 +1753,12 @@ for the full reasoning.
   `Document::on_mouse_over` exist but are not called; only click (not
   hover/move) triggers a `Document` build. Not required by any current
   `esmail` call site.
-- **CI/Dockerfiles (Phase 5)**, **`rusqlite` version (Phase 5)**, and
-  **rewriting this file's/HANDOFF.md's Servo-era history (Phase 6)** —
-  explicitly out of scope per the approved plan; not touched.
+- **CI/Dockerfiles (Phase 5)** and **`rusqlite` version (Phase 5)** — done in
+  a later pass (see the row below); explicitly out of scope for *this* pass
+  at the time this bullet was written.
+- **Rewriting this file's/HANDOFF.md's Servo-era history (Phase 6)** — still
+  out of scope; only the specific CI/Dockerfile/rusqlite/DLL entries Phase 5
+  called for were touched, not a wholesale rewrite of the Servo narrative.
 - **Per-image memory growth across message loads** — `PixbufContainer`'s own
   decoded-image cache (`images: HashMap<String, Pixmap>`) is never purged by
   `WebView::load`/`reload` (only `pending_images`/`requested_images`
@@ -1795,17 +1799,27 @@ and the `rusqlite` version pin that existed only to unify with
 
 ## Risks
 
-- **Servo API churn.** `servo 0.1` is a moving pre-release. The hooks A3 needs
-  are confirmed to exist *today* (verified against the vendored 0.1.0 source),
-  but they are young and unstable — `stop()` is already missing, and
-  `notify_favicon_changed` carries no payload. Pin an exact version and expect
-  the delegate signatures to move under us.
-- **Build cost dominates the loop.** Servo is a cold multi-hour build and already
-  needs a long apt install in
-  [.github/workflows/ci.yml](.github/workflows/ci.yml). The workspace split only
-  buys fast test runs if the pure-logic parts (MIME parsing, sanitising,
-  search-query parsing, cache) live in a third crate with no Servo dependency —
-  worth doing when B3/B4 land. Add `sccache` / `Swatinem/rust-cache` to CI early.
+- **Servo API churn.** *No longer applies — Servo is gone (see Track C).* Kept
+  for the reasoning: `servo 0.1` was a moving pre-release, and the hooks A3
+  needed were confirmed to exist *today* (verified against the vendored 0.1.0
+  source) but young and unstable — `stop()` was already missing, and
+  `notify_favicon_changed` carried no payload. litehtml has no equivalent
+  delegate-hook surface to churn under us; its own API stability is a
+  different, un-investigated question.
+- **Build cost dominates the loop.** *Resolved by the Servo → litehtml
+  migration, not just historical — the long apt install in
+  [.github/workflows/ci.yml](.github/workflows/ci.yml) it refers to is gone.*
+  This used to warn that Servo was a cold multi-hour build, and that the
+  workspace split only bought fast test runs if the pure-logic parts (MIME
+  parsing, sanitising, search-query parsing, cache) moved into a third crate
+  with no Servo dependency. litehtml's build cost is a `cc`-crate compile of
+  vendored C/C++ (verified during Phase 5 cleanup: well under a minute cold,
+  against a minimal package set — see ci.yml's build-linux job), not a
+  multi-hour one, so the pure-logic-crate-split motivation this risk
+  described no longer applies for build-speed reasons (it could still be
+  worth doing for other reasons, just not this one). `sccache`/
+  `Swatinem/rust-cache` in CI is still a reasonable idea on its own merits,
+  just no longer an urgent one.
 - **`panic = "abort"` in the release profile** means any `expect` in the widget
   kills the app with no unwind. A2's `Result`-returning constructors matter more
   than they look.
@@ -1820,6 +1834,9 @@ and the `rusqlite` version pin that existed only to unify with
   The manifest fix was applied to `mail` directly, so that checkout builds either
   way.
 - **`libEGL.dll` and `libGLESv2.dll` are untracked and not ignored** at the repo
-  root — Servo runtime libraries loose in the working tree. Decide whether they
-  are build output (gitignore them) or required redistributables (commit them, or
-  fetch them during the build) before they get committed by accident.
+  root. *Resolved by deletion, not just historical: these were Servo runtime
+  libraries (its GL/EGL rendering path), and litehtml's `pixbuf` backend is
+  pure CPU/software with no GL/EGL dependency at all — see Track C's
+  verification notes and HANDOFF.md §3.9. There is nothing left needing a
+  packaging decision here; if the two DLL files are still sitting untracked
+  at the repo root from the Servo era, they can simply be deleted.*

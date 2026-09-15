@@ -53,9 +53,13 @@ tray-icon = { version = "0.24", default-features = false }
 winrt-notification = "0.5"
 
 # Storage / secrets
-# Pinned to 0.37 to unify with servo-storage's rusqlite; libsqlite3-sys sets
-# `links = "sqlite3"`, so only one copy may exist in the dependency graph.
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Used to be pinned to exactly 0.37 to unify with servo-storage's rusqlite
+# (libsqlite3-sys sets `links = "sqlite3"`, so only one copy may exist in the
+# dependency graph). That constraint no longer applies now that servo/
+# servo-storage are gone -- `esmail` is the only crate in the workspace that
+# depends on rusqlite (confirmed via `cargo tree -i libsqlite3-sys`), so a
+# plain lower bound is enough.
+rusqlite = { version = ">=0.37", features = ["bundled"] }
 keyring = "3.2"
 secrecy = "0.10"
 directories = "5"
