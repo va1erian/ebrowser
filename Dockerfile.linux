@@ -1,36 +1,24 @@
 # Use an official Rust image as a parent image
 FROM rust:1.85-slim-bookworm
 
-# Install system dependencies for Servo
-# Based on Servo's requirements for Linux
+# Install system dependencies. This used to be a long list for Servo (cmake,
+# nasm, clang/llvm-dev for bindgen, X11/Vulkan/Mesa/GL dev headers,
+# freetype/harfbuzz/glib, gstreamer, python3 for mach, curl, etc.) -- see
+# PLAN.md's Servo -> litehtml migration section. litehtml's `cc`-crate build
+# only needs a C/C++ compiler (build-essential) and pkg-config (probed by
+# openssl-sys and wayland-sys); nothing here needs bindgen/libclang since the
+# crate ships pre-generated FFI bindings by default. libssl-dev is for
+# native-tls (async-imap/lettre), unrelated to Servo or litehtml -- this
+# image never had it, so `cargo build --release` would already have failed
+# on openssl-sys before reaching any Servo/litehtml code. libdbus-1-dev is
+# for keyring's Linux secret-service backend, also unrelated to
+# Servo/litehtml -- keep it. Verified by a clean `cargo build --workspace`
+# against exactly this package set in a bare rust:slim-bookworm container.
 RUN apt-get update && apt-get install -y \
     build-essential \
-    cmake \
-    nasm \
     pkg-config \
-    clang \
-    llvm-dev \
-    m4 \
-    gperf \
-    libx11-dev \
-    libvulkan-dev \
-    libgl1-mesa-dri \
-    libgles2-mesa-dev \
-    libegl1-mesa-dev \
-    xorg-dev \
+    libssl-dev \
     libdbus-1-dev \
-    libfreetype6-dev \
-    libglib2.0-dev \
-    libharfbuzz-dev \
-    liblzma-dev \
-    libudev-dev \
-    libunwind-dev \
-    libxkbcommon-dev \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    curl \
-    python3 \
-    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory

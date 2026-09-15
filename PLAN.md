@@ -1623,19 +1623,207 @@ impossible without them:
 - **13 unit tests + log filtering** (`9143154`) — covering the pure helpers, and
   quietening Servo's benign chatter from 19 lines to 2 per run.
 
+## Track C — Servo → litehtml migration (Phases 0-3)
+
+Everything in Tracks A/B above describes `egui-servo-webview`, which this
+migration replaces outright with `egui-litehtml-webview`
+(`crates/egui-litehtml-webview`) — a JS-less HTML/CSS renderer via
+[litehtml](https://github.com/litehtml/litehtml) (through
+`va1erian/litehtml-rs`'s Rust bindings, a fork carrying a Windows/MSVC build
+fix found and merged in a prior session). No legitimate mail client executes
+JS in HTML email, so the entire Servo engine — and everything Track A above
+spent seven phases getting right (A3's resource interception, A5's input
+forwarding, A6's rendering path, the overlay scrollbar) — turned out to be in
+service of a JS engine nothing needed. This is a clean cutover, not a
+dual-path migration: `egui-servo-webview` is deleted, not feature-flagged.
+
+**Approved plan's phases, what landed:**
+
+| Phase | Content | Status |
+|---|---|---|
+| 0 | Workspace setup: root `Cargo.toml` swaps the `servo`/`dpi`/`http`/`raw-window-handle`/`euclid`/`keyboard-types` block for a `litehtml` git dependency (`features = ["pixbuf", "email"]`), adds `ureq` (Misc section), widens `image`'s features to `["png", "jpeg", "gif"]` | **DONE** |
+| 1 | New crate `egui-litehtml-webview` (Cargo.toml exactly as specified: `egui`/`litehtml`/`url`/`log` deps, `eframe`/`env_logger` dev-deps, `two_views` example) | **DONE** |
+| 2 | Core render pipeline: `PixbufContainer` (persistent) + fresh `litehtml::Document` per render (never stored — see the crate's own module doc for the self-referential-struct reasoning), the measure→resize→draw→resolve-images sequence, `WebViewHost`/`WebView`/`WebViewConfig`/`WebViewSource::Html`/`WebViewEvent::LinkClicked`/`WebViewHandler`/`InterceptOutcome` public API | **DONE** |
+| 3 | `crates/esmail/src/main.rs` wiring (`MessageViewHandler` now fetches allowed remote images itself via `ureq`, since litehtml has no network layer to delegate to), `egui-servo-webview` deleted, verification | **DONE** |
+| 5 (partial) | Dead Servo-era infrastructure removed: `.github/workflows/ci.yml`/`build.yml`'s Linux apt lists trimmed from ~22 packages to `build-essential pkg-config libssl-dev libdbus-1-dev` (verified by a clean `cargo build --workspace`/`cargo test --workspace --no-run` against exactly that set in a bare `rust:slim-bookworm` container — see those files' own comments for the reasoning per package, including the openssl-sys/native-tls requirement this uncovered that was previously only working by accident); Windows jobs' `choco install nasm` step removed (`ring`/litehtml/the rest of the graph built clean on this Windows dev machine with no `nasm` on `PATH`); `Dockerfile.linux`/`Dockerfile.windows` given the same trim plus `libssl-dev` added to `Dockerfile.linux` (a real, previously-missing requirement, not a Servo leftover); root `Cargo.toml`'s `rusqlite` pin relaxed from `"0.37"` to `">=0.37"` (confirmed via `cargo tree -i libsqlite3-sys` that only `esmail` depends on it now that servo-storage is gone; `cargo update -p rusqlite` resolves to 0.40.2 and the workspace builds/tests clean). HANDOFF.md §3.9 (the `libEGL.dll`/`libGLESv2.dll` runtime-DLL story) removed as no-longer-applicable; §3's other Servo-specific landmines (3.1-3.4, 3.7, 3.8) and this file's own Risks section marked historical/resolved rather than deleted, per this file's own "kept for the reasoning" convention. Not done: Phase 6 (rewriting the Servo-era narrative in PLAN.md/HANDOFF.md wholesale) — deliberately separate, later scope. | **DONE** |
+
+**API deviations from the plan's sketch, and why** (per HANDOFF.md §6's
+working agreement: fix the plan in the same commit rather than silently
+diverging):
+
+- **`WebViewHost::from_eframe(cc, size)` was dropped in favor of
+  `WebViewHost::new()` (no arguments, infallible).** The plan's own
+  Cargo.toml spec for this crate lists `eframe` only as a dev-dependency
+  (examples/tests), so a public method taking `&eframe::CreationContext`
+  cannot exist in the library without adding `eframe` as a real dependency —
+  and litehtml's `pixbuf` backend genuinely needs nothing from `cc` (no
+  window handle, no GL context), so there was nothing worth threading through
+  a parameter for. `main.rs`'s call site changed from
+  `WebViewHost::from_eframe(cc, PhysicalSize::new(1280, 720)).expect(...)` to
+  `WebViewHost::new()`.
+- **`InterceptedResponse` wrapper was dropped**; `InterceptOutcome::Serve`
+  carries a plain `Vec<u8>`. There is no HTTP status code to carry for an
+  image load the way there was for Servo's `WebResourceResponse`, so the
+  wrapper added nothing.
+- **`WebViewHandler::navigation`/`NavigationPolicy` were dropped entirely**,
+  not kept vestigially — litehtml has no navigation concept at all (see the
+  crate's `WebViewEvent::LinkClicked` doc), so there was no policy left to
+  decide, matching the plan's own "simpler is better" guidance for this case.
+- **`master_css: None`, `user_styles: Some(EMAIL_MASTER_CSS)`** — not
+  `Some(EMAIL_MASTER_CSS)` as `master_css`. Passing it as `master_css`
+  *replaces* litehtml's built-in master stylesheet (confirmed by reading
+  `litehtml_c.cpp`'s `lh_document_create_from_string`: `master_css ?
+  master_css : litehtml::master_css`) rather than layering on top of it,
+  which was tried first and produced a real bug — every element collapsed
+  onto one or two inline-flowed lines, since `<h1>`/`<p>`/`<div>`/`<table>`
+  lost their default `display: block`/`table-row`/etc. Caught by the
+  mandatory `ESMAIL_PREVIEW=demo` screenshot check per HANDOFF.md §2 (see
+  its own before/after screenshots in this session's transcript), not by any
+  test — exactly the kind of bug HANDOFF.md warns compiles clean and changes
+  no warning count.
+- **Click detection uses a short-lived, hit-test-only `Document`** (layout,
+  no draw) built on demand from `WebView::show`'s `egui::Image` response,
+  rather than keeping any `Document` alive across frames. `on_lbutton_down`
+  + `on_lbutton_up` + `take_anchor_click()` on that one-shot `Document` is
+  enough for `WebViewEvent::LinkClicked` without needing a persistent,
+  self-referential `Document`/`PixbufContainer` pair.
+
+**Found and fixed in review, after the phases above landed:**
+
+- **The page background was transparent, not opaque white.**
+  `PixbufContainer::new_with_scale`'s own doc comment says it "initializes a
+  transparent pixmap" — unlike a real browser (or the Servo-backed
+  predecessor, which always painted an opaque white canvas), litehtml only
+  paints where CSS actually says to. A message with no explicit `body {
+  background }` (the overwhelming common case for real mail) showed
+  whatever egui panel color sat behind the texture bleeding through every
+  unpainted region — confirmed visually via `ESMAIL_PREVIEW=demo` against a
+  dark theme: plain text rendered dark-on-dark instead of dark-on-white.
+  Fixed in `WebView::upload_texture` by flattening the container's
+  premultiplied pixels onto opaque white before handing them to egui
+  (`out = src_channel + (255 - alpha)` per channel — the general "over"
+  formula collapses to this once the background is pure white), rather than
+  trying to get litehtml to paint a canvas background it has no concept of.
+- **Zero unit tests, despite the approved plan asking for pure-logic
+  coverage mirroring the predecessor crate.** Extracted the pending-image
+  resolution decision (`data:` decode / unmatched `cid:` passthrough /
+  `handler.intercept` for everything else) out of `load_pending_images` into
+  a pure `resolve_image_bytes` function and added 4 unit tests covering it
+  (data-URI decode, unmatched-`cid:` never reaching the handler, a remote
+  URL being handed to the handler and its `Serve` bytes applied, and
+  `Allow`/`Block` both resolving to nothing).
+
+**Known limitation — `vh` CSS units are relative to this render's own
+content height, not a real browser viewport.** `PixbufContainer` ties
+"viewport size" and "canvas size" to the same `resize_with_scale` call, and
+this crate renders a message as one static image at its full content height
+(so `WebView::show`'s `egui::ScrollArea` can scroll it natively) rather than
+into a fixed-size scrolling viewport. A message seeded at height 1 (this
+crate's very first render) resolved `1vh` to ~0.01px, collapsing any `height:
+NNvh` block to nothing — caught by the same demo-page screenshot check (its
+`.tall { height: 60vh; }` block). Fixed by seeding a plausible
+`DEFAULT_VIEWPORT_HEIGHT` (800 logical px) rather than 1px, so `vh` resolves
+to something reasonable instead of collapsing to zero — this does not make
+`vh` mean what it would in a real browser, it just avoids the degenerate
+case. In practice this is a non-issue for real mail: no mainstream mail
+client preserves or predictably renders viewport-relative units in HTML
+email, so authors do not rely on them. See
+`egui-litehtml-webview/src/lib.rs`'s `DEFAULT_VIEWPORT_HEIGHT` doc comment
+for the full reasoning.
+
+**What did not land / deliberately out of scope for this pass:**
+
+- **Text selection (Phase 4) — investigated, confirmed real, not wired
+  up.** `litehtml::selection::Selection` is a genuine, working, well-tested
+  API in the vendored crate (`start_at`/`extend_to`/`clear`/`is_active`/
+  `selected_text`/`rectangles`, 20+ of the crate's own unit tests exercising
+  it), and `PixbufContainer::draw_selection_rects` exists to paint the
+  resulting highlight — this is a real functional capability litehtml has
+  that Servo's pinned 0.1.0 never did (see issue #21: Servo never fires a
+  repaint in response to a selection drag at all, root-caused to the engine
+  itself having no selection-UI implementation, still true as of Servo
+  0.5.0 per that issue's own investigation). Nothing in this pass wires it
+  up, per the plan's explicit scoping — the one-shot-render design (fresh
+  `Document` per interaction, not a persisted one) will need revisiting for
+  this specifically, since a drag-select gesture needs the same `Document`
+  alive across a sequence of frames (mousedown through mouseup), not just
+  for one instantaneous click the way link-detection's hit-test `Document`
+  is used today.
+- **Hover cursor / `:hover` styling** — `PixbufContainer::cursor()` and
+  `Document::on_mouse_over` exist but are not called; only click (not
+  hover/move) triggers a `Document` build. Not required by any current
+  `esmail` call site.
+- **CI/Dockerfiles (Phase 5)** and **`rusqlite` version (Phase 5)** — done in
+  a later pass (see the row below); explicitly out of scope for *this* pass
+  at the time this bullet was written.
+- **Rewriting this file's/HANDOFF.md's Servo-era history (Phase 6)** — still
+  out of scope; only the specific CI/Dockerfile/rusqlite/DLL entries Phase 5
+  called for were touched, not a wholesale rewrite of the Servo narrative.
+- **Per-image memory growth across message loads** — `PixbufContainer`'s own
+  decoded-image cache (`images: HashMap<String, Pixmap>`) is never purged by
+  `WebView::load`/`reload` (only `pending_images`/`requested_images`
+  tracking is, via `clear_pending_images`), so distinct image URLs across
+  many opened messages accumulate for the life of the `WebView`. Not
+  addressed here; `PixbufContainer` exposes no eviction API to call.
+
+**Verification actually run:** `cargo check --workspace` (clean, no
+warnings, `--examples --tests` too), `cargo test --workspace`
+(`ESMAIL_TEST_CA_TRUSTED=1`) — 115 `esmail` lib tests + 10 `main.rs` tests +
+**4 `egui-litehtml-webview` unit tests** (added in review, see above) + 15
+`mail-mock-server` integration tests (2 `#[ignore]`d stress tests) + 2
+`mail-mock-server` lib tests + 2 smoke tests, all passing. `ESMAIL_PREVIEW=demo
+ESMAIL_SCREENSHOT=... ESMAIL_SCREENSHOT_FRAMES=90` against the debug binary,
+three times across the two review passes — the first caught the
+`master_css` bug above, the second (after that fix) caught the transparent-
+background bug above (visible only because the demo screenshot happened to
+run against a dark theme — a lighter theme would have hidden it), the third
+(after both fixes) matches the pre-migration Servo baseline pixel-for-pixel
+in layout: heading, accented UTF-8 text, the link, the `From`/`Subject`
+table, and the `.tall` block extending well past the visible window
+(confirming the `ScrollArea` has real content to scroll, replacing the old
+overlay-scrollbar polling entirely) all render correctly against an opaque
+white page background. `cargo build --release --bin esmail` succeeded; the
+resulting `esmail.exe` is **12,822,016 bytes (≈12.23 MiB)** — re-confirmed
+after Phase 5's `rusqlite` bump to 0.40.2 (a negligible ~4KB larger than the
+12,817,920-byte figure first measured against 0.37, well within noise for a
+dependency-version change) — down from Servo's 100-300MB+DLLs, though larger
+than the 3.96MB fully-static build measured in the prior hands-on-validation
+session (that number came from a minimal standalone binary linking only
+`litehtml`/`tiny-skia`/`cosmic-text`, not the full `esmail` binary with
+`rusqlite` bundled, `eframe`/`egui_glow`, async-imap/tokio, keyring backends,
+etc. all still linked in). Re-verified the release build's screenshot too
+(not just debug) — identical, correct render. The
+`libEGL.dll`/`libGLESv2.dll` copy step is confirmed unnecessary and its
+HANDOFF.md §3.9 section removed by Phase 5 (see below) — litehtml's
+`pixbuf` backend is pure CPU, no GL/EGL dependency at all. (Phase 5 also
+removes the now-unnecessary Servo-era CI/Docker package lists and relaxes
+the `rusqlite` version pin that existed only to unify with
+`servo-storage`'s own requirement, both **DONE** — see Track C's Phase 5 row
+below for the full detail.)
+
 ## Risks
 
-- **Servo API churn.** `servo 0.1` is a moving pre-release. The hooks A3 needs
-  are confirmed to exist *today* (verified against the vendored 0.1.0 source),
-  but they are young and unstable — `stop()` is already missing, and
-  `notify_favicon_changed` carries no payload. Pin an exact version and expect
-  the delegate signatures to move under us.
-- **Build cost dominates the loop.** Servo is a cold multi-hour build and already
-  needs a long apt install in
-  [.github/workflows/ci.yml](.github/workflows/ci.yml). The workspace split only
-  buys fast test runs if the pure-logic parts (MIME parsing, sanitising,
-  search-query parsing, cache) live in a third crate with no Servo dependency —
-  worth doing when B3/B4 land. Add `sccache` / `Swatinem/rust-cache` to CI early.
+- **Servo API churn.** *No longer applies — Servo is gone (see Track C).* Kept
+  for the reasoning: `servo 0.1` was a moving pre-release, and the hooks A3
+  needed were confirmed to exist *today* (verified against the vendored 0.1.0
+  source) but young and unstable — `stop()` was already missing, and
+  `notify_favicon_changed` carried no payload. litehtml has no equivalent
+  delegate-hook surface to churn under us; its own API stability is a
+  different, un-investigated question.
+- **Build cost dominates the loop.** *Resolved by the Servo → litehtml
+  migration, not just historical — the long apt install in
+  [.github/workflows/ci.yml](.github/workflows/ci.yml) it refers to is gone.*
+  This used to warn that Servo was a cold multi-hour build, and that the
+  workspace split only bought fast test runs if the pure-logic parts (MIME
+  parsing, sanitising, search-query parsing, cache) moved into a third crate
+  with no Servo dependency. litehtml's build cost is a `cc`-crate compile of
+  vendored C/C++ (verified during Phase 5 cleanup: well under a minute cold,
+  against a minimal package set — see ci.yml's build-linux job), not a
+  multi-hour one, so the pure-logic-crate-split motivation this risk
+  described no longer applies for build-speed reasons (it could still be
+  worth doing for other reasons, just not this one). `sccache`/
+  `Swatinem/rust-cache` in CI is still a reasonable idea on its own merits,
+  just no longer an urgent one.
 - **`panic = "abort"` in the release profile** means any `expect` in the widget
   kills the app with no unwind. A2's `Result`-returning constructors matter more
   than they look.
@@ -1650,6 +1838,9 @@ impossible without them:
   The manifest fix was applied to `mail` directly, so that checkout builds either
   way.
 - **`libEGL.dll` and `libGLESv2.dll` are untracked and not ignored** at the repo
-  root — Servo runtime libraries loose in the working tree. Decide whether they
-  are build output (gitignore them) or required redistributables (commit them, or
-  fetch them during the build) before they get committed by accident.
+  root. *Resolved by deletion, not just historical: these were Servo runtime
+  libraries (its GL/EGL rendering path), and litehtml's `pixbuf` backend is
+  pure CPU/software with no GL/EGL dependency at all — see Track C's
+  verification notes and HANDOFF.md §3.9. There is nothing left needing a
+  packaging decision here; if the two DLL files are still sitting untracked
+  at the repo root from the Servo era, they can simply be deleted.*

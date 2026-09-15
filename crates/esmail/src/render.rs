@@ -16,7 +16,7 @@
 //! markup would mean there's no URL left for a later "load remote images"
 //! action to use. So this module leaves `http(s)` URLs exactly as the
 //! message had them, and blocking happens at the network layer instead, via
-//! `egui_servo_webview`'s `WebViewHandler::intercept` — see `main.rs`'s
+//! `egui_litehtml_webview`'s `WebViewHandler::intercept` — see `main.rs`'s
 //! `MessageViewHandler`.
 //!
 //! **Known limitation:** inline `style` attributes and `<style>` blocks are
@@ -134,8 +134,8 @@ fn find_text(part: &ParsedMail) -> Option<String> {
 /// Replace every `cid:<id>` reference in `html` with a `data:` URL built
 /// from the matching inline part's own bytes and MIME type, found by walking
 /// every part of the message for one whose `Content-ID` matches. A `cid:`
-/// with no matching part is left as-is — Servo will fail to load it, the
-/// same as any other dead link, rather than this function guessing at a
+/// with no matching part is left as-is — the webview will fail to load it,
+/// the same as any other dead link, rather than this function guessing at a
 /// replacement.
 fn resolve_cid_parts(html: &str, root: &ParsedMail) -> String {
     let mut html = html.to_string();
