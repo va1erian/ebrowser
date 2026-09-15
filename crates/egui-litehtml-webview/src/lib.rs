@@ -470,22 +470,7 @@ impl WebView {
         }
         let mut any_loaded = false;
         for (url, _redraw_on_ready) in pending {
-            let bytes = if let Some(data) = decode_data_uri(&url) {
-                Some(data)
-            } else if url.starts_with("cid:") {
-                // esmail's render.rs already inlines every resolvable
-                // Content-ID part as a data: URL before this HTML reaches
-                // the widget (B5 in PLAN.md); a cid: URL surviving to here
-                // means no matching part was found. Nothing to fetch.
-                None
-            } else {
-                let request = ImageRequest { url: url.clone() };
-                match self.handler.borrow_mut().intercept(&request) {
-                    InterceptOutcome::Serve(bytes) => Some(bytes),
-                    InterceptOutcome::Allow | InterceptOutcome::Block => None,
-                }
-            };
-            if let Some(bytes) = bytes {
+            if let Some(bytes) = resolve_image_bytes(&url, &mut *self.handler.borrow_mut()) {
                 self.container.load_image_data(&url, &bytes);
                 any_loaded = true;
             }
@@ -499,19 +484,43 @@ impl WebView {
     /// **premultiplied** RGBA -- confirmed against `pixbuf.rs`'s
     /// `load_image_data` (which explicitly premultiplies incoming image
     /// bytes before storing them) and its `blend_pixel` helper (which
-    /// documents "the pixmap stores premultiplied RGBA"). egui's own
-    /// `ColorImage::from_rgba_premultiplied` exists for exactly this, so
-    /// this uses that directly rather than the `from_rgba_unmultiplied`
-    /// entry point the Servo-backed predecessor used (Servo's own readback
-    /// was *not* premultiplied) -- un-premultiplying by hand was
-    /// unnecessary and would have been lossy at low alpha.
+    /// documents "the pixmap stores premultiplied RGBA").
+    ///
+    /// `PixbufContainer::new_with_scale`'s own doc comment says it
+    /// "initializes a transparent pixmap" -- unlike a real browser (or the
+    /// Servo-backed predecessor, which always painted an opaque white
+    /// canvas), litehtml only paints where CSS actually says to. A message
+    /// with no explicit `body { background }` (the overwhelming common
+    /// case) would otherwise show whatever egui panel color sits behind
+    /// the texture bleeding through every unpainted region -- caught by
+    /// the mandatory `ESMAIL_PREVIEW=demo` screenshot check against a dark
+    /// theme, where the demo page's plain text was rendered dark-on-dark
+    /// instead of dark-on-white. Fixed by flattening onto opaque white
+    /// ourselves before upload, rather than trying to get litehtml to
+    /// paint a canvas background it has no concept of. Compositing
+    /// premultiplied-alpha `src` over opaque white simplifies to
+    /// `out = src_channel + (255 - alpha)` per channel (the general "over"
+    /// formula's `(1-src_a)*bg` term collapses since `bg == 255`), so this
+    /// needs no general alpha-blend math, just one add per byte.
     fn upload_texture(&mut self, ctx: &egui::Context) {
         let w = self.container.width() as usize;
         let h = self.container.height() as usize;
         if w == 0 || h == 0 {
             return;
         }
-        let color_image = egui::ColorImage::from_rgba_premultiplied([w, h], self.container.pixels());
+        let mut flattened = self.container.pixels().to_vec();
+        for px in flattened.chunks_exact_mut(4) {
+            let alpha = px[3];
+            if alpha == 255 {
+                continue;
+            }
+            let carry = 255 - alpha;
+            px[0] = px[0].saturating_add(carry);
+            px[1] = px[1].saturating_add(carry);
+            px[2] = px[2].saturating_add(carry);
+            px[3] = 255;
+        }
+        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &flattened);
         match &mut self.texture {
             Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
             slot => {
@@ -537,5 +546,84 @@ impl WebView {
         doc.on_lbutton_up(x, y, x, y);
         drop(doc);
         self.container.take_anchor_click()
+    }
+}
+
+/// Decide how to resolve one pending image URL, without touching the
+/// container -- pulled out of [`WebView::load_pending_images`] so it's
+/// testable without a real [`PixbufContainer`]/`Document`. `data:` URLs are
+/// decoded locally; a surviving `cid:` URL means `esmail`'s `render.rs`
+/// found no matching part and there's nothing to fetch (see
+/// [`ImageRequest::url`]'s doc); anything else goes to `handler`.
+fn resolve_image_bytes(url: &str, handler: &mut dyn WebViewHandler) -> Option<Vec<u8>> {
+    if let Some(data) = decode_data_uri(url) {
+        return Some(data);
+    }
+    if url.starts_with("cid:") {
+        return None;
+    }
+    let request = ImageRequest { url: url.to_string() };
+    match handler.intercept(&request) {
+        InterceptOutcome::Serve(bytes) => Some(bytes),
+        InterceptOutcome::Allow | InterceptOutcome::Block => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingHandler {
+        seen: Vec<String>,
+        outcome: InterceptOutcome,
+    }
+
+    impl WebViewHandler for RecordingHandler {
+        fn intercept(&mut self, request: &ImageRequest) -> InterceptOutcome {
+            self.seen.push(request.url.clone());
+            match &self.outcome {
+                InterceptOutcome::Allow => InterceptOutcome::Allow,
+                InterceptOutcome::Block => InterceptOutcome::Block,
+                InterceptOutcome::Serve(bytes) => InterceptOutcome::Serve(bytes.clone()),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_image_bytes_decodes_a_data_uri_without_asking_the_handler() {
+        // "hi" base64-encoded, arbitrary content -- only the round trip
+        // through decode_data_uri matters here.
+        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Allow };
+        let bytes = resolve_image_bytes("data:text/plain;base64,aGk=", &mut handler);
+        assert_eq!(bytes, Some(b"hi".to_vec()));
+        assert!(handler.seen.is_empty(), "a data: URL must never reach the handler");
+    }
+
+    #[test]
+    fn resolve_image_bytes_leaves_an_unmatched_cid_unresolved_without_asking_the_handler() {
+        // render.rs (B5) already inlines every cid: part it can match as a
+        // data: URL before the HTML reaches this crate -- a cid: surviving
+        // to here means no match was found, and there's nothing to fetch.
+        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Serve(vec![1]) };
+        let bytes = resolve_image_bytes("cid:missing-part", &mut handler);
+        assert_eq!(bytes, None);
+        assert!(handler.seen.is_empty(), "an unmatched cid: URL must never reach the handler either");
+    }
+
+    #[test]
+    fn resolve_image_bytes_asks_the_handler_for_a_remote_url_and_serves_its_bytes() {
+        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Serve(vec![9, 9, 9]) };
+        let bytes = resolve_image_bytes("https://example.com/pixel.png", &mut handler);
+        assert_eq!(bytes, Some(vec![9, 9, 9]));
+        assert_eq!(handler.seen, vec!["https://example.com/pixel.png".to_string()]);
+    }
+
+    #[test]
+    fn resolve_image_bytes_blocks_a_remote_url_when_the_handler_declines() {
+        for outcome in [InterceptOutcome::Allow, InterceptOutcome::Block] {
+            let mut handler = RecordingHandler { seen: Vec::new(), outcome };
+            let bytes = resolve_image_bytes("https://example.com/track.gif", &mut handler);
+            assert_eq!(bytes, None);
+        }
     }
 }
