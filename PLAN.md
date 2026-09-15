@@ -1783,19 +1783,23 @@ table, and the `.tall` block extending well past the visible window
 (confirming the `ScrollArea` has real content to scroll, replacing the old
 overlay-scrollbar polling entirely) all render correctly against an opaque
 white page background. `cargo build --release --bin esmail` succeeded; the
-resulting `esmail.exe` is **12,817,920 bytes (≈12.2 MiB)** — down from
-Servo's 100-300MB+DLLs, though larger than the 3.96MB fully-static build
-measured in the prior hands-on-validation session (that number came from a
-minimal standalone binary linking only `litehtml`/`tiny-skia`/`cosmic-text`,
-not the full `esmail` binary with `rusqlite` bundled, `eframe`/`egui_glow`,
-async-imap/tokio, keyring backends, etc. all still linked in). Not verified:
-the `libEGL.dll`/`libGLESv2.dll` copy step in HANDOFF.md §3.9 is confirmed
-*unnecessary* now (the screenshot runs above all succeeded without them
-present next to the binary) — litehtml's `pixbuf` backend is pure CPU, no
-GL/EGL dependency at all. (Phase 5 removes this section from HANDOFF.md
-properly, along with the now-unnecessary Servo-era CI/Docker package lists
-and the `rusqlite` version pin that existed only to unify with
-`servo-storage`'s own requirement — in progress as of this writing.)
+resulting `esmail.exe` is **12,822,016 bytes (≈12.23 MiB)** — re-confirmed
+after Phase 5's `rusqlite` bump to 0.40.2 (a negligible ~4KB larger than the
+12,817,920-byte figure first measured against 0.37, well within noise for a
+dependency-version change) — down from Servo's 100-300MB+DLLs, though larger
+than the 3.96MB fully-static build measured in the prior hands-on-validation
+session (that number came from a minimal standalone binary linking only
+`litehtml`/`tiny-skia`/`cosmic-text`, not the full `esmail` binary with
+`rusqlite` bundled, `eframe`/`egui_glow`, async-imap/tokio, keyring backends,
+etc. all still linked in). Re-verified the release build's screenshot too
+(not just debug) — identical, correct render. The
+`libEGL.dll`/`libGLESv2.dll` copy step is confirmed unnecessary and its
+HANDOFF.md §3.9 section removed by Phase 5 (see below) — litehtml's
+`pixbuf` backend is pure CPU, no GL/EGL dependency at all. (Phase 5 also
+removes the now-unnecessary Servo-era CI/Docker package lists and relaxes
+the `rusqlite` version pin that existed only to unify with
+`servo-storage`'s own requirement, both **DONE** — see Track C's Phase 5 row
+below for the full detail.)
 
 ## Risks
 
