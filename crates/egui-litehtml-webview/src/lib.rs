@@ -449,15 +449,19 @@ impl WebView {
         let t_total = std::time::Instant::now();
 
         let t = std::time::Instant::now();
-        if (self.container_width - width).abs() > 0.5 || (self.container_scale - scale).abs() > 0.001 {
-            // A width or DPI change invalidates the existing buffer's
-            // layout regardless of height -- litehtml lays out for a
-            // specific width, and the pixel buffer's physical size bakes
-            // in the scale factor. Keep whatever height capacity we
-            // already had (still just a guess, still may need to grow
-            // below) rather than dropping back to a 1px-tall buffer.
-            self.resize_container(width, self.container_height, scale);
-        }
+        // Always clear the buffer before drawing, even when its capacity
+        // (width/height) isn't actually changing. `resize_with_scale` is
+        // what resets the pixmap to transparent -- it is cheap (an alloc +
+        // zero-fill, not a layout pass) -- and skipping it whenever the
+        // capacity already fit a shorter/differently-shaped message left
+        // the *previous* message's pixels in the buffer, since litehtml's
+        // `draw()` only paints where CSS says to, not the whole canvas.
+        // That showed up as one message's text visibly overlapping the
+        // next one's. Keep the "don't grow height unnecessarily" capacity
+        // reuse (still the actual expensive thing to avoid -- a resize
+        // that grows height forces a second full parse+layout+draw pass),
+        // but always re-clear at the current capacity first.
+        self.resize_container(width, self.container_height, scale);
         let t_resize = t.elapsed();
 
         let t = std::time::Instant::now();
