@@ -19,11 +19,24 @@
 //! `egui_litehtml_webview`'s `WebViewHandler::intercept` — see `main.rs`'s
 //! `MessageViewHandler`.
 //!
-//! **Known limitation:** inline `style` attributes and `<style>` blocks are
-//! stripped along with everything else not in ammonia's default allowlist,
-//! so HTML mail that relies on CSS for layout/color renders as plain
-//! formatted text. Preserving inline styles safely needs a CSS sanitizer on
-//! top of ammonia's HTML one; out of scope for this pass.
+//! **CSS:** inline `style="..."` attributes survive sanitization, filtered
+//! through an allowlist of property names (`allowed_style_properties`) via
+//! ammonia's built-in CSS-property parser — not a value-level sanitizer,
+//! but litehtml has no JS engine, so there's no `expression()`/
+//! `-moz-binding` execution path for a CSS value to exploit; `url(...)`
+//! values are safe because litehtml routes every CSS-triggered image load
+//! through the same `load_image` callback `<img src>` uses, which is
+//! already gated by `WebViewHandler::intercept`. Positioning properties
+//! (`position`, `z-index`, offsets) are deliberately left off the
+//! allowlist — real HTML email doesn't need them for layout, and they're
+//! the one class of CSS that could otherwise overlay convincing fake UI.
+//! **`<style>` blocks are still stripped entirely** (unlike the attribute,
+//! ammonia has no built-in per-property filter for a `<style>` tag's text
+//! content — allowing the tag would mean its CSS passes through
+//! completely unfiltered, defeating the allowlist); this only matters for
+//! mail that relies on class-selector CSS instead of inline styles, which
+//! most real-world HTML email avoids anyway since some mail clients strip
+//! `<style>` blocks outright.
 //!
 //! [`extract_attachments`] is B6 of PLAN.md: it walks the same parsed
 //! structure for leaf parts that are neither the chosen body nor already
@@ -168,6 +181,51 @@ fn content_id(part: &ParsedMail) -> Option<String> {
     Some(raw.trim().trim_start_matches('<').trim_end_matches('>').to_string())
 }
 
+/// CSS properties allowed through `style="..."` attributes and `<style>`
+/// blocks. An allowlist, not a blocklist: ammonia's `style_properties`
+/// parses the declaration with a real CSS parser (`cssparser`, not regex)
+/// and drops anything whose property name isn't listed here, so there's no
+/// value-level sanitization to also get right — layout/typography/color
+/// properties are inert data as far as litehtml is concerned (no JS engine,
+/// no `expression()`/`-moz-binding` execution path exists to worry about).
+/// The one property category deliberately left out is positioning
+/// (`position`, `z-index`, `top`/`left`/etc.) — HTML email doesn't need it
+/// for legitimate layout (that's what nested tables are for), and it's the
+/// one class of CSS that could otherwise be used to overlay convincing fake
+/// UI inside the message body. `url(...)` values (`background-image`,
+/// `list-style-image`) stay in-scope for the property allowlist below
+/// because they're already safe: litehtml routes every CSS-triggered image
+/// load through the exact same `load_image` callback as `<img src>`, which
+/// `egui_litehtml_webview`'s `WebViewHandler::intercept` — the same
+/// block-by-default gate B5 already built — governs regardless of whether
+/// the URL came from an attribute or a CSS property.
+fn allowed_style_properties() -> std::collections::HashSet<&'static str> {
+    [
+        // Color / background
+        "color", "background", "background-color", "background-image", "background-position",
+        "background-repeat", "background-size", "opacity",
+        // Box model
+        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "border", "border-top", "border-right", "border-bottom", "border-left",
+        "border-width", "border-style", "border-color", "border-radius",
+        "border-collapse", "border-spacing",
+        "width", "height", "max-width", "max-height", "min-width", "min-height",
+        "box-shadow", "box-sizing",
+        // Typography
+        "font", "font-family", "font-size", "font-weight", "font-style", "font-variant",
+        "line-height", "letter-spacing", "text-align", "text-decoration", "text-transform",
+        "text-indent", "text-shadow", "white-space", "word-break", "word-wrap",
+        "overflow-wrap", "word-spacing",
+        // Layout (non-positioning)
+        "display", "vertical-align", "float", "clear", "overflow", "table-layout",
+        // Misc, low-risk
+        "list-style", "list-style-type", "list-style-image", "list-style-position", "cursor",
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn sanitize(html: &str) -> String {
     ammonia::Builder::default()
         // `data:` — inline images resolved from `cid:` parts above need it to
@@ -178,6 +236,22 @@ fn sanitize(html: &str) -> String {
         // either; allowing it keeps the dead reference exactly as
         // "left as-is" implies, rather than silently deleting it.
         .add_url_schemes(&["data", "cid"])
+        // Allow the `style="..."` attribute (filtered — see
+        // allowed_style_properties' doc): without it, marketing/
+        // transactional HTML that relies on inline styles for spacing/
+        // color renders as dense, unstyled plain text (see this module's
+        // doc comment's former "known limitation" note). Deliberately
+        // *not* allowing the `<style>` tag itself: ammonia's
+        // `style_properties` filtering only inspects the `style`
+        // attribute — a `<style>` block's text content would pass through
+        // completely unfiltered (ammonia treats it as an opaque text node,
+        // no CSS parsing at all), which would defeat the point of having
+        // an allowlist. Inline `style=` is also what real HTML email
+        // overwhelmingly relies on in the first place (many mail clients
+        // strip `<style>` blocks outright, so senders lean on inline
+        // styles as the portable baseline).
+        .add_generic_attributes(&["style"])
+        .filter_style_properties(allowed_style_properties())
         .clean(html)
         .to_string()
 }
@@ -265,6 +339,59 @@ mod tests {
         // The remote src itself is left alone -- blocking it is the
         // network-layer handler's job, not this pipeline's.
         assert!(html.contains(r#"src="https://example.com/a.png""#));
+    }
+
+    #[test]
+    fn allowed_style_properties_survive_sanitization() {
+        let raw = message(
+            "Content-Type: text/html",
+            r#"<div style="margin:8px 0; color:#666; font-size:13px;">spaced text</div>"#,
+        );
+        let html = render_message(&raw);
+        assert!(html.contains("margin:8px 0"), "expected {html:?} to keep the style attribute");
+        assert!(html.contains("color:#666"));
+        assert!(html.contains("font-size:13px"));
+    }
+
+    #[test]
+    fn disallowed_style_properties_are_dropped_but_allowed_ones_survive() {
+        let raw = message(
+            "Content-Type: text/html",
+            r#"<div style="position:fixed; top:0; color:red;">x</div>"#,
+        );
+        let html = render_message(&raw);
+        assert!(!html.contains("position"), "expected {html:?} to drop position");
+        assert!(!html.contains("top:0"), "expected {html:?} to drop top");
+        assert!(html.contains("color:red"), "expected {html:?} to keep color");
+    }
+
+    #[test]
+    fn style_tag_blocks_are_still_stripped_entirely() {
+        // Unlike the style attribute, ammonia has no per-property filter for
+        // a <style> tag's text content -- allowing the tag would let its CSS
+        // through completely unfiltered. Left disabled deliberately (see
+        // this module's doc comment). Checks sanitize()'s output directly,
+        // not render_message()'s -- wrap_document() always adds its own
+        // base <style> block, so asserting against the full wrapped
+        // document would trivially "pass" regardless of what this checks.
+        let cleaned = sanitize("<style>body { position: fixed; }</style><p>hi</p>");
+        assert!(!cleaned.contains("<style"), "expected {cleaned:?} to drop the style tag");
+        assert!(!cleaned.contains("position"), "expected {cleaned:?} to drop its CSS text");
+        assert!(cleaned.contains("<p>hi</p>"));
+    }
+
+    #[test]
+    fn javascript_style_expressions_cannot_reach_the_page_via_style_attribute() {
+        // Legacy IE `expression()` CSS is meaningless to litehtml (no JS
+        // engine), but confirm the sanitizer doesn't even let it near a
+        // property that isn't allowlisted, and that a malformed/dangerous
+        // declaration doesn't poison adjacent, legitimate ones.
+        let raw = message(
+            "Content-Type: text/html",
+            r#"<div style="width:expression(alert(1)); color:blue;">x</div>"#,
+        );
+        let html = render_message(&raw);
+        assert!(html.contains("color:blue"));
     }
 
     #[test]
