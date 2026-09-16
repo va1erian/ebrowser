@@ -517,10 +517,25 @@ impl WebView {
     /// Parse + lay out + draw into `self.container`'s current pixel buffer.
     /// Returns the content height.
     fn layout_and_draw(&mut self, width: f32) -> Option<f32> {
+        let t_parse = std::time::Instant::now();
         let mut doc = self.parse()?;
+        let t_parse = t_parse.elapsed();
+
+        let t_render = std::time::Instant::now();
         let _ = doc.render(width);
+        let t_render = t_render.elapsed();
+
         let height = doc.height().max(1.0);
+
+        let t_paint = std::time::Instant::now();
         doc.draw(DrawContext::default(), 0.0, 0.0, None);
+        let t_paint = t_paint.elapsed();
+
+        log::debug!(
+            "layout_and_draw: parse={:?} render(layout)={:?} draw(paint)={:?}",
+            t_parse, t_render, t_paint,
+        );
+
         Some(height)
     }
 
