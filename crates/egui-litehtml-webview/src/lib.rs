@@ -400,7 +400,26 @@ impl WebView {
                 };
                 let size = egui::vec2(self.logical_width, self.content_height);
                 let sized = egui::load::SizedTexture::new(texture.id(), size);
-                let resp = ui.add(egui::Image::from_texture(sized).sense(egui::Sense::click()));
+                // The uploaded texture is `container_height` tall (a
+                // *capacity* this crate deliberately never shrinks between
+                // messages -- see that field's doc), not necessarily
+                // `content_height` (this message's actual content). Left
+                // at egui::Image's default UV of the whole (0,0)-(1,1)
+                // texture, a shorter message reusing a taller leftover
+                // buffer would have its entire texture -- real content
+                // plus the unused blank capacity below it -- uniformly
+                // squeezed into the `content_height`-tall display box,
+                // visibly compressing the actual rendered text/images.
+                // Crop to just the fraction of the texture that holds
+                // real content instead, so it always displays at true
+                // scale.
+                let v_max = if self.container_height > 0.0 {
+                    (self.content_height / self.container_height).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, v_max));
+                let resp = ui.add(egui::Image::from_texture(sized).uv(uv).sense(egui::Sense::click()));
 
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
