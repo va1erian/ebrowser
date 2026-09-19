@@ -33,8 +33,8 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ebrowser-linux
-          path: target/release/ebrowser
+          name: esmail-linux
+          path: target/release/esmail
 
   build-windows:
     name: Build Windows
@@ -53,16 +53,16 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path ebrowser-windows
-          Copy-Item "target/release/ebrowser.exe" -Destination "ebrowser-windows/"
-          Get-ChildItem "target/release/*.dll" | Copy-Item -Destination "ebrowser-windows/" -ErrorAction SilentlyContinue
-          Compress-Archive -Path "ebrowser-windows/*" -DestinationPath "ebrowser-windows.zip"
+          New-Item -ItemType Directory -Path esmail-windows
+          Copy-Item "target/release/esmail.exe" -Destination "esmail-windows/"
+          Get-ChildItem "target/release/*.dll" | Copy-Item -Destination "esmail-windows/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "esmail-windows/*" -DestinationPath "esmail-windows.zip"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ebrowser-windows
-          path: ebrowser-windows.zip
+          name: esmail-windows
+          path: esmail-windows.zip
 
   create-release:
     name: Create Release
@@ -73,20 +73,20 @@ jobs:
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
-          name: ebrowser-linux
+          name: esmail-linux
           path: ./artifacts/linux
           
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: ebrowser-windows
+          name: esmail-windows
           path: ./artifacts/windows
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ./artifacts/linux/ebrowser
-            ./artifacts/windows/ebrowser-windows.zip
+            ./artifacts/linux/esmail
+            ./artifacts/windows/esmail-windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
