@@ -29,12 +29,17 @@ frames back (see that crate's module doc). Consequences worth knowing:
 `allow_remote` through an atomic, not a `RefCell`); link clicks arrive a
 frame or more after the click; `ESMAIL_SCREENSHOT` waits for the webview to
 finish rendering. Image drawing (`<img width=..>`, `max-width`,
-`background-size`) is fixed by a patched copy of the `litehtml` crate in
-`vendor/litehtml` (see its `PATCHES.md`; `upstream-draw-image.patch` is ready to
-send upstream, after which the `[patch]` in `Cargo.toml` can go). The message
-action bar has an **Export...** button that saves the raw RFC822 source as an
-`.eml`; `ESMAIL_PREVIEW=some.eml` renders such a file with no account, which
-is the intended way to keep problem emails as repeatable test cases.
+`background-size`) and table layout speed both live in `litehtml-rs` `master`
+(the `draw_image` fix, and a C++ litehtml bump that memoizes table cell
+measurements -- without it layout time is exponential in table nesting depth
+and a 17-deep marketing mail never finished); don't pin `Cargo.toml` to an
+older commit. The message action bar has an **Export...** button that saves
+the raw RFC822 source as an `.eml`; `ESMAIL_PREVIEW=some.eml` renders such a
+file with no account. Problem emails are kept as repeatable test cases in
+`crates/esmail/tests/fixtures/` (redact them first -- see the README there;
+`tests/render_fixtures.rs` checks conformance and layout time, and has an
+`--include-ignored` benchmark). Known limit: a message is one texture, so a
+message taller than the GL max texture side (8192-16384 px) cannot be shown.
 
 **Your next task, now that Track C's core migration (Phases 0-3) has
 landed:**

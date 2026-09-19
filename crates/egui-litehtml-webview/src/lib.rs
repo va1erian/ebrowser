@@ -415,6 +415,13 @@ impl WebView {
         self.rendering || self.dirty
     }
 
+    /// The size, in egui points, of the page as last rendered, or `None`
+    /// until the first frame has arrived. Its height is the document's
+    /// content height at the width it was laid out at.
+    pub fn content_size(&self) -> Option<egui::Vec2> {
+        self.texture.as_ref().map(|_| self.frame_size)
+    }
+
     /// Draw the view into `ui` (inside its own scroll area) and return any
     /// queued [`WebViewEvent`]s.
     ///
