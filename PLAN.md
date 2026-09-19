@@ -14,7 +14,80 @@ rendered safely, so A3 must land before B5.
 > pick this up, including the landmines that cost real time. Sections marked
 > **DONE** below are kept for the reasoning, not as work remaining.
 
-## Where things actually stand
+## Status and roadmap (refreshed 2026-09-19 — read this first)
+
+The rest of this file is mostly a record of reasoning, kept on purpose. This
+section is the current state.
+
+| Track | State |
+|---|---|
+| **A** — `egui-servo-webview` | **Superseded.** The crate was deleted in the litehtml migration (Track C); A1-A7 are historical. |
+| **B** — the mail client | B1, B5, B10, B11 done; B2, B3, B4, B6, B7, B8, B9 partially done (remaining items below). |
+| **C** — Servo → litehtml | **Done except text selection** (#36). Phase 5 landed (`3698207`); phase 6 (rewriting the Servo-era narrative) is deliberately not done: those sections stay, marked historical. |
+| **D** — post-migration rendering work | **Done**; the open follow-ups are the performance issues below. Section after Track C. |
+
+**Open work is tracked as GitHub issues** (`va1erian/ebrowser`):
+
+| # | What |
+|---|---|
+| #31 | Dev builds render heavy mail ~15x slower: optimize dependencies in the dev profile (verified 3.5 s -> 234 ms; one Cargo line, not yet applied) |
+| #28 | litehtml-rs: cache text widths in `text_width` (95% of measurements repeat; parse -55% in a prototype) |
+| #29 | litehtml-rs: `draw_text` bypasses the glyph cache (`get_image_uncached`); paint -40% when cached |
+| #30 | litehtml-rs: paint fast paths (full-canvas clip mask, AA `fill_path` for plain rects) |
+| #27 | Clicking a link in a heavy newsletter waits on a full re-layout (hit test builds a new `Document`) |
+| #32 | Umbrella: where the render time goes on `meilleurtaux.eml`, and the path to sub-second |
+| #36 | Text selection and copy in message bodies: what is missing (needs data gathered during the render pass) |
+| #35 | Multiple accounts in one session, with new-mail watching for every account |
+| #34 | Compose in a dedicated native window instead of an in-app egui window |
+
+**Track B: what is still open** (per-section reasoning is in each section's
+"what did not land" note; *checked* = verified against the code at this
+refresh, the rest as those notes state them):
+
+- **Sync / search (B3, B4):** the header list always re-fetches from the
+  server instead of reading the cache (no offline mode); UID-based cache
+  paging; a message opened one at a time is not indexed, so search misses it;
+  server-side `UID SEARCH`/`ESEARCH` is not wired; `since:`/`before:`/
+  `is:unread`/`has:attachment` parse but are not applied (*checked*); no result
+  count next to Clear.
+- **Reading (B5, B6, B8):** whole-message `RFC822` fetches (no `BODYSTRUCTURE`
+  / `BODY.PEEK[n]`); attachments missing when a message is opened from the
+  search cache; per-sender "always load images" (*checked*: absent); the
+  mailbox tree is a flat indented list, not collapsible (*checked*); unread
+  counts are a live `STATUS` round trip; bulk flag/move cost one round trip per
+  message, no UID sets (*checked*); IDLE not tied to the selected mailbox and
+  no live header-list updates.
+- **Compose (B7):** drafts (`APPEND` with `\Draft`, *checked*: absent), a
+  send-retry queue, rich text, recipient autocomplete; the SMTP TLS mode
+  cannot be set to `StartTls` in the UI (*checked*); Reply-All Cc is
+  best-effort (envelope parsing keeps one From/To address). Compose in its own
+  window: #34.
+- **Notifications (B10, B11; Windows only):** INBOX only (per-account and
+  per-mailbox watching: #35); no click-to-open on a toast (`winrt-notification`
+  has no activation API); toasts show under "Windows PowerShell" (no AUMID
+  without an installer); no settings; no watch-status indicator; the tray and
+  toast round trip has never been verified on a real machine.
+- **Polish (B9):** per-operation progress (only bulk download has one);
+  a real first-run wizard; window geometry validated against connected
+  monitors; the theme toggle saves config synchronously on the UI thread.
+- **Session layer (B2):** in-flight fetches are not interrupted on mailbox
+  change (only stale replies are dropped by `req_id`); any error clears the
+  session and costs a reconnect.
+- **Webview:** text selection (#36); `PixbufContainer`'s decoded-image cache is
+  never evicted.
+
+**Corrections to older sections** (the original text is left as written; these
+notes are also placed inline where the claim was made):
+
+- B5 said `ammonia` strips inline `style`, so CSS-styled mail renders as plain
+  text: no longer true, inline `style=` is allowed through a property
+  allowlist (`5290dfb`).
+- B7 and B8 said the `\Sent`/`\Trash`/`\Archive` special-use wiring was not
+  done: it is (`a637fb3`).
+- The Sequencing table below says "remaining work is the small follow-ups
+  named in HANDOFF.md"; the current list is this section.
+
+## Where things actually stand (at the start of the original plan)
 
 *(Written before any work started; kept because the reasoning still explains
 why the code looks the way it does.)*
@@ -817,6 +890,10 @@ its default allowlist (no CSS sanitizer is wired in), so CSS-styled HTML mail
 renders as plain formatted text; noted in `render.rs`'s module docs as a
 known limitation, not silently accepted.
 
+**Update (2026-09-19):** the inline-`style` half of that is resolved: inline
+`style=` attributes now pass through the sanitizer, filtered by a property
+allowlist (`5290dfb`). `<style>` blocks are still not passed through as such.
+
 ### B6. Attachments — **PARTIALLY DONE**
 Enumerate non-inline parts during parse; show a chip row above the body with
 filename, MIME type and size; save-as via `rfd`, open-with via `opener`. Fetch
@@ -926,6 +1003,11 @@ its real one, since `Store::deliver`/most real IMAP servers create-on-append
 by default. There is also still no draft autosave (`APPEND` with `\Draft`)
 — the `APPEND` machinery this phase added is the same primitive drafts
 would need, but nothing calls it for that purpose yet.
+
+**Update (2026-09-19):** the special-use half is done: `\Sent`/`\Trash`/
+`\Archive` targeting follows the server's special-use folders with a
+name-based fallback (`a637fb3`, `find_special_use_mailbox` in `main.rs`).
+Drafts are still not done.
 
 **What else did not land, and why:**
 - **Rich-text composing.** The plan itself sequences this after plain-text
@@ -1081,6 +1163,7 @@ keystroke ever turns out to be too chatty in practice.
   reply arrives (nothing to look up yet) and wasn't attempted here to avoid
   touching B7's already-shipped Sent-on-send path under this phase's own
   time budget.
+  **Update (2026-09-19):** wired since, in `a637fb3`.
 - **A real recursive/collapsible tree widget.** The left panel renders
   `flatten_tree`'s output as an always-fully-expanded indented list, not a
   `CollapsingHeader`-per-node tree a user could fold shut. Fine for the
@@ -1612,6 +1695,10 @@ to verify against.
 Phases 2 and 3 are independent and can run in parallel. A5–A7 are deliberately
 late: they improve the widget, but nothing in Track B waits on them.
 
+*(Update 2026-09-19: Track A was superseded by Track C, and the follow-up
+work is Track D. The current open list is the "Status and roadmap" section at
+the top of this file, not "the small follow-ups named in HANDOFF.md".)*
+
 **Landed outside the phase plan**, because verifying anything visual was
 impossible without them:
 
@@ -1749,6 +1836,12 @@ for the full reasoning.
   alive across a sequence of frames (mousedown through mouseup), not just
   for one instantaneous click the way link-detection's hit-test `Document`
   is used today.
+  **Update (2026-09-19):** tracked as #36, which spells out what is missing
+  and three ways to get around the `Document`-lifetime problem (the preferred
+  one records the text runs and link rectangles during the render pass and does
+  selection on the UI side, sharing plumbing with the link-click fix in #27).
+  The render worker (Track D) did not change the constraint: it still builds a
+  `Document` per pass and drops it.
 - **Hover cursor / `:hover` styling** — `PixbufContainer::cursor()` and
   `Document::on_mouse_over` exist but are not called; only click (not
   hover/move) triggers a `Document` build. Not required by any current
@@ -1800,6 +1893,91 @@ removes the now-unnecessary Servo-era CI/Docker package lists and relaxes
 the `rusqlite` version pin that existed only to unify with
 `servo-storage`'s own requirement, both **DONE** — see Track C's Phase 5 row
 below for the full detail.)
+
+## Track D — post-migration rendering work (worker thread, image fidelity, layout speed)
+
+Everything here happened after Track C's migration, driven by real mail (a
+LinkedIn invitation, a Salesforce Marketing Cloud newsletter with tables nested
+17 deep) and live use. Decisions and their reasons; the numbers are from the
+measurements recorded in `docs/PERFORMANCE.md`.
+
+**D1. Rendering off the UI thread** (`c562c84`). litehtml's parse + layout took
+seconds on newsletters and image fetches are network I/O, so a
+`WebView` now owns a render thread that holds the (`!Send`) `PixbufContainer`;
+the UI thread sends jobs (render, hit test) and uploads finished frames. Jobs
+carry an id: superseded renders (window resize, clicking through messages) are
+dropped from the queue and abandoned between stages, and the UI ignores frames
+whose id is not the newest. `load()` invalidates in-flight work immediately.
+Remote images are fetched up to eight at a time with a per-image timeout;
+`WebViewHandler` became `Send + Sync` with `&self` methods (esmail flips
+`allow_remote` through an atomic). When remote images are involved, the
+text-only frame is sent first. Consequences: link clicks resolve a frame or
+more later (#27); `ESMAIL_SCREENSHOT` waits for the webview to finish; a job
+superseded mid-fetch makes the next job forget requested image URLs, or images
+would silently never load after a resize. Still no persisted `Document` (it
+borrows the container), which is what blocks text selection and cheap link
+hit-testing (#36, #27).
+
+**D2. Bug fixed on the way: the redraw drew over the previous pass** without
+clearing the canvas, so text moved by the second pass stayed visible
+(overlapping text in image-heavy mail). Every draw pass now starts from a
+cleared canvas.
+
+**D3. Image sizing** (`534e430`, then litehtml-rs #3). `PixbufContainer::
+draw_image` blitted images at their natural pixel size at the border box,
+ignoring `origin_box` (the size/position litehtml computes from `width`/
+`height`, `max-width`, `background-size`/`-position`) and `background-repeat`.
+Fixed in litehtml-rs (scale to `origin_box`, tile, clip; tile count bounded
+because `background-size` is author-controlled); it was carried as a vendored
+copy of the `litehtml` crate until merged upstream, then removed (`9819b05`).
+
+**D4. Table layout speed.** litehtml layout time was exponential in table
+nesting depth (measured on the old dependency: 12 levels 33 ms, 20 levels
+1.5 s, 24 levels over 20 s); the 17-deep newsletter never finished laying out.
+The fix is the table-cell measurement memoization in the C++ litehtml, pulled
+in through litehtml-rs `master` (`0cdb75b`, `aa1a469`); do not pin `Cargo.toml`
+to an older litehtml-rs commit. A regression test lays out 24 nested tables
+under a timeout and was checked to exceed it on the old dependency.
+
+**D5. Canvas seed and one layout pass** (`0cdb75b`). The canvas is a capacity
+that only grows, and content taller than it forces a second full parse +
+layout (a `Document` cannot survive a resize). Seeding at 800 px doubled the
+cost of the first tall message; it now starts at 4000 px and skips the paint
+when content overflows (that message: 6.5 s -> 3.5 s in a debug build).
+
+**D6. Tiling** (`55a23be`). A message was one GPU texture, which fails beyond
+the maximum texture side (2048 headless, 8192-16384 on typical GL); egui
+debug-asserts on the upload. The finished frame is cut into a grid of tiles no
+larger than the context's `max_texture_side`, flattened per tile, painted edge
+to edge and only where visible.
+
+**D7. Export and fixtures** (`c562c84`, `9819b05`). An **Export...** button saves
+a message's raw RFC822 source as an `.eml` (fetched on the IMAP body worker);
+`ESMAIL_PREVIEW=x.eml` renders it with no account. Problem emails are kept as
+redacted test cases in `crates/esmail/tests/fixtures/` (the README lists what
+real newsletters carry that must be redacted: the recipient address, delivery
+and signature headers, unsubscribe JWTs, bounce tokens and per-recipient
+tracking tokens); `tests/render_fixtures.rs` checks conformance, bounded
+layout time, a plausible height, and that no fixture carries personal
+identifiers.
+
+**D8. Measuring and profiling** (`20fa906`; `docs/PERFORMANCE.md`,
+`tools/render-profiler`). Findings on the Meilleurtaux fixture (one machine,
+render = parse + layout + paint): release opt-level 3 ~330 ms, release `z`
+(our profile) ~475 ms, **dev ~3.5 s in the real app, dropping to 234 ms with
+`[profile.dev.package."*"] opt-level = 3`** (#31); the dev cost is the Rust
+dependencies (cosmic-text/rustybuzz shaping, swash/skrifa rasterization)
+compiled unoptimized, with the C++ layout the smaller share. Code-level
+hot spots at opt-level 3: 63% of parse is uncached text measurement (#28),
+paint re-rasterizes every glyph because the glyph cache is bypassed (#29) and
+rebuilds full-canvas clip masks (#30), layout is dominated by allocation
+churn in litehtml's line boxes (upstream). See #32 for the breakdown and the
+proposed order.
+
+**What did not land:** everything in the issue table at the top of this file
+under "Open work", in particular selection (#36), the link-click cost (#27) and
+the litehtml-rs performance changes (#28-#30, prototyped and measured but not
+opened as PRs).
 
 ## Risks
 
