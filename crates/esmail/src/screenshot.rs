@@ -49,8 +49,15 @@ impl Screenshotter {
     }
 
     /// Call once per frame. Requests captures and writes out any that arrived.
-    pub fn update(&mut self, ctx: &egui::Context) {
-        self.frames_seen += 1;
+    ///
+    /// `content_ready` is whether the webview has finished rendering the page:
+    /// it renders on a background thread, so the fixed frame count alone can
+    /// pass long before a slow page has any pixels on screen. The automatic
+    /// capture only starts counting frames once it is true.
+    pub fn update(&mut self, ctx: &egui::Context, content_ready: bool) {
+        if content_ready {
+            self.frames_seen += 1;
+        }
 
         // Keep frames coming even when nothing else is animating, or an
         // automatic capture would wait forever for an idle UI to repaint.

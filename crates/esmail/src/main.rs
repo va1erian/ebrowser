@@ -14,8 +14,8 @@ use db::{DbActor, DbCommand, DbEvent};
 use config::{AccountConfig, Config};
 use search_query::ParsedQuery;
 use secrecy::SecretString;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Image-loading policy for the single [`WebView`] esmail reuses to show
@@ -39,16 +39,47 @@ use tokio::sync::mpsc;
 /// itself with `ureq` and hands the bytes back via
 /// `InterceptOutcome::Serve` — there is no "let the engine fetch it"
 /// option to fall back on.
+///
+/// `intercept` runs on the webview's render thread, several calls at a time
+/// (see [`WebViewHandler`]), so the UI thread flips `allow_remote` through a
+/// shared `Arc` -- an atomic, so it never has to wait for a download in
+/// flight -- and blocking on the network here is fine.
 struct MessageViewHandler {
-    allow_remote: bool,
+    allow_remote: AtomicBool,
+    agent: ureq::Agent,
+}
+
+impl MessageViewHandler {
+    /// Give up on a single image after this long, so one dead tracking-pixel
+    /// host cannot hold up the message's remaining images indefinitely (ureq
+    /// has no timeout at all unless asked).
+    const IMAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    fn new() -> Self {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Self::IMAGE_FETCH_TIMEOUT))
+            .build();
+        Self {
+            allow_remote: AtomicBool::new(false),
+            agent: ureq::Agent::new_with_config(config),
+        }
+    }
+
+    fn allow_remote(&self) -> bool {
+        self.allow_remote.load(Ordering::Relaxed)
+    }
+
+    fn set_allow_remote(&self, allow: bool) {
+        self.allow_remote.store(allow, Ordering::Relaxed);
+    }
 }
 
 impl WebViewHandler for MessageViewHandler {
-    fn intercept(&mut self, request: &ImageRequest) -> InterceptOutcome {
-        if !self.allow_remote {
+    fn intercept(&self, request: &ImageRequest) -> InterceptOutcome {
+        if !self.allow_remote() {
             return InterceptOutcome::Block;
         }
-        match ureq::get(&request.url).call() {
+        match self.agent.get(&request.url).call() {
             Ok(response) => match response.into_body().read_to_vec() {
                 Ok(bytes) => InterceptOutcome::Serve(bytes),
                 Err(e) => {
@@ -96,7 +127,7 @@ struct EsMailApp {
     /// Bound to `web_view` at construction. Toggled per-message by the "Load
     /// remote images" button; reset to blocked whenever a new message is
     /// opened. See [`MessageViewHandler`].
-    message_view_handler: Rc<RefCell<MessageViewHandler>>,
+    message_view_handler: Arc<MessageViewHandler>,
     screenshotter: screenshot::Screenshotter,
     /// Show only the webview, with no IMAP account. See ESMAIL_PREVIEW.
     preview: bool,
@@ -333,6 +364,13 @@ impl EsMailApp {
                 },
                 Err(e) => WebViewSource::Html(format!("<h1>could not fetch {target}</h1><p>{e}</p>")),
             },
+            // An exported message (see the "Export..." button): render it
+            // through the same pipeline a live message goes through, so a
+            // saved real-world email can be reproduced without an account.
+            Some(path) if path.to_ascii_lowercase().ends_with(".eml") => match std::fs::read(path) {
+                Ok(raw) => WebViewSource::Html(render::render_message(&raw)),
+                Err(e) => WebViewSource::Html(format!("<h1>could not read {path}</h1><p>{e}</p>")),
+            },
             Some(path) => match std::fs::read_to_string(path) {
                 Ok(html) => WebViewSource::Html(html),
                 Err(e) => WebViewSource::Html(format!("<h1>could not read {path}</h1><p>{e}</p>")),
@@ -390,7 +428,7 @@ impl EsMailApp {
         // egui-litehtml-webview's `WebViewHost` doc), unlike the Servo-backed
         // predecessor's `WebViewHost::from_eframe`, so this is infallible.
         let web_view_host = WebViewHost::new();
-        let message_view_handler = Rc::new(RefCell::new(MessageViewHandler { allow_remote: false }));
+        let message_view_handler = Arc::new(MessageViewHandler::new());
         let web_view = web_view_host.new_view(
             &cc.egui_ctx,
             WebViewConfig::new(source).with_handler(message_view_handler.clone()),
@@ -554,6 +592,12 @@ impl EsMailApp {
                         self.web_view.load(WebViewSource::Html(msg));
                     }
                     self.push_banner(format!("Could not load message: {error}"));
+                }
+                ImapEvent::Exported { path } => {
+                    self.status = format!("Exported message to {}", path.display());
+                }
+                ImapEvent::ExportFailed { error } => {
+                    self.push_banner(format!("Could not export message: {error}"));
                 }
                 ImapEvent::DownloadProgress { current, total } => {
                     self.download_progress = Some((current, total));
@@ -900,6 +944,26 @@ impl EsMailApp {
         let _ = self.imap_tx.try_send(ImapCommand::FetchBody { mailbox, uid, req_id });
     }
 
+    /// Save the open message's raw RFC822 source as an `.eml` file, chosen
+    /// through a native save dialog. The fetch and the write happen on the
+    /// IMAP body worker (`ImapCommand::ExportMessage`), not here. Does
+    /// nothing if no message is open or the dialog is cancelled.
+    fn export_selected_message(&mut self, header: &MailHeader) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Email message", &["eml"])
+            .set_file_name(export_file_name(&header.subject, header.uid))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = format!("Exporting message to {}...", path.display());
+        let _ = self.imap_tx.try_send(ImapCommand::ExportMessage {
+            mailbox: self.selected_mailbox.clone(),
+            uid: header.uid,
+            path,
+        });
+    }
+
     /// Open a message the way a click on it (or `j`/`k` + `Enter`, see the
     /// keyboard-shortcut handling in `ui()`) does: select it, blank the
     /// viewer while it loads, and either `FetchBody` (a live message) or
@@ -909,7 +973,7 @@ impl EsMailApp {
         self.selected_uid = Some(uid);
         // A new message defaults to blocked remote content, same as any
         // other mail client; "Load remote images" opts back in per view.
-        self.message_view_handler.borrow_mut().allow_remote = false;
+        self.message_view_handler.set_allow_remote(false);
         self.current_attachments.clear();
         self.web_view.load(WebViewSource::Html("<i>Loading message...</i>".to_string()));
         if is_search {
@@ -1392,7 +1456,7 @@ impl eframe::App for EsMailApp {
         // unlike the Servo-backed predecessor, there is nothing to do here
         // once per frame before the views are drawn.
 
-        self.screenshotter.update(ui.ctx());
+        self.screenshotter.update(ui.ctx(), !self.web_view.is_rendering());
 
         // Window-geometry persistence (B9): keep the latest known outer rect
         // around every frame (cheap -- just a field write, no I/O), and
@@ -1881,6 +1945,13 @@ impl eframe::App for EsMailApp {
                                 if ui.button("Delete").clicked() {
                                     self.delete_selection();
                                 }
+                                if ui
+                                    .button("Export...")
+                                    .on_hover_text("Save this message's raw source as an .eml file")
+                                    .clicked()
+                                {
+                                    self.export_selected_message(&header);
+                                }
                             });
                         });
                     }
@@ -1890,12 +1961,12 @@ impl eframe::App for EsMailApp {
                     // shown rather than only when the message actually has
                     // remote images — knowing whether it does would mean
                     // parsing the HTML again here just to answer that.
-                    if !self.message_view_handler.borrow().allow_remote {
+                    if !self.message_view_handler.allow_remote() {
                         egui::Panel::top("remote_images_bar").show_inside(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Remote images are blocked for this message.");
                                 if ui.button("Load remote images").clicked() {
-                                    self.message_view_handler.borrow_mut().allow_remote = true;
+                                    self.message_view_handler.set_allow_remote(true);
                                     // The markup never lost its original
                                     // http(s) URLs (see render.rs) -- a
                                     // reload against the same document is
@@ -2161,6 +2232,22 @@ fn safe_attachment_filename(filename: &str) -> String {
     }
 }
 
+/// A default file name for exporting a message: its subject, reduced to
+/// characters that are safe in a file name on every OS, plus `.eml`. Falls
+/// back to the UID when the subject leaves nothing usable.
+fn export_file_name(subject: &str, uid: u32) -> String {
+    let cleaned: String = subject
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    let cleaned: String = cleaned.trim_matches(|c: char| c == '.' || c == '_' || c.is_whitespace()).chars().take(60).collect();
+    if cleaned.is_empty() {
+        format!("message-{uid}.eml")
+    } else {
+        format!("{}.eml", cleaned.trim_end())
+    }
+}
+
 /// The set of UIDs between `anchor` and `uid` (inclusive) in `list`'s
 /// current order, for shift-click range selection (B8). Falls back to just
 /// `{uid}` if either isn't actually in `list` (e.g. the anchor was on a page
@@ -2317,6 +2404,26 @@ mod tests {
             safe_attachment_filename(r"C:\Windows\System32\evil.dll"),
             "evil.dll"
         );
+    }
+
+    // ── export_file_name ─────────────────────────────────────────────────────
+
+    #[test]
+    fn export_file_name_uses_the_subject_with_unsafe_characters_replaced() {
+        assert_eq!(export_file_name("Votre projet: un coup de pouce.", 7), "Votre projet_ un coup de pouce.eml");
+        assert_eq!(export_file_name(r"a/b\c?d", 7), "a_b_c_d.eml");
+    }
+
+    #[test]
+    fn export_file_name_falls_back_to_the_uid() {
+        assert_eq!(export_file_name("", 42), "message-42.eml");
+        assert_eq!(export_file_name("???", 42), "message-42.eml");
+    }
+
+    #[test]
+    fn export_file_name_is_bounded() {
+        let name = export_file_name(&"x".repeat(500), 1);
+        assert_eq!(name.len(), 60 + ".eml".len());
     }
 
     // ── find_special_use_mailbox ─────────────────────────────────────────────

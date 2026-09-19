@@ -20,6 +20,22 @@ deleted just because it stopped being current work), not as work remaining.
 Track C's own "what landed / what did not" writeup in PLAN.md is the
 current source of truth for the webview layer.
 
+**Webview rendering now happens on a worker thread** (after the migration
+above). `egui-litehtml-webview`'s `WebView` no longer parses/lays out/draws or
+fetches images on the UI thread: each view owns a render thread that holds the
+`PixbufContainer`, fetches remote images in parallel, and sends finished
+frames back (see that crate's module doc). Consequences worth knowing:
+`WebViewHandler` is now `Send + Sync` with `&self` methods (flip
+`allow_remote` through an atomic, not a `RefCell`); link clicks arrive a
+frame or more after the click; `ESMAIL_SCREENSHOT` waits for the webview to
+finish rendering. Image drawing (`<img width=..>`, `max-width`,
+`background-size`) is fixed by a patched copy of the `litehtml` crate in
+`vendor/litehtml` (see its `PATCHES.md`; `upstream-draw-image.patch` is ready to
+send upstream, after which the `[patch]` in `Cargo.toml` can go). The message
+action bar has an **Export...** button that saves the raw RFC822 source as an
+`.eml`; `ESMAIL_PREVIEW=some.eml` renders such a file with no account, which
+is the intended way to keep problem emails as repeatable test cases.
+
 **Your next task, now that Track C's core migration (Phases 0-3) has
 landed:**
 - **Track C Phase 4 — text selection.** Investigated and confirmed real:
