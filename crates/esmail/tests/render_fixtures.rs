@@ -52,9 +52,11 @@ fn render_headless(html: String, width: f32, limit: Duration) -> (Duration, egui
     };
     let started = Instant::now();
     loop {
-        let _ = ctx.run_ui(input(), |ui| {
+        // Nothing uploads the textures headless; egui asserts that an
+        // unapplied `TexturesDelta` is cleared rather than dropped.
+        ctx.run_ui(input(), |ui| {
             view.show(ui);
-        });
+        }).textures_delta.clear();
         if !view.is_rendering() {
             break;
         }

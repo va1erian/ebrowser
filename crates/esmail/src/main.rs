@@ -1485,7 +1485,7 @@ impl eframe::App for EsMailApp {
         }
 
         if self.preview {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 for event in self.web_view.show(ui) {
                     // `WebViewEvent` has one variant today (LinkClicked) --
                     // matched with `let` rather than `if let` since the
@@ -1531,7 +1531,7 @@ impl eframe::App for EsMailApp {
             });
         }
 
-        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+        egui::Panel::top("top_panel").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("esMail");
                 ui.separator();
@@ -1588,7 +1588,7 @@ impl eframe::App for EsMailApp {
         // so they don't shove the search box around; a dismissed banner is
         // just removed from the list, nothing more.
         if !self.banners.is_empty() {
-            egui::Panel::top("error_banners").show_inside(ui, |ui| {
+            egui::Panel::top("error_banners").show(ui, |ui| {
                 let mut dismissed = None;
                 for banner in &self.banners {
                     ui.horizontal(|ui| {
@@ -1611,7 +1611,7 @@ impl eframe::App for EsMailApp {
         }
 
         if !self.is_connected {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.group(|ui| {
                         ui.set_width(300.0);
@@ -1716,7 +1716,7 @@ impl eframe::App for EsMailApp {
             // `max_height(220.0)` scroll area regardless of how much vertical
             // room the window actually had. As its own resizable panel, the
             // tree gets the full column width and full available height.
-            egui::Panel::left("mailbox_panel").resizable(true).default_size(240.0).show_inside(ui, |ui| {
+            egui::Panel::left("mailbox_panel").resizable(true).default_size(240.0).show(ui, |ui| {
                 ui.heading("Mailboxes");
                 egui::ScrollArea::vertical().id_salt("mailboxes_scroll").show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
@@ -1768,7 +1768,7 @@ impl eframe::App for EsMailApp {
             });
 
             // Message list, as its own column next to the mailbox tree.
-            egui::Panel::left("message_list_panel").resizable(true).default_size(320.0).show_inside(ui, |ui| {
+            egui::Panel::left("message_list_panel").resizable(true).default_size(320.0).show(ui, |ui| {
                 let title = if self.search_results.is_some() {
                     "Search Results".to_string()
                 } else {
@@ -1811,7 +1811,7 @@ impl eframe::App for EsMailApp {
                 });
 
                 if self.search_results.is_none() {
-                    egui::Panel::bottom("pagination_panel").show_inside(ui, |ui| {
+                    egui::Panel::bottom("pagination_panel").show(ui, |ui| {
                         ui.horizontal(|ui| {
                             if ui.button("<").clicked() && self.current_page > 1 {
                                 self.current_page -= 1;
@@ -1872,7 +1872,7 @@ impl eframe::App for EsMailApp {
             });
 
             if let Some((current, total)) = self.download_progress {
-                egui::Panel::bottom("progress_status").show_inside(ui, |ui| {
+                egui::Panel::bottom("progress_status").show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("Indexing {}... ", self.selected_mailbox));
                         ui.add(egui::ProgressBar::new(current as f32 / total as f32)
@@ -1881,7 +1881,7 @@ impl eframe::App for EsMailApp {
                 });
             }
 
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(uid) = self.selected_uid {
                     // Cloned rather than borrowed: the Reply/Reply All/
                     // Forward buttons below need `&mut self.compose` while
@@ -1889,7 +1889,7 @@ impl eframe::App for EsMailApp {
                     // `self.headers` (the same reason the mailbox/message
                     // list loops elsewhere in this file defer their sends).
                     if let Some(header) = self.headers.iter().find(|h| h.uid == uid).cloned() {
-                        egui::Panel::top("mail_info").show_inside(ui, |ui| {
+                        egui::Panel::top("mail_info").show(ui, |ui| {
                             egui::Grid::new("mail_info_grid").num_columns(2).show(ui, |ui| {
                                 ui.label(egui::RichText::new("From:").strong());
                                 ui.add(egui::Label::new(&header.from).selectable(true));
@@ -1962,7 +1962,7 @@ impl eframe::App for EsMailApp {
                     // remote images — knowing whether it does would mean
                     // parsing the HTML again here just to answer that.
                     if !self.message_view_handler.allow_remote() {
-                        egui::Panel::top("remote_images_bar").show_inside(ui, |ui| {
+                        egui::Panel::top("remote_images_bar").show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Remote images are blocked for this message.");
                                 if ui.button("Load remote images").clicked() {
@@ -1979,7 +1979,7 @@ impl eframe::App for EsMailApp {
                     }
 
                     if !self.current_attachments.is_empty() {
-                        egui::Panel::top("attachments_bar").show_inside(ui, |ui| {
+                        egui::Panel::top("attachments_bar").show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 for attachment in &self.current_attachments {
                                     ui.group(|ui| {

@@ -9,9 +9,9 @@ publish = false
 
 [workspace.dependencies]
 # GUI
-eframe = { version = "0.34.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-egui = "0.34.1"
-egui_glow = "0.34.1"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "links", "x11", "wayland"] }
+egui = "0.36.2"
+egui_glow = "0.36.2"
 
 # HTML/CSS rendering engine for message bodies (litehtml migration -- see
 # PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML
