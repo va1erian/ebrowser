@@ -2353,10 +2353,20 @@ fn preview_demo_html() -> String {
 /// about individual malformed fonts installed on the system, which says
 /// nothing about this application -- `RUST_LOG` overrides the default if
 /// that gets noisy.
+///
+/// `html5ever` (the parser inside `ammonia`, our sanitizer) logs a warning
+/// for every misnested table node ("foster parenting not implemented"), and
+/// marketing HTML is full of them -- one message can produce hundreds of
+/// identical lines, none actionable. It is muted even when `RUST_LOG` is set
+/// (people set that to see *our* debug output), unless `RUST_LOG` mentions
+/// `html5ever` itself.
 fn init_logging() {
     const QUIET: &str = "warn,fontdb=error";
 
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| QUIET.to_string());
+    let mut filter = std::env::var("RUST_LOG").unwrap_or_else(|_| QUIET.to_string());
+    if !filter.contains("html5ever") {
+        filter.push_str(",html5ever=error");
+    }
     let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
 }
 

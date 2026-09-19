@@ -2240,7 +2240,7 @@ dependencies = [
 [[package]]
 name = "litehtml-sys"
 version = "0.2.5"
-source = "git+https://github.com/va1erian/litehtml-rs.git#61125c8a9c96e3b18344e23b9481b3719527e1cd"
+source = "git+https://github.com/va1erian/litehtml-rs.git?branch=bump-litehtml-table-measure-cache#9f8cad64b98730b369ac868f2e3874122958158b"
 dependencies = [
  "cc",
 ]

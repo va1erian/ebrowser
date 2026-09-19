@@ -90,26 +90,31 @@ use litehtml::html::decode_data_uri;
 use litehtml::pixbuf::PixbufContainer;
 use litehtml::{Document, DrawContext};
 
-/// Seed/fallback viewport height (logical points) used for `vh`-unit CSS
-/// resolution.
+/// Height (logical points) the pixel canvas starts at, before any message has
+/// been measured.
+///
+/// It is a *capacity*: content taller than the canvas cannot be drawn until
+/// the canvas is resized, and a `Document` cannot survive a resize, so the
+/// whole parse + layout has to be done again. On real newsletters that
+/// parse + layout is the expensive part (seconds), so a too-small seed
+/// doubled the cost of opening the first tall message. Marketing mail is
+/// routinely 2000-4000px tall, hence this value; a canvas this size costs
+/// only a few tens of MB and a zero-fill per pass. It grows (never shrinks)
+/// when a message needs more.
 ///
 /// **Known limitation:** this crate renders a message body as one static
 /// image at its full content height (so [`WebView::show`]'s `ScrollArea` can
 /// scroll it natively), not into a fixed-size viewport the way a real
 /// browser window is. `PixbufContainer` has no separate "viewport size" from
 /// "canvas size" -- both come from the same `resize_with_scale` call -- so
-/// `vh` units end up relative to *this render's own canvas height*, not a
-/// stable window size. A canvas seeded at height 1 would resolve `1vh` to
-/// ~0.01px, collapsing any `height: NNvh` block to nothing -- a real bug
-/// this constant exists to avoid, caught by the mandatory
-/// `ESMAIL_PREVIEW=demo` screenshot check (see HANDOFF.md §2) against the
-/// demo page's own `.tall { height: 60vh; }` block. Seeding with a plausible
-/// window height instead means `vh` at least resolves to something
-/// reasonable rather than collapsing to zero; it does not make `vh` mean
-/// what it would in a real browser. In practice this is a non-issue for
-/// real mail: no mainstream mail client preserves or predictably renders
+/// `vh` units end up relative to *the canvas height*, not a stable window
+/// size. (A canvas seeded at height 1 would resolve `1vh` to ~0.01px,
+/// collapsing any `height: NNvh` block to nothing -- a real bug, caught by
+/// the `ESMAIL_PREVIEW=demo` screenshot check against the demo page's own
+/// `.tall { height: 60vh; }` block.) In practice this is a non-issue for real
+/// mail: no mainstream mail client preserves or predictably renders
 /// viewport-relative units in HTML email, so authors do not rely on them.
-const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
+const INITIAL_CANVAS_HEIGHT: u32 = 4000;
 
 /// How many image URLs the worker fetches at the same time.
 const MAX_PARALLEL_FETCHES: usize = 8;
@@ -627,12 +632,12 @@ impl Worker {
         latest_id: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            container: PixbufContainer::new_with_scale(1, DEFAULT_VIEWPORT_HEIGHT, ctx.pixels_per_point()),
+            container: PixbufContainer::new_with_scale(1, INITIAL_CANVAS_HEIGHT, ctx.pixels_per_point()),
             handler,
             ctx,
             out,
             latest_id,
-            container_height: DEFAULT_VIEWPORT_HEIGHT as f32,
+            container_height: INITIAL_CANVAS_HEIGHT as f32,
             total_images_loaded: 0,
             reset_images_next: false,
         }
@@ -773,17 +778,20 @@ impl Worker {
     /// pixmap to transparent, and it is cheap (an alloc + zero-fill).
     fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
         self.resize_container(width, self.container_height, scale);
-        let height = self.layout_and_draw(html, width)?;
-        if height <= self.container_height + 0.5 {
+        let (height, drawn) = self.layout_and_draw(html, width, self.container_height)?;
+        if drawn {
             return Some(height);
         }
+        // Did not fit: grow the canvas and lay out again from scratch.
         self.resize_container(width, height, scale);
-        Some(self.layout_and_draw(html, width).unwrap_or(height))
+        Some(self.layout_and_draw(html, width, f32::INFINITY).map_or(height, |(h, _)| h))
     }
 
     /// Parse + lay out + draw into the container's current pixel buffer.
-    /// Returns the content height.
-    fn layout_and_draw(&mut self, html: &str, width: f32) -> Option<f32> {
+    /// Returns the content height, and whether it was drawn: when the content
+    /// is taller than `max_height` the (pointless) paint is skipped and the
+    /// caller is expected to grow the canvas and call again.
+    fn layout_and_draw(&mut self, html: &str, width: f32, max_height: f32) -> Option<(f32, bool)> {
         let t_parse = Instant::now();
         // `master_css: None` is deliberate, not an oversight: the vendored
         // litehtml C++ core only falls back to its own **built-in** master
@@ -813,6 +821,10 @@ impl Worker {
         let t_render = t_render.elapsed();
 
         let height = doc.height().max(1.0);
+        if height > max_height + 0.5 {
+            log::debug!("layout_and_draw: parse={t_parse:?} render(layout)={t_render:?} (too tall for the canvas, not drawn)");
+            return Some((height, false));
+        }
 
         let t_paint = Instant::now();
         doc.draw(DrawContext::default(), 0.0, 0.0, None);
@@ -821,7 +833,7 @@ impl Worker {
         log::debug!(
             "layout_and_draw: parse={t_parse:?} render(layout)={t_render:?} draw(paint)={t_paint:?}",
         );
-        Some(height)
+        Some((height, true))
     }
 
     /// Resize the pixel buffer to `width` x `height` (logical points) at
@@ -1165,6 +1177,38 @@ mod tests {
         let frame = last_frame(&outputs);
         assert_eq!(frame.id, 2);
         assert_eq!(pixel(frame, 10, 10), [255, 0, 0, 255], "the image was never re-requested");
+    }
+
+    #[test]
+    fn deeply_nested_layout_tables_finish_laying_out() {
+        // Marketing mail nests layout tables (and floats them with
+        // `align=left`) many levels deep. Without the table-cell measurement
+        // memoization in the C++ litehtml this workspace pins (see the
+        // `litehtml` dependency in the workspace Cargo.toml), layout time is
+        // exponential in the nesting depth (measured on the unpatched
+        // dependency: 12 levels 33ms, 20 levels 1.5s, 24 levels over 20s): a
+        // real 17-level mail never finished. Run it on a thread so a
+        // regression fails this test instead of hanging the whole suite.
+        const DEPTH: usize = 24;
+        let mut html = String::from(r#"<body style="margin:0">"#);
+        for _ in 0..DEPTH {
+            html.push_str(r#"<table align="left" style="width:100%"><tbody><tr><td>text "#);
+        }
+        html.push_str("deep");
+        for _ in 0..DEPTH {
+            html.push_str("</td></tr></tbody></table>");
+        }
+        html.push_str("</body>");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outputs = render_in_process(&html, 700.0, Arc::new(DefaultHandler));
+            let _ = tx.send(outputs.len());
+        });
+        let outputs = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("layout of 24 nested tables did not finish within 60s -- is the table-cell memoization missing?");
+        assert!(outputs > 0);
     }
 
     #[test]
