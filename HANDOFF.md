@@ -43,50 +43,71 @@ file with no account. Problem emails are kept as repeatable test cases in
 tiles no larger than the GPU's max texture side, so arbitrarily long messages
 display (a single texture failed beyond 8192-16384 px).
 
-**Your next task, now that Track C's core migration (Phases 0-3) has
-landed:**
-- **Track C Phase 4 — text selection.** Investigated and confirmed real:
-  litehtml has a genuine, working, well-tested `Selection` API
-  (`start_at`/`extend_to`/`selected_text`/`rectangles`, 20+ upstream unit
-  tests) that Servo's pinned 0.1.0 never had working at all (see the old
-  issue #21 this superseded). Not yet wired into
-  `egui-litehtml-webview` — needs the one-shot-render design (a fresh
-  `Document` per interaction) revisited, since a drag-select gesture needs
-  the same `Document` alive across a sequence of frames. See PLAN.md's
-  Track C section for the full detail.
-- **Track C Phase 5 — CI/Docker/`rusqlite` cleanup.** The Servo-era apt
-  package lists in `.github/workflows/*.yml`/`Dockerfile.*` (nasm, Mesa/EGL
-  dev packages, GStreamer, etc.) and the `rusqlite = "0.37"` pin (which
-  existed only to unify with `servo-storage`'s own requirement) are both
-  now-unnecessary leftovers.
-- **Track C Phase 6 — rewrite this file's/PLAN.md's Servo-era framing**
-  once Phase 4/5 land, so a fresh reader doesn't have to mentally
-  find-and-replace "Servo" with "litehtml" through the older sections below.
-- **Everything below this notice from the pre-migration phase-7 backlog is
-  still open and unaffected by the webview swap** (it's all IMAP/SMTP/DB
-  layer work, orthogonal to which engine renders a message body) — pick
-  whichever is most useful:
-  - **B7's `\Sent`/`\Trash`/`\Archive` wiring.** B8 built the special-use
-    discovery infrastructure B7 was waiting on (`imap::SpecialUse`, from real
-    `LIST` attributes with a name-based fallback) but did not wire it into
-    `main.rs`'s hardcoded `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX`
-    constants — that's now a small, mechanical follow-up rather than a
-    research question. Drafts (`APPEND` with `\Draft`), a real retry queue,
-    rich-text composing, and recipient autocomplete are still open too.
-  - **B9's per-operation progress** (generalizing `download_progress`) —
-    deliberately left for its own commit until B8's concurrent `main.rs`
-    changes landed; they now have, so this is unblocked.
-  - **B8's IDLE-on-selected-mailbox.** B11's `idle_watch` already covers
-    "new-mail push" but stays INBOX-only, same as B10 — see §B8 for the full
-    "what landed / what didn't" writeup. A real collapsible mailbox-tree
-    widget (currently a flat indented list) and wiring `is:unread` into
-    search (B4's gap) are noted there too.
-  - Any of B3/B4/B6/B7's still-open live-IMAP-protocol pieces (UID-based
-    cache paging, server-side `UID SEARCH`, lazy `BODY.PEEK[n]`) — all
-    verifiable now via `crates/mail-mock-server`, see below.
+**Where things stand and what is left (refreshed 2026-09-19).** Track C (the
+Servo -> litehtml migration) is finished except text selection; the follow-up
+rendering work is Track D in [PLAN.md](PLAN.md); everything still open is
+tracked as GitHub issues plus a short list of Track B gaps below. The "next
+task" list that used to be here was partly stale (it listed work that had
+already landed), so it was replaced. Landed and no longer open:
 
-  (A6's zero-copy GL blit and A3/A5's Servo-specific input/resource-hook
-  work are no longer applicable at all — that engine is gone.)
+- **Track C phase 5** (CI/Docker/`rusqlite` cleanup): `3698207`.
+- **`\Sent`/`\Trash`/`\Archive` targeting** follows the server's special-use
+  folders (`a637fb3`; `find_special_use_mailbox` in `main.rs`). Drafts, a retry
+  queue, rich text and recipient autocomplete are still open.
+- **Inline `style=`** survives the sanitizer, filtered by a property allowlist
+  (`5290dfb`), so CSS-styled mail no longer renders as plain text.
+- **Track D** (post-migration rendering work: worker thread, image sizing,
+  table-layout speed, tiling, export, fixtures, profiling): see PLAN.md.
+
+**Open work, as GitHub issues** (`va1erian/ebrowser`):
+
+| # | What |
+|---|---|
+| #31 | Dev builds render heavy mail ~15x slower: optimize dependencies in the dev profile (verified 3.5 s -> 234 ms; one Cargo line, not yet applied) |
+| #28 | litehtml-rs: cache text widths in `text_width` (95% of measurements repeat; parse -55% in a prototype) |
+| #29 | litehtml-rs: `draw_text` bypasses the glyph cache (`get_image_uncached`); paint -40% when cached |
+| #30 | litehtml-rs: paint fast paths (full-canvas clip mask, AA `fill_path` for plain rects) |
+| #27 | Clicking a link in a heavy newsletter waits on a full re-layout (hit test builds a new `Document`) |
+| #32 | Umbrella: where the render time goes on `meilleurtaux.eml`, and the path to sub-second |
+| #36 | Text selection and copy in message bodies: what is missing (needs data gathered during the render pass) |
+| #35 | Multiple accounts in one session, with new-mail watching for every account |
+| #34 | Compose in a dedicated native window instead of an in-app egui window |
+
+**Open Track B gaps not (yet) ticketed** (details and reasoning in PLAN.md's
+per-section "what did not land" notes; the ones marked *checked* were verified
+against the code at this refresh, the rest are as PLAN.md states them):
+
+- *Sync/search:* the header list always re-fetches from the server rather than
+  reading the cache (no offline mode); a message opened one at a time is not
+  indexed, so search misses it; server-side `UID SEARCH` is not wired;
+  `since:`/`before:`/`is:unread`/`has:attachment` parse but are not applied
+  (*checked*); no result count next to Clear.
+- *Reading:* whole-message `RFC822` fetches (no `BODYSTRUCTURE`/`BODY.PEEK[n]`
+  partial fetch); a message opened from the search cache shows no attachments;
+  no per-sender "always load images" (*checked*); the mailbox tree is not
+  collapsible (*checked*); unread counts are a live `STATUS` round trip; bulk
+  flag/move issue one round trip per message (*checked*, no UID sets); IDLE is
+  not tied to the selected mailbox and the header list does not update live.
+- *Compose:* no drafts (`APPEND` with `\Draft`, *checked*), no send-retry queue,
+  no rich text, no recipient autocomplete; SMTP `StartTls` (port 587) cannot be
+  chosen in the UI (*checked*, `smtp_tls` exists in config only); Reply-All only
+  Ccs the first address (envelope parsing keeps one From/To).
+- *Notifications (Windows only):* INBOX only (see #35); toasts cannot be
+  clicked to open the message; attributed to "Windows PowerShell" (no real
+  AUMID); no settings (quiet hours, mailboxes, interval); no watch-status
+  indicator; the tray/toast round trip has never been checked on a real machine.
+- *Polish:* per-operation progress (only bulk download has a progress bar); no
+  real first-run wizard; a window saved on a since-unplugged monitor can reopen
+  off-screen; the theme toggle saves config on the UI thread.
+- *Session layer:* in-flight fetches are not interrupted on mailbox change
+  (only stale replies are dropped by `req_id`); any error clears the session
+  and costs a reconnect (PLAN.md section B2).
+- *Housekeeping:* `PixbufContainer`'s decoded-image cache never evicts (memory
+  grows with distinct image URLs over a long session); the Servo-era narrative
+  below is kept but marked historical rather than rewritten.
+
+(A6's zero-copy GL blit and A3/A5's Servo-specific input/resource-hook work
+are no longer applicable at all: that engine is gone.)
 
 **There is now a real (mock) IMAP + SMTP server to verify live-protocol
 code against** — `crates/mail-mock-server`, merged in from a separate branch
@@ -95,8 +116,8 @@ worker-session split, B3's incremental-fetch half, and B7's `APPEND`-to-Sent
 half landing here without the "no server to verify this against" caveat
 every other live-IMAP deferral above still carries. If you pick up any of
 those next — B3's UID-based cache-paging half, B4's server-side
-`UID SEARCH`, B6's lazy `BODY.PEEK[n]`, B7's special-use discovery/drafts —
-this is the tool to verify them with; see `crates/mail-mock-server/README.md`
+`UID SEARCH`, B6's lazy `BODY.PEEK[n]`, B7's drafts — this is the tool to
+verify them with; see `crates/mail-mock-server/README.md`
 for how to trust its test CA locally (already done once in this worktree)
 and `crates/esmail/tests/imap_smtp_integration.rs` for the pattern to follow
 (drive `ImapActor`/`SmtpActor`/`idle_watch` directly against a freshly seeded
@@ -137,15 +158,13 @@ handler subscribes to it while a client is idling).
 
 ## 1. The environment
 
-Work in the worktree, never `cd` to the parent repo:
+Work in your session's git worktree (`git worktree list`), never `cd` to the
+parent repo. Long paths matter on Windows: the worktree paths are ~150
+characters, which breaks `link.exe`/`cl.exe` for anything that builds C++ into
+a deep `target/`; see docs/PERFORMANCE.md's "Windows pitfalls" and use a short
+`CARGO_TARGET_DIR` for those.
 
-```
-C:\Users\hadri\Documents\repos\ebrowser\src\.claude\worktrees\imap-mail-client-egui-736b94
-```
-
-Branch `claude/esmail-implementation-plan-a05e38` (this worktree's own —
-`imap-mail-client-egui-736b94`, named in the rest of this section's original
-text, was an earlier worktree whose work is long since merged). The layout:
+The layout:
 
 ```
 Cargo.toml                               workspace root
@@ -158,6 +177,10 @@ crates/esmail/src/imap.rs                IMAP actor
 crates/esmail/src/idle_watch.rs          dedicated IMAP IDLE connection (B11)
 crates/esmail/src/db.rs                  SQLite actor
 crates/esmail/src/screenshot.rs          screenshot dumps
+crates/esmail/tests/render_fixtures.rs   render conformance + timing on real mail
+crates/esmail/tests/fixtures/            redacted real-world .eml test cases (+ README)
+docs/PERFORMANCE.md                      how to measure/profile a render
+tools/render-profiler/                   sampling profiler (own workspace, Windows)
 crates/mail-mock-server/                 in-process IMAP+SMTP server for tests
 crates/esmail/tests/imap_smtp_integration.rs  drives the app against it
 ```
@@ -199,9 +222,11 @@ its own — no human, no credentials, no window to close.
 
 - `ESMAIL_PREVIEW` takes `demo` (a built-in page exercising accented text,
   links, a table, a text input and a tall scrollable block), a path to an HTML
-  file, or a URL.
-- `ESMAIL_SCREENSHOT_FRAMES` defaults to 30; use 90 for Servo to finish
-  painting.
+  file or an `.eml` (rendered through the same pipeline as a live message), or
+  a URL.
+- `ESMAIL_SCREENSHOT_FRAMES` defaults to 30 and only counts frames once the
+  webview has finished rendering (it renders on a worker thread), so the
+  default is fine even for slow pages.
 - Without `ESMAIL_PREVIEW` you get the login screen, which does **not** draw the
   webview at all — so it is useless for checking the widget.
 - F12 dumps a screenshot during a normal interactive run.
@@ -431,11 +456,24 @@ the `glow` renderer. That is §A6.
 | *(this branch)* | **A5 (finished)** — see PLAN.md §A5. The `Scroll::Delta`→`InputEvent::Wheel` migration landed: the sign convention was resolved from three vendored doc comments/call sites (`WheelDelta`'s own doc comment, Servo's own `webview_renderer.rs` negating a wheel delta into `Scroll::Delta`, and egui's `ScrollArea` applying `smooth_scroll_delta` as `offset -= delta`), pinned by two new unit tests on the extracted `WebView::scroll_to_wheel_delta` helper rather than needing to be watched live after all. IME (`egui::Event::Ime` → `InputEvent::Ime` via a new pure `egui_ime_to_servo_ime` helper), the cursor-icon delegate hook (`notify_cursor_changed` → `servo_cursor_to_egui_cursor_icon`, applied every frame the pointer hovers the widget since egui resets to `Default` otherwise), and Ctrl/Cmd+C/X/V → `InputEvent::EditingAction` also landed — the OS clipboard itself was confirmed already free (`servo`'s `clipboard` feature is in its `default` list, installing a real `arboard`-backed delegate), so only the shortcut-to-action wiring was missing. 5 new unit tests on top of A5's existing 18 (23 total in the crate). |
 | *(this branch)* | **B8 (partial)** — see PLAN.md §B8. Flags (`\Seen` with a 1.2s mark-as-read delay, `\Flagged` star toggle, mark-unread) via a new `ImapCommand::StoreFlags`/`ImapEvent::FlagsUpdated`, finally populating `messages.flags` (the column B3 added and left unpopulated); delete-to-Trash/Archive via `ImapCommand::MoveMessage` (`MOVE` first, `COPY`+`STORE \Deleted`+`EXPUNGE` fallback — only the fallback is verified, since `mail-mock-server` has no `MOVE`); the mailbox tree (`imap::MailboxInfo`/`mailbox_tree`/`flatten_tree`, RFC 6154 special-use attributes with a name-based fallback, INBOX-then-Sent-then-Drafts-then-Archive-then-Junk-then-Trash-then-alphabetical sort); per-mailbox unread counts via `STATUS (UNSEEN)`; multi-select (ctrl toggles, shift range-selects via a pure `select_range` helper); keyboard shortcuts (`j`/`k`/`Enter`/`r`/`a`/`f`/`Del`/`Ctrl+F`/`Ctrl+N`). Extended `mail-mock-server` with `STORE`/`UID STORE`, `COPY`/`UID COPY`, `EXPUNGE`/`UID EXPUNGE`, `STATUS`, `FLAGS` on every envelope fetch, and special-use `LIST` attributes — same "extend the mock server first" pattern B3/B7/B11 each followed. **Not done:** IDLE tied to the *selected* mailbox specifically (B11's `idle_watch` already covers "new-mail push," but stays INBOX-only); wiring the new `SpecialUse` infrastructure into `main.rs`'s hardcoded `SENT_MAILBOX`/`TRASH_MAILBOX`/`ARCHIVE_MAILBOX` (B7's still-open special-use-discovery gap — the data now exists, the wiring doesn't); a real collapsible tree widget (always-expanded flat list instead); `is:unread` in search (B4's gap, now mechanical given `messages.flags` but not reached into). |
 
-State: `cargo check --workspace` clean (no warnings), `cargo test --workspace`
-all passing (18 `egui-servo-webview` unit tests, 102 `esmail` lib unit tests
-+ 7 `main.rs` unit tests, 14 `imap_smtp_integration` tests plus 2
-`#[ignore]`d stress tests, run with `ESMAIL_TEST_CA_TRUSTED=1`), app builds,
-runs, screenshots (`ESMAIL_PREVIEW=demo`) and exits cleanly.
+| `fe52e37`, `8e47906` | **Track C phases 0-3** — `egui-servo-webview` replaced by `egui-litehtml-webview` (JS-less litehtml, pixbuf backend); ~12.2 MiB release binary instead of 100-300 MB+ of Servo DLLs. See PLAN.md Track C |
+| `3698207` | **Track C phase 5** — dead Servo-era CI/Docker/`rusqlite` infrastructure removed |
+| `a637fb3` | B8's special-use discovery wired into Sent/Archive/Trash targeting |
+| `5290dfb` | Inline `style=` allowed through the sanitizer, filtered by a property allowlist |
+| `c562c84` | **Track D: render worker thread**, parallel image fetch, canvas cleared per pass (fixes overlapping text), **Export...** + `ESMAIL_PREVIEW=x.eml` |
+| `534e430` → litehtml-rs #3 | `draw_image` fixed (scale to `origin_box`, tile, clip); first vendored, now upstream in litehtml-rs `master` |
+| `0cdb75b`, `aa1a469` | litehtml-rs `master` with the table-cell measurement memoization (layout was exponential in table nesting depth); canvas seed 4000 px; html5ever log noise muted |
+| `9819b05` | Vendoring dropped; `meilleurtaux.eml` (redacted) as a render conformance/timing test case |
+| `55a23be` | Rendered page split into GPU-texture-sized tiles (tall messages no longer fail to upload) |
+| `20fa906` | `docs/PERFORMANCE.md` and `tools/render-profiler` |
+
+State (2026-09-19): `cargo build --workspace` clean; `cargo test --workspace --
+--include-ignored` (with `ESMAIL_TEST_CA_TRUSTED=1`) passes 176 tests: 16
+`egui-litehtml-webview`, 119 `esmail` lib + 13 `main.rs`, 19
+`imap_smtp_integration` (including the 2 stress tests), 5 `render_fixtures`
+(including the benchmark and the HTML dump utility), and 4 in
+`mail-mock-server`. CI runs the simulation job with `--include-ignored`, so an
+`#[ignore]`d test must be a harmless no-op when it lacks its input.
 
 ---
 
@@ -447,8 +485,9 @@ runs, screenshots (`ESMAIL_PREVIEW=demo`) and exits cleanly.
 - **Say what you did not do.** If part of a task is blocked or skipped, state it
   plainly rather than quietly narrowing scope.
 - **Do not re-litigate settled decisions**: the crate stays internal (not
-  published), `rusqlite` stays at 0.37, and the Servo API facts in §4 are
-  verified — trust them.
+  published). (The `rusqlite` 0.37 pin and the Servo API facts in §4 were
+  settled decisions of the Servo era; both are gone/historical now, see §3.7
+  and the notice at the top.)
 - When a plan item turns out to be wrong once you see the code, **fix the plan
   in the same commit** rather than silently diverging from it. That has happened
   three times already and each correction is recorded in a commit message.
