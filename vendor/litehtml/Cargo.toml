@@ -19,7 +19,7 @@ html = ["encoding_rs", "base64"]
 email = ["html"]
 
 [dependencies]
-litehtml-sys = { git = "https://github.com/va1erian/litehtml-rs.git", branch = "bump-litehtml-table-measure-cache", version = "0.2.0", default-features = false }
+litehtml-sys = { git = "https://github.com/va1erian/litehtml-rs.git", version = "0.2.0", default-features = false }
 log = "0.4"
 tiny-skia = { version = "0.11", optional = true }
 cosmic-text = { version = "0.14", optional = true }

@@ -1,12 +1,14 @@
 # Local patches to `litehtml`
 
 This directory is a copy of the `litehtml` crate (only that crate, not
-`litehtml-sys`) from <https://github.com/va1erian/litehtml-rs>, branch
-`bump-litehtml-table-measure-cache` (commit `9f8cad6`: `master` at `61125c8` plus a
-bump of the C++ litehtml to the table-cell-measurement memoization, which is
-what makes deeply nested table layouts finish at all). It is wired in through `[patch]` in the workspace `Cargo.toml`.
+`litehtml-sys`) from <https://github.com/va1erian/litehtml-rs> `master` at
+`d0f31e0` (the Rust code is identical to `61125c8`; `d0f31e0` only bumps the
+C++ litehtml submodule to the table-cell-measurement memoization, which is what
+makes deeply nested table layouts finish at all). It is wired in through
+`[patch]` in the workspace `Cargo.toml`, and `litehtml-sys` still comes from
+that git source's `master`.
 
-Changes against that commit:
+Changes against that copy:
 
 * `Cargo.toml`: `litehtml-sys` is a git dependency instead of `path = "../litehtml-sys"`
   (the sys crate is not vendored here).
