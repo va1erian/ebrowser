@@ -1,8 +1,5 @@
 [workspace]
 members = ["crates/egui-litehtml-webview", "crates/esmail", "crates/mail-mock-server"]
-# vendor/ holds a patched copy of the `litehtml` crate (see [patch] below); it
-# has its own manifest and must not be picked up as a workspace member.
-exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -26,7 +23,9 @@ egui_glow = "0.34.1"
 # REQUIRED for real mail: without it, layout time is exponential in table
 # nesting depth, and a marketing mail with tables nested 17 deep never
 # finished laying out (5-8 levels took many seconds). Do not pin this to a
-# commit older than that bump.
+# commit older than that bump. The same `master` also has the fix for
+# `PixbufContainer::draw_image` drawing images at their natural size instead of
+# their laid-out size (cropped / mis-sized `<img width=..>` and backgrounds).
 litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", features = ["pixbuf", "email"] }
 
 # Async / IO
@@ -91,18 +90,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # MessageViewHandler uses to fetch a remote image once the user has opted
 # in via "Load remote images" (B5 in PLAN.md).
 ureq = "3"
-
-# Patched copy of litehtml-rs's `litehtml` crate (only that crate -- its
-# `litehtml-sys` dependency still resolves from the git source above). The
-# patch fixes `PixbufContainer::draw_image`, which drew every image at its
-# natural pixel size anchored at the border box, ignoring the layer's
-# `origin_box` (the final position + size litehtml computed for the image from
-# width/height attributes, `max-width`, `background-size`/`-position`) and
-# `background-repeat`. Real-world HTML email is full of `<img width=..>` /
-# `max-width:100%` images, so they came out cropped or unscaled. See
-# vendor/litehtml/PATCHES.md; drop this section once the fix is upstream.
-[patch."https://github.com/va1erian/litehtml-rs.git"]
-litehtml = { path = "vendor/litehtml" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size

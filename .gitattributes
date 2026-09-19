@@ -1,0 +1,2 @@
+# Keep test fixtures byte-for-byte: real mail is CRLF and git must not normalize it.
+crates/esmail/tests/fixtures/*.eml -text
