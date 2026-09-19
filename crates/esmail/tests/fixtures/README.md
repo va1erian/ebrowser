@@ -33,6 +33,8 @@ performance. `tests/render_fixtures.rs` runs every `*.eml` here through
 
 ## Measuring
 
+(Full guide, including the stack-level profiler: `docs/PERFORMANCE.md`.)
+
 ```text
 RUST_LOG=egui_litehtml_webview=debug \
   cargo test -p esmail --test render_fixtures --release -- --nocapture --include-ignored

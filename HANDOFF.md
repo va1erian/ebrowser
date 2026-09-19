@@ -38,7 +38,8 @@ the raw RFC822 source as an `.eml`; `ESMAIL_PREVIEW=some.eml` renders such a
 file with no account. Problem emails are kept as repeatable test cases in
 `crates/esmail/tests/fixtures/` (redact them first -- see the README there;
 `tests/render_fixtures.rs` checks conformance and layout time, and has an
-`--include-ignored` benchmark). The rendered picture is cut into a grid of
+`--include-ignored` benchmark; how to measure and profile a render is in
+`docs/PERFORMANCE.md`, with a sampling profiler in `tools/render-profiler`). The rendered picture is cut into a grid of
 tiles no larger than the GPU's max texture side, so arbitrarily long messages
 display (a single texture failed beyond 8192-16384 px).
 
