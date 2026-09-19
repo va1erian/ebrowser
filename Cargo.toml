@@ -19,10 +19,16 @@ egui_glow = "0.34.1"
 # HTML/CSS rendering engine for message bodies (litehtml migration -- see
 # PLAN.md). JS-less by design: no legitimate mail client executes JS in HTML
 # email anyway, and dropping the JS engine (Servo) is what makes the binary
-# dramatically smaller. `va1erian/litehtml-rs`'s `master` branch carries a
-# Windows/MSVC build fix on top of upstream `franzos/litehtml-rs`, found and
-# merged in a prior session -- not yet released upstream, hence the git dep.
-litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", features = ["pixbuf", "email"] }
+# dramatically smaller. `va1erian/litehtml-rs` carries a Windows/MSVC build
+# fix on top of upstream `franzos/litehtml-rs` -- not yet released upstream,
+# hence the git dep. The `bump-litehtml-table-measure-cache` branch also bumps
+# the vendored C++ litehtml to `va1erian/litehtml`'s
+# `memoize-table-cell-measurement`. That memoization is REQUIRED for real
+# mail: without it, layout time is exponential in table nesting depth, and a
+# marketing mail with tables nested 17 deep never finished laying out (5-8
+# levels took many seconds). Drop `branch =` once it is merged into the fork's
+# default branch (the vendored crate under vendor/ needs the same change).
+litehtml = { git = "https://github.com/va1erian/litehtml-rs.git", branch = "bump-litehtml-table-measure-cache", features = ["pixbuf", "email"] }
 
 # Async / IO
 tokio = { version = "1", features = ["full"] }
