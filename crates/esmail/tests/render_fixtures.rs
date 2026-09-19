@@ -139,6 +139,25 @@ fn bench_fixtures_across_widths() {
     }
 }
 
+/// Utility, not a test: writes what the webview is actually given for each
+/// fixture (the sanitized HTML from `render_message`) to
+/// `$ESMAIL_DUMP_DIR/<fixture>.html`, so it can be fed to out-of-tree tools such
+/// as `tools/render-profiler` (see docs/PERFORMANCE.md).
+///
+/// ```text
+/// ESMAIL_DUMP_DIR=C:/prof cargo test -p esmail --test render_fixtures dump_fixtures_as_html -- --ignored
+/// ```
+#[test]
+#[ignore = "utility: writes files to $ESMAIL_DUMP_DIR"]
+fn dump_fixtures_as_html() {
+    let dir = PathBuf::from(std::env::var_os("ESMAIL_DUMP_DIR").expect("set ESMAIL_DUMP_DIR to an existing directory"));
+    for (name, raw) in fixtures() {
+        let out = dir.join(format!("{}.html", name.trim_end_matches(".eml")));
+        std::fs::write(&out, esmail::render::render_message(&raw)).unwrap();
+        eprintln!("wrote {}", out.display());
+    }
+}
+
 // ─── every fixture ──────────────────────────────────────────────────────────
 
 /// Fixtures are checked into a public repo: guard against a real address or
