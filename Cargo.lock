@@ -2227,7 +2227,6 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "litehtml"
 version = "0.2.6"
-source = "git+https://github.com/va1erian/litehtml-rs.git#61125c8a9c96e3b18344e23b9481b3719527e1cd"
 dependencies = [
  "base64 0.22.1",
  "cosmic-text",
