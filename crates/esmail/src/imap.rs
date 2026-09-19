@@ -276,6 +276,13 @@ pub enum ImapCommand {
     /// See `FetchHeaders`; echoed on [`ImapEvent::Body`].
     FetchBody { mailbox: String, uid: u32, req_id: u64 },
     BulkDownload { mailbox: String },
+    /// Save one message's full raw RFC822 source to `path` as an `.eml`
+    /// file, so a specific real-world message can be kept as a test case
+    /// (it can be opened again without an account via `ESMAIL_PREVIEW`, see
+    /// `main.rs`). Handled on the body worker's own connection, like
+    /// `FetchBody`, and answered with [`ImapEvent::Exported`] or
+    /// [`ImapEvent::ExportFailed`].
+    ExportMessage { mailbox: String, uid: u32, path: std::path::PathBuf },
     /// Lightweight new-mail poll (B10): re-`EXAMINE`s `mailbox` to read the
     /// fresh UIDVALIDITY/UIDNEXT off the untagged response -- the same free
     /// ride `fetch_headers` already takes, just without the ENVELOPE fetch
@@ -370,6 +377,10 @@ pub enum ImapEvent {
     /// instead of leaving it stuck.
     BodyFailed { uid: u32, req_id: u64, error: String },
     DownloadProgress { current: u32, total: u32 },
+    /// Reply to `ExportMessage`: the message's raw source was written to `path`.
+    Exported { path: std::path::PathBuf },
+    /// `ExportMessage` failed (fetching the message or writing the file).
+    ExportFailed { error: String },
     MailData { mailbox: String, header: MailHeader, body: String },
     /// Reply to `PollMailbox` (B10).
     MailboxPolled { mailbox: String, state: MailboxState },
@@ -526,6 +537,15 @@ impl ImapActor {
                         continue;
                     };
                     let _ = worker.send(WorkerCommand::BulkDownload { mailbox }).await;
+                }
+                ImapCommand::ExportMessage { mailbox, uid, path } => {
+                    // Same routing as `FetchBody`: a full-message download
+                    // has no business stalling this actor's own session.
+                    let Some(worker) = &self.worker_tx else {
+                        let _ = self.event_tx.send(ImapEvent::ExportFailed { error: "not connected".to_string() }).await;
+                        continue;
+                    };
+                    let _ = worker.send(WorkerCommand::ExportMessage { mailbox, uid, path }).await;
                 }
                 ImapCommand::PollMailbox { mailbox } => {
                     // No `ensure_connected` here on purpose -- see the
@@ -806,7 +826,8 @@ impl ImapActor {
         Ok((headers, total_pages, mailbox_state))
     }
 
-    async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<(String, Vec<crate::render::Attachment>)> {
+    /// Fetch one message's full raw RFC822 source.
+    async fn fetch_raw(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<Vec<u8>> {
         session.examine(mailbox_name).await?;
         let query = format!("{}", uid);
         let mut fetches = session.uid_fetch(query, "RFC822").await?;
@@ -814,12 +835,17 @@ impl ImapActor {
         if let Some(msg) = fetches.next().await {
             let msg = msg?;
             let body = msg.body().ok_or_else(|| anyhow::anyhow!("No body"))?;
-            let html = crate::render::render_message(body);
-            let attachments = crate::render::extract_attachments(body);
-            return Ok((html, attachments));
+            return Ok(body.to_vec());
         }
 
         Err(anyhow!("Message not found or no body"))
+    }
+
+    async fn fetch_body(session: &mut async_imap::Session<TlsStream<TcpStream>>, mailbox_name: &str, uid: u32) -> anyhow::Result<(String, Vec<crate::render::Attachment>)> {
+        let raw = Self::fetch_raw(session, mailbox_name, uid).await?;
+        let html = crate::render::render_message(&raw);
+        let attachments = crate::render::extract_attachments(&raw);
+        Ok((html, attachments))
     }
 
     /// Fetch envelopes for every UID from `first_uid` onward (B10). Same
@@ -1043,6 +1069,7 @@ async fn connect_session(
 enum WorkerCommand {
     FetchBody { mailbox: String, uid: u32, req_id: u64 },
     BulkDownload { mailbox: String },
+    ExportMessage { mailbox: String, uid: u32, path: std::path::PathBuf },
 }
 
 /// B2's session-pool split: a second, independent IMAP connection that
@@ -1098,6 +1125,11 @@ fn spawn_body_worker(
                             WorkerCommand::BulkDownload { .. } => {
                                 let _ = event_tx.send(ImapEvent::Error(format!("could not open a connection for this request: {e}"))).await;
                             }
+                            WorkerCommand::ExportMessage { .. } => {
+                                let _ = event_tx.send(ImapEvent::ExportFailed {
+                                    error: format!("could not open a connection for this request: {e}"),
+                                }).await;
+                            }
                         }
                         continue;
                     }
@@ -1114,6 +1146,26 @@ fn spawn_body_worker(
                         Err(e) => {
                             session = None; // let the next command's ensure_worker_connected retry
                             let _ = event_tx.send(ImapEvent::BodyFailed { uid, req_id, error: e.to_string() }).await;
+                        }
+                    }
+                }
+                WorkerCommand::ExportMessage { mailbox, uid, path } => {
+                    match ImapActor::fetch_raw(sess, &mailbox, uid).await {
+                        Ok(raw) => match tokio::fs::write(&path, raw).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(ImapEvent::Exported { path }).await;
+                            }
+                            // A local file error says nothing about the
+                            // IMAP session, so keep it.
+                            Err(e) => {
+                                let _ = event_tx.send(ImapEvent::ExportFailed {
+                                    error: format!("could not write {}: {e}", path.display()),
+                                }).await;
+                            }
+                        },
+                        Err(e) => {
+                            session = None;
+                            let _ = event_tx.send(ImapEvent::ExportFailed { error: format!("{e:#}") }).await;
                         }
                     }
                 }

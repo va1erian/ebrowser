@@ -13,49 +13,57 @@
 //! smaller. See `PLAN.md`'s migration section for the full rationale and the
 //! measured before/after binary size.
 //!
-//! # Design: no persisted `litehtml::Document`
+//! # Design: a render worker thread
+//!
+//! litehtml's parse + layout is slow on real-world newsletter HTML (several
+//! seconds for some marketing mail) and fetching remote images is network
+//! I/O, so **none of it runs on the UI thread**. Each [`WebView`] owns one
+//! background thread (the "worker") that owns the
+//! [`litehtml::pixbuf::PixbufContainer`] outright -- it is `!Send` (it holds
+//! `Rc`s), so it is created *on* the worker and never crosses a thread
+//! boundary. The UI thread only ever:
+//!
+//! * sends the worker a job (`Render` after a `load`/`reload`/resize,
+//!   `HitTest` after a click), and
+//! * receives finished outputs -- ready-to-upload pixel frames and clicked
+//!   links -- in [`WebView::show`], uploading the newest frame to an egui
+//!   texture. The worker calls `Context::request_repaint` when it has
+//!   something to show.
+//!
+//! Render jobs carry a monotonically increasing id. The worker drops
+//! superseded render jobs from its queue and re-checks the id between
+//! stages, so dragging the window edge (a job per width) or clicking through
+//! messages quickly never queues up seconds of stale layout work; the UI
+//! likewise ignores frames whose id is not the newest.
+//!
+//! # No persisted `litehtml::Document`
 //!
 //! `litehtml::Document<'a>` borrows its `DocumentContainer` mutably for the
-//! `Document`'s own lifetime, which makes storing both a `Document` and its
-//! backing container as sibling fields of one long-lived struct a
-//! self-referential-struct problem. This crate sidesteps that entirely:
-//! [`WebView`] stores only the owned [`litehtml::pixbuf::PixbufContainer`]
-//! (persistent, reused across frames -- it is what actually holds the
-//! rendered pixels) and the current HTML string. A `Document` is
-//! constructed fresh, used, and dropped every time layout or drawing is
-//! actually needed (on load/reload, on a resize, or to hit-test a click) --
-//! never stored as a field. litehtml's parse+layout for mail-sized HTML is
-//! fast enough that this "reload on every re-render" model is the right,
-//! simple design, matching how this crate's Servo-backed predecessor's
-//! `WebView::load()` already worked (throw away the old page, load fresh).
+//! `Document`'s own lifetime, which makes storing both as sibling fields a
+//! self-referential-struct problem. The worker sidesteps that: it stores only
+//! the container (which holds the pixels, fonts and decoded images, reused
+//! across jobs) and builds a `Document` fresh for each pass, dropping it
+//! straight after.
 //!
-//! # Render sequence
+//! # Render sequence (one `Render` job)
 //!
-//! Because the container's pixel buffer must be sized to match the
-//! document's actual content height before the final draw, showing a
-//! message is a multi-pass sequence (see [`WebView::show`] / its private
-//! `relayout`):
+//! 1. **Draw** into a cleared canvas: build a `Document`, `render()` it at
+//!    the requested width, `draw()` it. If the content turns out taller than
+//!    the canvas, grow the canvas (never shrunk between messages -- resizing
+//!    is what forces the extra pass) and draw once more.
+//! 2. **Discover images**: URLs are only known after the layout has walked
+//!    the document. `data:` URIs are decoded locally (litehtml has no
+//!    network layer; `esmail` inlines `cid:` parts as `data:` URIs first);
+//!    everything else goes to [`WebViewHandler::intercept`], several at a
+//!    time. If remote images are involved, the text-only frame from step 1 is
+//!    sent right away so the message is readable while images arrive.
+//! 3. **Redraw** with the images loaded (an image can change layout, so this
+//!    is a full pass on a *cleared* canvas -- drawing over the previous pass
+//!    leaves its text behind), and send that frame. Repeats if the redraw
+//!    turns up more URLs, up to a small limit.
 //!
-//! 1. **Measure**: build a `Document`, `render()` it at the widget's current
-//!    width, read `height()`, then drop it.
-//! 2. **Resize** the container's pixel buffer to that height (this clears
-//!    its pixel content, per `PixbufContainer::resize`'s own doc comment --
-//!    which is exactly why step 3 below re-renders and re-draws rather than
-//!    reusing anything from step 1).
-//! 3. **Draw**: build a *new* `Document` (layout state does not survive a
-//!    container resize), `render()` + `draw()` it into the now-correctly-sized
-//!    buffer.
-//! 4. **Resolve images**: drain `take_pending_images()` -- URLs the layout
-//!    discovered are unknown until this point, since they are only found by
-//!    walking the parsed document. `data:` URIs are decoded locally
-//!    (litehtml has no network layer and does not do this itself outside
-//!    its own `prepare_html` pipeline, which this crate deliberately does
-//!    not use -- see the note on sanitization below); `http(s)` URLs are
-//!    handed to the host's [`WebViewHandler::intercept`], which decides
-//!    whether to fetch and returns the bytes via
-//!    [`InterceptOutcome::Serve`]. Any image actually loaded means steps 1-3
-//!    run one more time so it actually appears (an image can also change the
-//!    document's content height, hence remeasuring, not just redrawing).
+//! The frame sent to the UI is flattened onto opaque white and cropped to
+//! the content height, so the texture is exactly what should be displayed.
 //!
 //! # Sanitization stays the host's job
 //!
@@ -71,8 +79,11 @@
 
 pub use url;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use litehtml::email::EMAIL_MASTER_CSS;
 use litehtml::html::decode_data_uri;
@@ -87,9 +98,8 @@ use litehtml::{Document, DrawContext};
 /// scroll it natively), not into a fixed-size viewport the way a real
 /// browser window is. `PixbufContainer` has no separate "viewport size" from
 /// "canvas size" -- both come from the same `resize_with_scale` call -- so
-/// `vh` units end up relative to *this render's own content height*, not a
-/// stable window size. A document seeded at height 1 (this crate's very
-/// first render, before anything has been measured) would resolve `1vh` to
+/// `vh` units end up relative to *this render's own canvas height*, not a
+/// stable window size. A canvas seeded at height 1 would resolve `1vh` to
 /// ~0.01px, collapsing any `height: NNvh` block to nothing -- a real bug
 /// this constant exists to avoid, caught by the mandatory
 /// `ESMAIL_PREVIEW=demo` screenshot check (see HANDOFF.md §2) against the
@@ -100,6 +110,15 @@ use litehtml::{Document, DrawContext};
 /// real mail: no mainstream mail client preserves or predictably renders
 /// viewport-relative units in HTML email, so authors do not rely on them.
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
+
+/// How many image URLs the worker fetches at the same time.
+const MAX_PARALLEL_FETCHES: usize = 8;
+
+/// Upper bound on draw passes for one render job. Pass 1 discovers image
+/// URLs, pass 2 draws with them loaded; a third covers URLs only discovered
+/// once the images' real sizes changed the layout. Anything past that is a
+/// pathological document and is shown as-is.
+const MAX_PASSES: usize = 3;
 
 // ─── Public API types ───────────────────────────────────────────────────────
 
@@ -130,6 +149,10 @@ pub enum WebViewEvent {
     /// the one that decides what to do with it (open in the system browser,
     /// etc.), same as how the Servo-backed predecessor's `MessageViewHandler`
     /// always denied in-view navigation and reported it this way too.
+    ///
+    /// Arrives a little after the click, not synchronously: working out
+    /// which link (if any) sits under the pointer needs a layout pass, which
+    /// runs on the worker thread.
     LinkClicked(String),
 }
 
@@ -166,16 +189,23 @@ pub enum InterceptOutcome {
 
 /// Host-supplied policy for which images a [`WebView`] is allowed to load.
 ///
+/// Called **on the worker thread**, possibly from several worker-spawned
+/// threads at once (up to [`MAX_PARALLEL_FETCHES`]) -- which is why it is
+/// `Send + Sync`, takes `&self`, and is free to block on network I/O (that
+/// is the whole point of it not running on the UI thread). Anything the
+/// host wants to change while a view is alive (e.g. an "allow remote
+/// images" switch) needs interior mutability, such as an `AtomicBool`.
+///
 /// Unlike the Servo-backed predecessor's `WebViewHandler`, there is no
 /// `navigation` method: litehtml has no navigation concept at all (see
 /// [`WebViewEvent::LinkClicked`]'s doc), so there is nothing left to decide
 /// there.
-pub trait WebViewHandler {
+pub trait WebViewHandler: Send + Sync {
     /// Called for every image URL the document's layout wants loaded, other
     /// than `data:` URLs (decoded locally, never reaching this hook -- see
     /// [`ImageRequest::url`]). Defaults to [`InterceptOutcome::Allow`] (no
     /// fetch), matching this crate having no default image fetcher.
-    fn intercept(&mut self, request: &ImageRequest) -> InterceptOutcome {
+    fn intercept(&self, request: &ImageRequest) -> InterceptOutcome {
         let _ = request;
         InterceptOutcome::Allow
     }
@@ -212,36 +242,51 @@ impl WebViewHost {
         Self::default()
     }
 
-    /// Create a new view showing `config.source`.
+    /// Create a new view showing `config.source`, and start its worker
+    /// thread. `ctx` is cloned into the worker so it can wake the UI when a
+    /// frame is ready.
     pub fn new_view(&self, ctx: &egui::Context, config: WebViewConfig) -> WebView {
         let view_id = self.next_view_id.get();
         self.next_view_id.set(view_id + 1);
 
         let WebViewSource::Html(html) = config.source;
-        let scale = ctx.pixels_per_point();
+        let handler: Arc<dyn WebViewHandler> = config.handler.unwrap_or_else(|| Arc::new(DefaultHandler));
+
+        let (job_tx, job_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let latest_id = Arc::new(AtomicU64::new(0));
+
+        let worker_ctx = ctx.clone();
+        let worker_latest = latest_id.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("litehtml-worker-{view_id}"))
+            .spawn(move || {
+                // Created here, not on the caller's thread: PixbufContainer
+                // is !Send. It also loads system fonts, which is slow
+                // enough that it should not block the UI at startup either.
+                Worker::new(worker_ctx, handler, out_tx, worker_latest).run(job_rx);
+            });
+        if let Err(e) = &spawned {
+            log::error!("egui-litehtml-webview: could not start the render thread: {e}");
+        }
 
         WebView {
-            // 1x1 placeholder; the first `show()` call resizes this to the
-            // widget's actual width before anything is measured or drawn.
-            // Height seeded to a plausible viewport size, not 1px -- see
-            // `DEFAULT_VIEWPORT_HEIGHT`'s doc for why a degenerate initial
-            // height is a real, visible bug for any message using `vh`
-            // units, not just a cosmetic nit.
-            container: PixbufContainer::new_with_scale(1, DEFAULT_VIEWPORT_HEIGHT, scale),
-            html,
-            handler: config
-                .handler
-                .unwrap_or_else(|| Rc::new(RefCell::new(DefaultHandler))),
+            html: Arc::new(html),
+            tx: job_tx,
+            rx: out_rx,
+            latest_id,
+            submitted_id: 0,
             texture: None,
             texture_name: format!("egui_litehtml_webview_{view_id}"),
-            logical_width: 1.0,
-            content_height: DEFAULT_VIEWPORT_HEIGHT as f32,
-            pixels_per_point: scale,
-            container_width: 1.0,
-            container_height: DEFAULT_VIEWPORT_HEIGHT as f32,
-            container_scale: scale,
+            frame_size: egui::Vec2::ZERO,
+            frame_layout_width: 1.0,
+            frame_scale: 1.0,
+            requested_width: 1.0,
+            requested_dpi: ctx.pixels_per_point(),
             dirty: true,
-            total_images_loaded: 0,
+            reset_images: true,
+            rendering: false,
+            failed: spawned.is_err(),
         }
     }
 }
@@ -254,7 +299,7 @@ pub struct WebViewConfig {
     pub source: WebViewSource,
     /// Which images this view is allowed to load. `None` uses
     /// [`DefaultHandler`]'s behaviour: no image is ever fetched.
-    pub handler: Option<Rc<RefCell<dyn WebViewHandler>>>,
+    pub handler: Option<Arc<dyn WebViewHandler>>,
 }
 
 impl WebViewConfig {
@@ -266,7 +311,7 @@ impl WebViewConfig {
 
     /// Use `handler` for this view's image-loading decisions instead of the
     /// default policy.
-    pub fn with_handler(mut self, handler: Rc<RefCell<dyn WebViewHandler>>) -> Self {
+    pub fn with_handler(mut self, handler: Arc<dyn WebViewHandler>) -> Self {
         self.handler = Some(handler);
         self
     }
@@ -274,68 +319,45 @@ impl WebViewConfig {
 
 /// One embedded HTML view, drawn with [`WebView::show`].
 ///
-/// Created by [`WebViewHost::new_view`].
+/// Created by [`WebViewHost::new_view`]. Holds only UI-thread state: the
+/// heavy lifting happens on the worker thread it talks to over channels (see
+/// the crate module doc).
 pub struct WebView {
-    /// Owns the rendered pixels. Persistent across frames/loads -- see the
-    /// crate module doc for why no `litehtml::Document` is ever stored
-    /// alongside it.
-    container: PixbufContainer,
-    /// The HTML currently loaded. Kept so a resize (which requires a fresh
-    /// `Document`, see the module doc) can re-parse without the caller
-    /// having to `load()` again.
-    html: String,
-    handler: Rc<RefCell<dyn WebViewHandler>>,
-    /// Reused across frames; reallocating one per frame was measurable waste
-    /// in the predecessor crate and would be here too.
+    /// The HTML currently loaded. Shared with the worker's jobs.
+    html: Arc<String>,
+    tx: Sender<Job>,
+    rx: Receiver<Output>,
+    /// Id of the newest render job, shared with the worker so it can notice
+    /// (between stages) that the job it is running has been superseded.
+    latest_id: Arc<AtomicU64>,
+    /// Id of the newest render job this view submitted; frames with any
+    /// other id are stale and ignored.
+    submitted_id: u64,
+    /// Reused across frames; reallocating one per frame would be wasteful.
     texture: Option<egui::TextureHandle>,
     /// Unique per view, so two views cannot collide on one egui texture.
     texture_name: String,
-    /// The width `relayout` last laid out at, in egui logical points.
-    logical_width: f32,
-    /// The document's content height after the last `relayout`, in egui
-    /// logical points -- what [`WebView::show`] sizes the displayed image
-    /// to. May be smaller than `container_height` (the container is
-    /// allowed to be taller than the content actually needs -- see
-    /// `container_height`'s own doc).
-    content_height: f32,
-    /// `egui::Context::pixels_per_point` last laid out at.
-    pixels_per_point: f32,
-    /// The width `self.container` is currently allocated/sized for.
-    /// Distinct from `logical_width` (the width `relayout` most recently
-    /// laid out *at*) only for one frame at a time -- `relayout` resizes
-    /// the container to match `logical_width` before doing anything else
-    /// whenever they differ, so outside of `relayout` itself these two are
-    /// always equal.
-    container_width: f32,
-    /// The height `self.container`'s pixel buffer is currently allocated
-    /// for -- a *capacity*, not necessarily equal to `content_height` (the
-    /// actual content height). `relayout` deliberately never shrinks this:
-    /// reusing a too-tall buffer from a previous, longer message costs
-    /// nothing but some unused canvas space, and avoids resizing (which
-    /// forces a full extra parse+layout+draw pass -- litehtml's own layout
-    /// pass measured 3+ seconds on real-world message HTML in this
-    /// session's live testing) on every single message open. Only grows,
-    /// via `relayout` noticing the freshly-drawn content actually
-    /// overflowed it.
-    container_height: f32,
-    /// The `pixels_per_point` `self.container` is currently allocated for.
-    /// See `container_width`'s doc -- same "only resize when it's actually
-    /// necessary" reasoning applies to a DPI change as to a width change.
-    container_scale: f32,
-    /// Set by [`WebView::load`]/[`WebView::reload`] and by a width/DPI
-    /// change noticed in `show()`; cleared once `relayout` has run. Keeps a
-    /// `show()` on an unchanged view cheap (no reparse/relayout), matching
-    /// the predecessor crate's frame-dirty gating in spirit even though the
-    /// underlying engine is completely different.
+    /// What the current texture should be displayed as, in egui points.
+    frame_size: egui::Vec2,
+    /// The layout width the current texture was rendered at, in points --
+    /// hit tests must be laid out at the same width to line up.
+    frame_layout_width: f32,
+    /// `pixels_per_point` the current texture was rendered at.
+    frame_scale: f32,
+    /// The width/DPI of the newest render job submitted, to notice when the
+    /// widget has since changed size.
+    requested_width: f32,
+    requested_dpi: f32,
+    /// Set by [`WebView::load`]/[`WebView::reload`]; cleared by submitting a
+    /// render job on the next `show()`.
     dirty: bool,
-    /// Cumulative count of `load_image_data` calls over this `WebView`'s
-    /// whole lifetime (i.e. across every message ever opened in it, not
-    /// just the current one) -- diagnostic only, logged by `relayout`. See
-    /// that method's doc: `PixbufContainer`'s internal decoded-image cache
-    /// is never purged (no eviction API exists to call), so this is a
-    /// proxy for how large that cache has grown, to see whether relayout
-    /// time correlates with it across a real session.
-    total_images_loaded: u64,
+    /// The next render job must forget which image URLs were already
+    /// requested -- set by `load`/`reload` (see their docs).
+    reset_images: bool,
+    /// A render job is in flight.
+    rendering: bool,
+    /// The worker reported that the document could not be rendered at all.
+    failed: bool,
 }
 
 impl WebView {
@@ -343,49 +365,69 @@ impl WebView {
 
     /// Load a new source, replacing whatever is currently shown. Triggers a
     /// fresh render on the next [`WebView::show`].
+    ///
+    /// The previous page's pixels are dropped immediately (a "Rendering..."
+    /// indicator is shown until the first frame of the new page arrives)
+    /// rather than left on screen: a slow render would otherwise show the
+    /// *previous* message under the *new* message's headers for seconds.
     pub fn load(&mut self, source: WebViewSource) {
         let WebViewSource::Html(html) = source;
-        self.html = html;
+        self.html = Arc::new(html);
+        self.texture = None;
+        self.failed = false;
+        // Invalidate whatever the worker is (or has just finished) rendering
+        // for the *previous* page right now, not when `show()` next submits
+        // the new job: a frame for the old page that lands in between would
+        // otherwise still match `submitted_id` and get displayed under the
+        // new page's headers. This also lets the worker abandon the old job
+        // sooner.
+        self.submitted_id += 1;
+        self.latest_id.store(self.submitted_id, Ordering::SeqCst);
         // New page: image URLs from the old one should not suppress
         // re-discovery, even if by coincidence a URL string repeats.
-        self.container.clear_pending_images();
+        self.reset_images = true;
         self.dirty = true;
     }
 
-    /// Re-run the render sequence for the currently-loaded HTML.
+    /// Re-run the render sequence for the currently-loaded HTML, keeping the
+    /// current frame on screen until the new one is ready.
     ///
     /// Used by `esmail`'s "Load remote images" button: the HTML itself never
-    /// loses its original `http(s)` URLs (B5 in PLAN.md), so once
-    /// `MessageViewHandler::allow_remote` flips, a `reload()` against the
-    /// same document is what actually re-requests them -- `clear_pending_images`
-    /// is required for that, since without it every URL would still be
-    /// marked "already requested" from the blocked first pass and never
-    /// make it back into `take_pending_images()`.
+    /// loses its original `http(s)` URLs (B5 in PLAN.md), so once the
+    /// handler starts allowing them, a `reload()` against the same document
+    /// is what actually re-requests them -- forgetting which URLs were
+    /// already requested is required for that, since without it every URL
+    /// would still be marked "already requested" from the blocked first pass.
     pub fn reload(&mut self) {
-        self.container.clear_pending_images();
+        self.reset_images = true;
         self.dirty = true;
+    }
+
+    /// Whether the worker has (or is about to have) work outstanding for
+    /// the current page. Useful for hosts that want to wait for the page to
+    /// settle, e.g. before taking a screenshot.
+    pub fn is_rendering(&self) -> bool {
+        self.rendering || self.dirty
     }
 
     /// Draw the view into `ui` (inside its own scroll area) and return any
     /// queued [`WebViewEvent`]s.
     ///
-    /// Call once per frame. Re-parses and re-lays-out only when something
-    /// actually changed (a `load`/`reload`, or the widget's width/DPI) --
-    /// see [`WebView::dirty`].
+    /// Call once per frame. Never blocks on layout or the network: it only
+    /// collects whatever the worker has finished since the last call, and
+    /// hands it new work when the page or the widget's width/DPI changed.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Vec<WebViewEvent> {
+        let events = self.poll_worker(ui.ctx());
+
         let dpi = ui.ctx().pixels_per_point();
         let avail_width = ui.available_width().max(1.0);
-
         if self.dirty
-            || (avail_width - self.logical_width).abs() > 0.5
-            || (dpi - self.pixels_per_point).abs() > 0.001
+            || (avail_width - self.requested_width).abs() > 0.5
+            || (dpi - self.requested_dpi).abs() > 0.001
         {
-            self.logical_width = avail_width;
-            self.pixels_per_point = dpi;
-            self.relayout(ui.ctx());
+            self.submit_render(avail_width, dpi);
         }
 
-        let mut events = Vec::new();
         // The whole document is rendered up front at its full content
         // height into one texture -- unlike the Servo-backed predecessor,
         // which had to poll a JS bridge and paint a hand-rolled overlay
@@ -396,38 +438,28 @@ impl WebView {
             .id_salt(&self.texture_name)
             .show(ui, |ui| {
                 let Some(texture) = &self.texture else {
+                    if self.failed {
+                        ui.label("Could not render this message.");
+                    } else if self.rendering {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Rendering...");
+                        });
+                    }
                     return;
                 };
-                let size = egui::vec2(self.logical_width, self.content_height);
-                let sized = egui::load::SizedTexture::new(texture.id(), size);
-                // The uploaded texture is `container_height` tall (a
-                // *capacity* this crate deliberately never shrinks between
-                // messages -- see that field's doc), not necessarily
-                // `content_height` (this message's actual content). Left
-                // at egui::Image's default UV of the whole (0,0)-(1,1)
-                // texture, a shorter message reusing a taller leftover
-                // buffer would have its entire texture -- real content
-                // plus the unused blank capacity below it -- uniformly
-                // squeezed into the `content_height`-tall display box,
-                // visibly compressing the actual rendered text/images.
-                // Crop to just the fraction of the texture that holds
-                // real content instead, so it always displays at true
-                // scale.
-                let v_max = if self.container_height > 0.0 {
-                    (self.content_height / self.container_height).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, v_max));
-                let resp = ui.add(egui::Image::from_texture(sized).uv(uv).sense(egui::Sense::click()));
+                let sized = egui::load::SizedTexture::new(texture.id(), self.frame_size);
+                let resp = ui.add(egui::Image::from_texture(sized).sense(egui::Sense::click()));
 
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let doc_x = pos.x - resp.rect.left();
-                        let doc_y = pos.y - resp.rect.top();
-                        if let Some(url) = self.hit_test_anchor(doc_x, doc_y) {
-                            events.push(WebViewEvent::LinkClicked(url));
-                        }
+                        let _ = self.tx.send(Job::HitTest(HitTestJob {
+                            html: self.html.clone(),
+                            width: self.frame_layout_width,
+                            scale: self.frame_scale,
+                            x: pos.x - resp.rect.left(),
+                            y: pos.y - resp.rect.top(),
+                        }));
                     }
                 }
             });
@@ -435,156 +467,361 @@ impl WebView {
         events
     }
 
-    // ── Private: render sequence ──────────────────────────────────────────
+    // ── Private: talking to the worker ───────────────────────────────────
 
-    /// Run the draw -> (grow-and-redraw if it overflowed) ->
-    /// resolve-images -> (grow-and-redraw again if needed) sequence
-    /// described in the crate module doc.
-    ///
-    /// **No longer does a separate "measure" pass before drawing.** The
-    /// original design always did two full parse+layout passes (measure,
-    /// then draw) even in the common case, on the reasoning that the
-    /// container has to be the right size *before* `draw()` runs. Live
-    /// usage testing (real account, real messages) showed each full
-    /// parse+layout pass costing 3+ seconds on some real-world message
-    /// HTML — litehtml has open, unresolved upstream reports of exactly
-    /// this ("slow rendering on complex real-world pages") — so paying
-    /// for two (or four, once image-loading's own remeasure+redraw pair is
-    /// included) of those on every single message open was the actual
-    /// cause of multi-second UI freezes, not anything specific to this
-    /// codebase's own logic. Fixed by no longer *requiring* the container
-    /// to already be correctly sized: draw straight into whatever buffer
-    /// already exists (reusing the previous message's, grown only when a
-    /// new message's content actually doesn't fit — see
-    /// `container_height`'s doc), and only pay for a second pass on the
-    /// rarer occasions that guess undershoots. A same-or-shorter message
-    /// right after a longer one now costs exactly one pass, not two.
-    ///
-    /// Instrumented with `log::debug!` timing at every phase — enable with
-    /// `RUST_LOG=egui_litehtml_webview=debug`.
-    fn relayout(&mut self, ctx: &egui::Context) {
-        let width = self.logical_width.max(1.0);
-        let scale = self.pixels_per_point.max(0.1);
-        let t_total = std::time::Instant::now();
-
-        let t = std::time::Instant::now();
-        // Always clear the buffer before drawing, even when its capacity
-        // (width/height) isn't actually changing. `resize_with_scale` is
-        // what resets the pixmap to transparent -- it is cheap (an alloc +
-        // zero-fill, not a layout pass) -- and skipping it whenever the
-        // capacity already fit a shorter/differently-shaped message left
-        // the *previous* message's pixels in the buffer, since litehtml's
-        // `draw()` only paints where CSS says to, not the whole canvas.
-        // That showed up as one message's text visibly overlapping the
-        // next one's. Keep the "don't grow height unnecessarily" capacity
-        // reuse (still the actual expensive thing to avoid -- a resize
-        // that grows height forces a second full parse+layout+draw pass),
-        // but always re-clear at the current capacity first.
-        self.resize_container(width, self.container_height, scale);
-        let t_resize = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let (height, grew) = self.draw_growing_as_needed(width, scale);
-        self.content_height = height;
-        let t_draw = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let images_loaded_this_pass = self.load_pending_images();
-        let t_images = t.elapsed();
-
-        let mut t_redraw = std::time::Duration::ZERO;
-        let mut grew_for_images = false;
-        if images_loaded_this_pass {
-            let t = std::time::Instant::now();
-            let (height2, grew2) = self.draw_growing_as_needed(width, scale);
-            self.content_height = height2;
-            grew_for_images = grew2;
-            t_redraw = t.elapsed();
+    /// Queue a render of the current HTML at `width` logical points.
+    fn submit_render(&mut self, width: f32, dpi: f32) {
+        self.submitted_id += 1;
+        // Publish the new id before the job itself, so a render already in
+        // progress can notice it has been superseded as early as possible.
+        self.latest_id.store(self.submitted_id, Ordering::SeqCst);
+        let job = RenderJob {
+            id: self.submitted_id,
+            html: self.html.clone(),
+            width,
+            scale: dpi,
+            reset_images: std::mem::take(&mut self.reset_images),
+        };
+        if self.tx.send(Job::Render(job)).is_err() {
+            log::error!("egui-litehtml-webview: the render thread is gone");
+            self.failed = true;
+            self.rendering = false;
+        } else {
+            self.rendering = true;
         }
-
-        let t = std::time::Instant::now();
-        self.upload_texture(ctx);
-        let t_upload = t.elapsed();
-
+        self.requested_width = width;
+        self.requested_dpi = dpi;
         self.dirty = false;
+    }
+
+    /// Apply everything the worker has produced so far. Returns the link
+    /// clicks among it.
+    fn poll_worker(&mut self, ctx: &egui::Context) -> Vec<WebViewEvent> {
+        let mut events = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(Output::Frame(frame)) if frame.id == self.submitted_id => {
+                    self.frame_size = frame.size_points;
+                    self.frame_layout_width = frame.layout_width;
+                    self.frame_scale = frame.scale;
+                    match &mut self.texture {
+                        Some(handle) => handle.set(frame.image, egui::TextureOptions::LINEAR),
+                        slot => {
+                            let _ = slot.insert(ctx.load_texture(
+                                &self.texture_name,
+                                frame.image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
+                }
+                Ok(Output::Done { id, ok }) if id == self.submitted_id => {
+                    self.rendering = false;
+                    self.failed = !ok && self.texture.is_none();
+                }
+                Ok(Output::Link(url)) => events.push(WebViewEvent::LinkClicked(url)),
+                // A frame/completion for a superseded job.
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.rendering {
+                        log::error!("egui-litehtml-webview: the render thread died mid-render");
+                        self.rendering = false;
+                        self.failed = self.texture.is_none();
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+}
+
+// ─── Worker protocol ─────────────────────────────────────────────────────────
+
+/// UI thread -> worker.
+enum Job {
+    Render(RenderJob),
+    HitTest(HitTestJob),
+}
+
+struct RenderJob {
+    id: u64,
+    html: Arc<String>,
+    /// Layout width, egui points.
+    width: f32,
+    /// egui `pixels_per_point`.
+    scale: f32,
+    /// Forget which image URLs were already requested before starting.
+    reset_images: bool,
+}
+
+struct HitTestJob {
+    html: Arc<String>,
+    /// The layout width of the frame that was clicked, egui points.
+    width: f32,
+    scale: f32,
+    /// Click position within the frame, egui points.
+    x: f32,
+    y: f32,
+}
+
+/// Worker -> UI thread.
+enum Output {
+    /// A finished (or intermediate) picture of the page.
+    Frame(Frame),
+    /// The render job `id` has nothing more to send. `ok` is false when the
+    /// document could not be rendered at all.
+    Done { id: u64, ok: bool },
+    /// An anchor was clicked.
+    Link(String),
+}
+
+struct Frame {
+    id: u64,
+    /// Opaque RGBA, cropped to the content height.
+    image: egui::ColorImage,
+    /// What to display `image` as, in egui points.
+    size_points: egui::Vec2,
+    layout_width: f32,
+    scale: f32,
+}
+
+// ─── Worker ──────────────────────────────────────────────────────────────────
+
+/// Everything that lives on the worker thread.
+struct Worker {
+    /// Owns the rendered pixels, the fonts and the decoded images. Reused
+    /// across jobs (fonts are expensive to load; decoded images are keyed by
+    /// URL, so re-opening a message does not re-download its images).
+    container: PixbufContainer,
+    handler: Arc<dyn WebViewHandler>,
+    ctx: egui::Context,
+    out: Sender<Output>,
+    /// See [`WebView::latest_id`].
+    latest_id: Arc<AtomicU64>,
+    /// The height (logical points) `container`'s pixel buffer is allocated
+    /// for -- a *capacity*, not necessarily the content height. Never
+    /// shrunk: reusing a too-tall buffer from a previous, longer message
+    /// costs nothing but some unused canvas, and avoids the extra
+    /// full parse+layout+draw pass that growing it forces. Only grows, when
+    /// freshly-drawn content turns out not to fit.
+    container_height: f32,
+    /// Cumulative count of `load_image_data` calls -- diagnostic only,
+    /// logged per job. `PixbufContainer`'s decoded-image cache has no
+    /// eviction API, so this is a proxy for how large it has grown.
+    total_images_loaded: u64,
+    /// The previous render job was abandoned (superseded) after litehtml had
+    /// already recorded its image URLs as requested. Those URLs would then
+    /// never be requested again -- the container skips URLs it has seen --
+    /// so the next job must forget them, or a resize mid-load leaves the
+    /// message permanently missing images.
+    reset_images_next: bool,
+}
+
+impl Worker {
+    fn new(
+        ctx: egui::Context,
+        handler: Arc<dyn WebViewHandler>,
+        out: Sender<Output>,
+        latest_id: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            container: PixbufContainer::new_with_scale(1, DEFAULT_VIEWPORT_HEIGHT, ctx.pixels_per_point()),
+            handler,
+            ctx,
+            out,
+            latest_id,
+            container_height: DEFAULT_VIEWPORT_HEIGHT as f32,
+            total_images_loaded: 0,
+            reset_images_next: false,
+        }
+    }
+
+    /// Serve jobs until the [`WebView`] (the only sender) is dropped.
+    fn run(mut self, jobs: Receiver<Job>) {
+        while let Ok(first) = jobs.recv() {
+            // Everything queued while the last job ran: only the newest
+            // render matters (the UI ignores older ones' frames anyway).
+            let mut render: Option<RenderJob> = None;
+            let mut reset_images = false;
+            let mut hit_tests = Vec::new();
+            for job in std::iter::once(first).chain(jobs.try_iter()) {
+                match job {
+                    Job::Render(r) => {
+                        // A dropped job may have been the one asking to
+                        // forget requested URLs (a `load`); its replacement
+                        // (say, a resize) must still do that.
+                        reset_images |= r.reset_images;
+                        render = Some(r);
+                    }
+                    Job::HitTest(h) => hit_tests.push(h),
+                }
+            }
+            if let Some(mut r) = render {
+                r.reset_images = reset_images;
+                self.render(&r);
+            }
+            for h in &hit_tests {
+                self.hit_test(h);
+            }
+        }
+    }
+
+    fn superseded(&self, id: u64) -> bool {
+        self.latest_id.load(Ordering::SeqCst) != id
+    }
+
+    fn send(&self, output: Output) {
+        // Only fails when the view is gone, in which case nobody cares.
+        let _ = self.out.send(output);
+        self.ctx.request_repaint();
+    }
+
+    /// Run one render job; see the crate module doc for the sequence.
+    fn render(&mut self, job: &RenderJob) {
+        let t_total = Instant::now();
+        if job.reset_images || std::mem::take(&mut self.reset_images_next) {
+            self.container.clear_pending_images();
+        }
+        let width = job.width.max(1.0);
+        let scale = job.scale.max(0.1);
+
+        let mut passes = 0;
+        let mut ok = true;
+        let mut fetched = 0usize;
+        while passes < MAX_PASSES {
+            if self.superseded(job.id) {
+                self.reset_images_next = true;
+                return;
+            }
+            let Some(height) = self.draw_pass(&job.html, width, scale) else {
+                ok = false;
+                break;
+            };
+            passes += 1;
+            // Whether this pass's picture has already gone to the UI.
+            let mut emitted = false;
+
+            let pending = self.container.take_pending_images();
+            if pending.is_empty() || passes == MAX_PASSES {
+                self.emit_frame(job.id, width, scale, height);
+                break;
+            }
+
+            let (local, remote): (Vec<String>, Vec<String>) =
+                pending.into_iter().map(|(url, _)| url).partition(|url| url.starts_with("data:"));
+            let mut loaded = self.load_images(local.into_iter().filter_map(|url| {
+                resolve_image_bytes(&url, &*self.handler).map(|bytes| (url, bytes))
+            }).collect());
+
+            if !remote.is_empty() {
+                // Let the user read the text while images download.
+                self.emit_frame(job.id, width, scale, height);
+                emitted = true;
+                let t = Instant::now();
+                let downloaded = fetch_all(remote, &*self.handler, &self.latest_id, job.id);
+                if self.superseded(job.id) {
+                    self.reset_images_next = true;
+                    return;
+                }
+                fetched += downloaded.len();
+                log::debug!("fetched {} remote image(s) in {:?}", downloaded.len(), t.elapsed());
+                loaded |= self.load_images(downloaded);
+            }
+
+            if !loaded {
+                if !emitted {
+                    self.emit_frame(job.id, width, scale, height);
+                }
+                break;
+            }
+            // Images changed what there is to draw (and possibly where):
+            // go around again on a fresh canvas.
+        }
 
         log::debug!(
-            "relayout: total={:?} (resize={:?} draw={:?} [grew={grew}] \
-             resolve_images={:?} [loaded_any={images_loaded_this_pass}] \
-             redraw={:?} [grew={grew_for_images}] upload={:?}) html_len={} \
-             content_height={:.0} container_height={:.0} total_images_loaded={}",
-            t_total.elapsed(), t_resize, t_draw, t_images, t_redraw, t_upload,
-            self.html.len(), self.content_height, self.container_height,
-            self.total_images_loaded,
+            "render job {}: total={:?} passes={passes} remote_fetched={fetched} html_len={} \
+             container_height={:.0} total_images_loaded={}",
+            job.id, t_total.elapsed(), job.html.len(), self.container_height, self.total_images_loaded,
         );
+        self.send(Output::Done { id: job.id, ok });
     }
 
-    /// Draw into the current container buffer; if the content turns out to
-    /// be taller than the buffer's current capacity (a real, if
-    /// increasingly rare, possibility — see `container_height`'s doc),
-    /// grow it and draw once more. Returns `(content_height, grew)`.
-    fn draw_growing_as_needed(&mut self, width: f32, scale: f32) -> (f32, bool) {
-        let height = self.layout_and_draw(width).unwrap_or(self.container_height);
+    /// Decode `images` into the container. Returns whether any loaded.
+    fn load_images(&mut self, images: Vec<(String, Vec<u8>)>) -> bool {
+        let mut any = false;
+        for (url, bytes) in images {
+            self.container.load_image_data(&url, &bytes);
+            self.total_images_loaded += 1;
+            any = true;
+        }
+        any
+    }
+
+    /// Clear the canvas, then lay out and draw the document into it; if the
+    /// content turns out taller than the canvas, grow it and draw once more.
+    /// Returns the content height (logical points), or `None` if the HTML
+    /// could not be parsed.
+    ///
+    /// The canvas is *always* cleared first, even when its size is not
+    /// changing: litehtml's `draw()` only paints where CSS says to, so
+    /// drawing a second pass over the first leaves the first pass's text and
+    /// images visible wherever the layout moved (overlapping text -- seen
+    /// with image-heavy mail, whose second pass lays out differently once
+    /// the images have real sizes). `resize_with_scale` is what resets the
+    /// pixmap to transparent, and it is cheap (an alloc + zero-fill).
+    fn draw_pass(&mut self, html: &str, width: f32, scale: f32) -> Option<f32> {
+        self.resize_container(width, self.container_height, scale);
+        let height = self.layout_and_draw(html, width)?;
         if height <= self.container_height + 0.5 {
-            return (height, false);
+            return Some(height);
         }
         self.resize_container(width, height, scale);
-        let height2 = self.layout_and_draw(width).unwrap_or(height);
-        (height2, true)
+        Some(self.layout_and_draw(html, width).unwrap_or(height))
     }
 
-    /// Parse + lay out + draw into `self.container`'s current pixel buffer.
+    /// Parse + lay out + draw into the container's current pixel buffer.
     /// Returns the content height.
-    fn layout_and_draw(&mut self, width: f32) -> Option<f32> {
-        let t_parse = std::time::Instant::now();
-        let mut doc = self.parse()?;
+    fn layout_and_draw(&mut self, html: &str, width: f32) -> Option<f32> {
+        let t_parse = Instant::now();
+        // `master_css: None` is deliberate, not an oversight: the vendored
+        // litehtml C++ core only falls back to its own **built-in** master
+        // stylesheet (which is where `<h1>`/`<p>`/`<div>`/`<table>`/etc. get
+        // their default `display: block`/`table-row`/etc. -- see
+        // `litehtml_c.cpp`'s `lh_document_create_from_string`) when the
+        // `master_css` argument is null. Passing `Some(EMAIL_MASTER_CSS)`
+        // there *replaces* the built-in stylesheet outright rather than
+        // layering on top of it, which produced a real, visible bug: every
+        // element collapsed onto one or two inline-flowed lines.
+        // `EMAIL_MASTER_CSS` (margin/table/link resets suited to email)
+        // belongs as `user_styles` instead, which litehtml applies *after*
+        // the built-in master and the document's own styles -- still low
+        // enough specificity (plain type selectors) that a message's own
+        // inline `style="..."` attributes win where they conflict.
+        let mut doc = match Document::from_html(html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!("egui-litehtml-webview: failed to parse message HTML: {e}");
+                return None;
+            }
+        };
         let t_parse = t_parse.elapsed();
 
-        let t_render = std::time::Instant::now();
+        let t_render = Instant::now();
         let _ = doc.render(width);
         let t_render = t_render.elapsed();
 
         let height = doc.height().max(1.0);
 
-        let t_paint = std::time::Instant::now();
+        let t_paint = Instant::now();
         doc.draw(DrawContext::default(), 0.0, 0.0, None);
         let t_paint = t_paint.elapsed();
 
         log::debug!(
-            "layout_and_draw: parse={:?} render(layout)={:?} draw(paint)={:?}",
-            t_parse, t_render, t_paint,
+            "layout_and_draw: parse={t_parse:?} render(layout)={t_render:?} draw(paint)={t_paint:?}",
         );
-
         Some(height)
-    }
-
-    /// Parse `self.html` into a fresh `Document` borrowing `self.container`.
-    /// See the crate module doc for why this is never stored.
-    ///
-    /// `master_css: None` is deliberate, not an oversight: the vendored
-    /// litehtml C++ core only falls back to its own **built-in** master
-    /// stylesheet (which is where `<h1>`/`<p>`/`<div>`/`<table>`/etc. get
-    /// their default `display: block`/`table-row`/etc. — see
-    /// `litehtml_c.cpp`'s `lh_document_create_from_string`) when the
-    /// `master_css` argument is null. Passing `Some(EMAIL_MASTER_CSS)` there
-    /// *replaces* the built-in stylesheet outright rather than layering on
-    /// top of it, which was tried first and produced a real, visible bug:
-    /// every element collapsed onto one or two inline-flowed lines (caught
-    /// by the mandatory `ESMAIL_PREVIEW=demo` screenshot check, exactly as
-    /// HANDOFF.md warns this kind of thing can compile clean and pass every
-    /// test). `EMAIL_MASTER_CSS` (margin/table/link resets suited to email)
-    /// belongs as `user_styles` instead, which litehtml documents as applied
-    /// *after* the built-in master and the document's own styles — still
-    /// low enough specificity (plain type selectors) that a message's own
-    /// inline `style="..."` attributes win where they conflict.
-    fn parse(&mut self) -> Option<Document<'_>> {
-        match Document::from_html(&self.html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) {
-            Ok(doc) => Some(doc),
-            Err(e) => {
-                log::warn!("egui-litehtml-webview: failed to parse message HTML: {e}");
-                None
-            }
-        }
     }
 
     /// Resize the pixel buffer to `width` x `height` (logical points) at
@@ -594,67 +831,34 @@ impl WebView {
         let w = width.ceil().max(1.0) as u32;
         let h = height.ceil().max(1.0) as u32;
         self.container.resize_with_scale(w, h, scale);
-        // Keep the capacity-tracking fields in lockstep with the actual
-        // buffer, unconditionally, so every call site (there are several:
-        // a width/DPI change, and either of `relayout`'s two
-        // draw-then-maybe-grow passes) automatically keeps
-        // `container_width`/`container_height`/`container_scale`
-        // accurate without each one having to remember to.
-        self.container_width = width;
         self.container_height = height;
-        self.container_scale = scale;
     }
 
-    /// Drain pending image URLs and resolve as many as possible. Returns
-    /// whether any image was actually loaded (i.e. whether a re-render is
-    /// worth doing).
-    fn load_pending_images(&mut self) -> bool {
-        let pending = self.container.take_pending_images();
-        if pending.is_empty() {
-            return false;
-        }
-        let mut any_loaded = false;
-        for (url, _redraw_on_ready) in pending {
-            if let Some(bytes) = resolve_image_bytes(&url, &mut *self.handler.borrow_mut()) {
-                self.container.load_image_data(&url, &bytes);
-                any_loaded = true;
-                self.total_images_loaded += 1;
-            }
-        }
-        any_loaded
-    }
-
-    /// Copy `self.container`'s pixels into the reused egui texture.
+    /// Send the container's current pixels to the UI as a [`Frame`].
     ///
     /// `PixbufContainer::pixels`'s own doc comment says it returns
-    /// **premultiplied** RGBA -- confirmed against `pixbuf.rs`'s
-    /// `load_image_data` (which explicitly premultiplies incoming image
-    /// bytes before storing them) and its `blend_pixel` helper (which
-    /// documents "the pixmap stores premultiplied RGBA").
-    ///
-    /// `PixbufContainer::new_with_scale`'s own doc comment says it
-    /// "initializes a transparent pixmap" -- unlike a real browser (or the
-    /// Servo-backed predecessor, which always painted an opaque white
-    /// canvas), litehtml only paints where CSS actually says to. A message
-    /// with no explicit `body { background }` (the overwhelming common
-    /// case) would otherwise show whatever egui panel color sits behind
-    /// the texture bleeding through every unpainted region -- caught by
-    /// the mandatory `ESMAIL_PREVIEW=demo` screenshot check against a dark
-    /// theme, where the demo page's plain text was rendered dark-on-dark
-    /// instead of dark-on-white. Fixed by flattening onto opaque white
-    /// ourselves before upload, rather than trying to get litehtml to
-    /// paint a canvas background it has no concept of. Compositing
+    /// **premultiplied** RGBA. It also starts out (and is cleared to)
+    /// transparent, and litehtml only paints where CSS actually says to --
+    /// unlike a real browser, which always paints an opaque white canvas. A
+    /// message with no explicit `body { background }` (the overwhelming
+    /// common case) would otherwise show whatever egui panel colour sits
+    /// behind the texture through every unpainted region (dark-on-dark text
+    /// in a dark theme). So flatten onto opaque white here. Compositing
     /// premultiplied-alpha `src` over opaque white simplifies to
-    /// `out = src_channel + (255 - alpha)` per channel (the general "over"
-    /// formula's `(1-src_a)*bg` term collapses since `bg == 255`), so this
-    /// needs no general alpha-blend math, just one add per byte.
-    fn upload_texture(&mut self, ctx: &egui::Context) {
+    /// `out = src_channel + (255 - alpha)` per channel, so this needs no
+    /// general alpha-blend math, just one add per byte.
+    ///
+    /// Only the rows up to `content_height` are sent: the canvas is usually
+    /// taller than the content (see `container_height`), and the UI wants a
+    /// texture that is exactly what should be displayed.
+    fn emit_frame(&self, id: u64, width: f32, scale: f32, content_height: f32) {
         let w = self.container.width() as usize;
-        let h = self.container.height() as usize;
-        if w == 0 || h == 0 {
+        let canvas_rows = self.container.height() as usize;
+        if w == 0 || canvas_rows == 0 {
             return;
         }
-        let mut flattened = self.container.pixels().to_vec();
+        let rows = ((content_height * scale).ceil() as usize).clamp(1, canvas_rows);
+        let mut flattened = self.container.pixels()[..w * rows * 4].to_vec();
         for px in flattened.chunks_exact_mut(4) {
             let alpha = px[3];
             if alpha == 255 {
@@ -666,42 +870,44 @@ impl WebView {
             px[2] = px[2].saturating_add(carry);
             px[3] = 255;
         }
-        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &flattened);
-        match &mut self.texture {
-            Some(handle) => handle.set(color_image, egui::TextureOptions::LINEAR),
-            slot => {
-                let _ = slot.insert(ctx.load_texture(
-                    &self.texture_name,
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        }
+        self.send(Output::Frame(Frame {
+            id,
+            image: egui::ColorImage::from_rgba_premultiplied([w, rows], &flattened),
+            size_points: egui::vec2(w as f32 / scale, rows as f32 / scale),
+            layout_width: width,
+            scale,
+        }));
     }
 
-    /// Build one more short-lived `Document`, feed it a down+up click at
-    /// document-local coordinates `(x, y)` (logical points, i.e. the same
-    /// space `render()` was called with), and return the anchor URL if that
-    /// completed a click on a link. Cheaper than a full render pass: layout
-    /// alone is enough for litehtml's own hit-testing, no `draw()` needed.
-    fn hit_test_anchor(&mut self, x: f32, y: f32) -> Option<String> {
-        let width = self.logical_width.max(1.0);
-        let mut doc = self.parse()?;
+    /// Feed litehtml a down+up click at document-local `(x, y)` (logical
+    /// points, the same space `render()` was called with) and report the
+    /// anchor URL if that completed a click on a link. Layout alone is
+    /// enough for litehtml's own hit-testing, no `draw()` needed -- but it
+    /// is still a full parse + layout, since no `Document` is kept between
+    /// jobs (see the crate module doc).
+    fn hit_test(&mut self, job: &HitTestJob) {
+        let width = job.width.max(1.0);
+        self.resize_container(width, self.container_height, job.scale.max(0.1));
+        let Ok(mut doc) = Document::from_html(&job.html, &mut self.container, None, Some(EMAIL_MASTER_CSS)) else {
+            return;
+        };
         let _ = doc.render(width);
-        doc.on_lbutton_down(x, y, x, y);
-        doc.on_lbutton_up(x, y, x, y);
+        doc.on_lbutton_down(job.x, job.y, job.x, job.y);
+        doc.on_lbutton_up(job.x, job.y, job.x, job.y);
         drop(doc);
-        self.container.take_anchor_click()
+        if let Some(url) = self.container.take_anchor_click() {
+            self.send(Output::Link(url));
+        }
     }
 }
 
 /// Decide how to resolve one pending image URL, without touching the
-/// container -- pulled out of [`WebView::load_pending_images`] so it's
-/// testable without a real [`PixbufContainer`]/`Document`. `data:` URLs are
-/// decoded locally; a surviving `cid:` URL means `esmail`'s `render.rs`
-/// found no matching part and there's nothing to fetch (see
-/// [`ImageRequest::url`]'s doc); anything else goes to `handler`.
-fn resolve_image_bytes(url: &str, handler: &mut dyn WebViewHandler) -> Option<Vec<u8>> {
+/// container -- pulled out so it's testable without a real
+/// [`PixbufContainer`]/`Document`. `data:` URLs are decoded locally; a
+/// surviving `cid:` URL means `esmail`'s `render.rs` found no matching part
+/// and there's nothing to fetch (see [`ImageRequest::url`]'s doc); anything
+/// else goes to `handler`.
+fn resolve_image_bytes(url: &str, handler: &dyn WebViewHandler) -> Option<Vec<u8>> {
     if let Some(data) = decode_data_uri(url) {
         return Some(data);
     }
@@ -715,34 +921,78 @@ fn resolve_image_bytes(url: &str, handler: &mut dyn WebViewHandler) -> Option<Ve
     }
 }
 
+/// Resolve `urls` with up to [`MAX_PARALLEL_FETCHES`] threads at a time,
+/// returning `(url, bytes)` for each one that produced data. Stops handing
+/// out new URLs once render job `job_id` is superseded (in-flight requests
+/// are left to finish -- they cannot be interrupted).
+fn fetch_all(
+    urls: Vec<String>,
+    handler: &dyn WebViewHandler,
+    latest_id: &AtomicU64,
+    job_id: u64,
+) -> Vec<(String, Vec<u8>)> {
+    let threads = MAX_PARALLEL_FETCHES.min(urls.len());
+    let queue = Mutex::new(VecDeque::from(urls));
+    let results = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    if latest_id.load(Ordering::SeqCst) != job_id {
+                        return;
+                    }
+                    let Some(url) = queue.lock().unwrap().pop_front() else {
+                        return;
+                    };
+                    if let Some(bytes) = resolve_image_bytes(&url, handler) {
+                        results.lock().unwrap().push((url, bytes));
+                    }
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct RecordingHandler {
-        seen: Vec<String>,
-        outcome: InterceptOutcome,
+        seen: Mutex<Vec<String>>,
+        outcome: fn() -> InterceptOutcome,
+    }
+
+    impl RecordingHandler {
+        fn new(outcome: fn() -> InterceptOutcome) -> Self {
+            Self { seen: Mutex::new(Vec::new()), outcome }
+        }
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
     }
 
     impl WebViewHandler for RecordingHandler {
-        fn intercept(&mut self, request: &ImageRequest) -> InterceptOutcome {
-            self.seen.push(request.url.clone());
-            match &self.outcome {
-                InterceptOutcome::Allow => InterceptOutcome::Allow,
-                InterceptOutcome::Block => InterceptOutcome::Block,
-                InterceptOutcome::Serve(bytes) => InterceptOutcome::Serve(bytes.clone()),
-            }
+        fn intercept(&self, request: &ImageRequest) -> InterceptOutcome {
+            self.seen.lock().unwrap().push(request.url.clone());
+            (self.outcome)()
         }
     }
+
+    /// A 1x1 opaque red PNG.
+    const RED_1X1_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    /// A 10x100 opaque red PNG.
+    const RED_10X100_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAABkCAYAAAC/zKGXAAAAKklEQVR4nO3KMQ0AMBADseNPOqXwayUP3txqF4miKIqiKIqiKIqiuI/jA8dQyJqAFjd8AAAAAElFTkSuQmCC";
 
     #[test]
     fn resolve_image_bytes_decodes_a_data_uri_without_asking_the_handler() {
         // "hi" base64-encoded, arbitrary content -- only the round trip
         // through decode_data_uri matters here.
-        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Allow };
-        let bytes = resolve_image_bytes("data:text/plain;base64,aGk=", &mut handler);
+        let handler = RecordingHandler::new(|| InterceptOutcome::Allow);
+        let bytes = resolve_image_bytes("data:text/plain;base64,aGk=", &handler);
         assert_eq!(bytes, Some(b"hi".to_vec()));
-        assert!(handler.seen.is_empty(), "a data: URL must never reach the handler");
+        assert!(handler.seen().is_empty(), "a data: URL must never reach the handler");
     }
 
     #[test]
@@ -750,26 +1000,219 @@ mod tests {
         // render.rs (B5) already inlines every cid: part it can match as a
         // data: URL before the HTML reaches this crate -- a cid: surviving
         // to here means no match was found, and there's nothing to fetch.
-        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Serve(vec![1]) };
-        let bytes = resolve_image_bytes("cid:missing-part", &mut handler);
+        let handler = RecordingHandler::new(|| InterceptOutcome::Serve(vec![1]));
+        let bytes = resolve_image_bytes("cid:missing-part", &handler);
         assert_eq!(bytes, None);
-        assert!(handler.seen.is_empty(), "an unmatched cid: URL must never reach the handler either");
+        assert!(handler.seen().is_empty(), "an unmatched cid: URL must never reach the handler either");
     }
 
     #[test]
     fn resolve_image_bytes_asks_the_handler_for_a_remote_url_and_serves_its_bytes() {
-        let mut handler = RecordingHandler { seen: Vec::new(), outcome: InterceptOutcome::Serve(vec![9, 9, 9]) };
-        let bytes = resolve_image_bytes("https://example.com/pixel.png", &mut handler);
+        let handler = RecordingHandler::new(|| InterceptOutcome::Serve(vec![9, 9, 9]));
+        let bytes = resolve_image_bytes("https://example.com/pixel.png", &handler);
         assert_eq!(bytes, Some(vec![9, 9, 9]));
-        assert_eq!(handler.seen, vec!["https://example.com/pixel.png".to_string()]);
+        assert_eq!(handler.seen(), vec!["https://example.com/pixel.png".to_string()]);
     }
 
     #[test]
     fn resolve_image_bytes_blocks_a_remote_url_when_the_handler_declines() {
-        for outcome in [InterceptOutcome::Allow, InterceptOutcome::Block] {
-            let mut handler = RecordingHandler { seen: Vec::new(), outcome };
-            let bytes = resolve_image_bytes("https://example.com/track.gif", &mut handler);
+        for outcome in [(|| InterceptOutcome::Allow) as fn() -> InterceptOutcome, || InterceptOutcome::Block] {
+            let handler = RecordingHandler::new(outcome);
+            let bytes = resolve_image_bytes("https://example.com/track.gif", &handler);
             assert_eq!(bytes, None);
         }
+    }
+
+    #[test]
+    fn fetch_all_resolves_every_url_and_drops_the_ones_the_handler_declines() {
+        struct Half;
+        impl WebViewHandler for Half {
+            fn intercept(&self, request: &ImageRequest) -> InterceptOutcome {
+                if request.url.ends_with("/ok") {
+                    InterceptOutcome::Serve(request.url.clone().into_bytes())
+                } else {
+                    InterceptOutcome::Block
+                }
+            }
+        }
+        let urls: Vec<String> = (0..20)
+            .map(|i| format!("https://example.com/{i}/{}", if i % 2 == 0 { "ok" } else { "no" }))
+            .collect();
+        let latest = AtomicU64::new(7);
+        let mut got = fetch_all(urls, &Half, &latest, 7);
+        got.sort();
+        assert_eq!(got.len(), 10);
+        assert!(got.iter().all(|(url, bytes)| url.ends_with("/ok") && bytes == url.as_bytes()));
+    }
+
+    #[test]
+    fn fetch_all_stops_once_the_job_is_superseded() {
+        let handler = RecordingHandler::new(|| InterceptOutcome::Serve(vec![1]));
+        let urls = vec!["https://example.com/a".to_string(), "https://example.com/b".to_string()];
+        // The "latest" id is already a newer job's.
+        let latest = AtomicU64::new(8);
+        let got = fetch_all(urls, &handler, &latest, 7);
+        assert!(got.is_empty());
+        assert!(handler.seen().is_empty(), "no request may start for a superseded job");
+    }
+
+    /// Run a worker's render job to completion in-process (no thread) and
+    /// collect what it sent.
+    fn render_in_process(html: &str, width: f32, handler: Arc<dyn WebViewHandler>) -> Vec<Output> {
+        let (out_tx, out_rx) = mpsc::channel();
+        let latest = Arc::new(AtomicU64::new(1));
+        let mut worker = Worker::new(egui::Context::default(), handler, out_tx, latest);
+        worker.render(&RenderJob {
+            id: 1,
+            html: Arc::new(html.to_string()),
+            width,
+            scale: 1.0,
+            reset_images: true,
+        });
+        out_rx.try_iter().collect()
+    }
+
+    fn last_frame(outputs: &[Output]) -> &Frame {
+        outputs
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::Frame(f) => Some(f),
+                _ => None,
+            })
+            .expect("a frame was sent")
+    }
+
+    fn pixel(frame: &Frame, x: usize, y: usize) -> [u8; 4] {
+        frame.image.pixels[y * frame.image.size[0] + x].to_array()
+    }
+
+    #[test]
+    fn an_image_is_scaled_to_its_laid_out_size_not_drawn_at_its_natural_size() {
+        // A 1x1 image displayed at 100x100 must fill that whole box; drawn at
+        // its natural size (the old behaviour) it would be a single pixel.
+        let html = format!(
+            r#"<body style="margin:0"><img src="{RED_1X1_PNG}" width="100" height="100"></body>"#
+        );
+        let outputs = render_in_process(&html, 300.0, Arc::new(DefaultHandler));
+        assert!(matches!(outputs.last(), Some(Output::Done { id: 1, ok: true })));
+        let frame = last_frame(&outputs);
+        assert_eq!(frame.image.size[0], 300);
+        // Cropped to the content: 100px of image, not the 800px seed canvas.
+        assert!((100..110).contains(&frame.image.size[1]), "height was {}", frame.image.size[1]);
+        for (x, y) in [(2, 2), (50, 50), (97, 97)] {
+            assert_eq!(pixel(frame, x, y), [255, 0, 0, 255], "inside the image at ({x},{y})");
+        }
+        assert_eq!(pixel(frame, 150, 50), [255, 255, 255, 255], "outside the image");
+    }
+
+    #[test]
+    fn a_redraw_after_images_load_does_not_leave_the_first_pass_behind() {
+        // With no width/height attributes the image's size is unknown until
+        // it has been loaded, so pass 1 lays the rule below it out at y=0
+        // and pass 2 at y=100. The rule must not appear at both places.
+        let html = format!(
+            r#"<body style="margin:0"><img src="{RED_10X100_PNG}" style="display:block"><div style="height:1px;background:#000"></div></body>"#
+        );
+        let outputs = render_in_process(&html, 200.0, Arc::new(DefaultHandler));
+        let frame = last_frame(&outputs);
+        // Exactly one black rule line in the final frame: at y = 100 (below
+        // the 100px image), and not also where pass 1 would have put it.
+        let black_rows: Vec<usize> = (0..frame.image.size[1])
+            .filter(|&y| pixel(frame, 150, y) == [0, 0, 0, 255])
+            .collect();
+        assert_eq!(black_rows, vec![100], "rule drawn at the wrong place(s): {black_rows:?}");
+    }
+
+    #[test]
+    fn images_are_requested_again_after_a_render_was_superseded_mid_fetch() {
+        // Job 1 discovers the remote image, and is then superseded while
+        // its fetch is in flight (the handler bumps the latest id, as a
+        // `show()` submitting a resize would). Job 2 -- same HTML, no
+        // explicit reset, like a resize -- must still get the image.
+        struct SupersedeOnce {
+            latest: Arc<AtomicU64>,
+            calls: Mutex<u32>,
+            png: Vec<u8>,
+        }
+        impl WebViewHandler for SupersedeOnce {
+            fn intercept(&self, _request: &ImageRequest) -> InterceptOutcome {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    self.latest.store(2, Ordering::SeqCst);
+                    InterceptOutcome::Block
+                } else {
+                    InterceptOutcome::Serve(self.png.clone())
+                }
+            }
+        }
+        let latest = Arc::new(AtomicU64::new(1));
+        let handler = Arc::new(SupersedeOnce {
+            latest: latest.clone(),
+            calls: Mutex::new(0),
+            png: decode_data_uri(RED_1X1_PNG).unwrap(),
+        });
+        let (out_tx, out_rx) = mpsc::channel();
+        let mut worker = Worker::new(egui::Context::default(), handler, out_tx, latest);
+        let html = Arc::new(
+            r#"<body style="margin:0"><img src="https://example.com/a.png" width="20" height="20"></body>"#.to_string(),
+        );
+        let job = |id, reset_images| RenderJob { id, html: html.clone(), width: 100.0, scale: 1.0, reset_images };
+        worker.render(&job(1, true));
+        worker.render(&job(2, false));
+        let outputs: Vec<Output> = out_rx.try_iter().collect();
+        let frame = last_frame(&outputs);
+        assert_eq!(frame.id, 2);
+        assert_eq!(pixel(frame, 10, 10), [255, 0, 0, 255], "the image was never re-requested");
+    }
+
+    #[test]
+    fn a_click_on_a_link_reports_its_url_via_the_worker() {
+        let (out_tx, out_rx) = mpsc::channel();
+        let mut worker = Worker::new(
+            egui::Context::default(),
+            Arc::new(DefaultHandler),
+            out_tx,
+            Arc::new(AtomicU64::new(1)),
+        );
+        let html = Arc::new(
+            r#"<body style="margin:0"><a href="https://example.com/x" style="display:block;height:40px">go</a></body>"#
+                .to_string(),
+        );
+        worker.hit_test(&HitTestJob { html: html.clone(), width: 200.0, scale: 1.0, x: 5.0, y: 5.0 });
+        assert!(matches!(out_rx.try_recv(), Ok(Output::Link(url)) if url == "https://example.com/x"));
+        worker.hit_test(&HitTestJob { html, width: 200.0, scale: 1.0, x: 5.0, y: 300.0 });
+        assert!(out_rx.try_recv().is_err(), "a click on empty space is not a link click");
+    }
+
+    #[test]
+    fn show_renders_off_the_ui_thread_and_ends_up_with_a_texture() {
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let mut view = host.new_view(
+            &ctx,
+            WebViewConfig::new(WebViewSource::Html("<h1>hello</h1><p>world</p>".to_string())),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        // The first `show()` must return without having rendered anything.
+        let _ = ctx.run_ui(input(), |ui| {
+            view.show(ui);
+        });
+        assert!(view.is_rendering());
+        assert!(view.texture.is_none());
+        while view.is_rendering() {
+            assert!(Instant::now() < deadline, "render never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = ctx.run_ui(input(), |ui| {
+                view.show(ui);
+            });
+        }
+        assert!(view.texture.is_some());
+        assert!(!view.failed);
     }
 }

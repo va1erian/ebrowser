@@ -185,6 +185,68 @@ async fn fetch_body_renders_html_resolves_cid_and_finds_the_attachment() {
     }
 }
 
+/// "Export message" saves the message's exact raw source, so a specific
+/// real-world email can be kept as a test case. Round-trip it: what lands in
+/// the file must be the full RFC822 message (headers, the cid: image part,
+/// the attachment) -- proven by rendering the file the way `ESMAIL_PREVIEW=
+/// x.eml` does and getting the same inlined image a live `FetchBody` gives.
+#[tokio::test]
+async fn export_message_writes_the_raw_rfc822_source() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    h.imap_cmd.send(ImapCommand::FetchHeaders { mailbox: "INBOX".to_string(), page: 1, req_id: 1 }).await.unwrap();
+    let headers = match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Headers { headers, .. } => headers,
+        other => panic!("expected Headers, got {other:?}"),
+    };
+    let report = headers.iter().find(|h| h.subject.contains("Report with image")).expect("fixture message present");
+
+    let dir = std::env::temp_dir().join(format!("esmail-export-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("report.eml");
+
+    h.imap_cmd
+        .send(ImapCommand::ExportMessage { mailbox: "INBOX".to_string(), uid: report.uid, path: path.clone() })
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::Exported { path: exported } => assert_eq!(exported, path),
+        other => panic!("expected Exported, got {other:?}"),
+    }
+
+    let raw = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("Subject: Report with image"), "not a raw RFC822 message: {text}");
+    let html = esmail::render::render_message(&raw);
+    assert!(html.contains("data:image/png"), "the exported file did not round-trip through render_message: {html}");
+    assert_eq!(esmail::render::extract_attachments(&raw).len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn export_message_for_a_missing_uid_reports_a_failure_and_writes_nothing() {
+    skip_unless_ca_trusted!();
+    let mut h = start_harness(0).await;
+
+    let dir = std::env::temp_dir().join(format!("esmail-export-test-missing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nothing.eml");
+
+    h.imap_cmd
+        .send(ImapCommand::ExportMessage { mailbox: "INBOX".to_string(), uid: 999_999, path: path.clone() })
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, h.imap_evt.recv()).await.unwrap().unwrap() {
+        ImapEvent::ExportFailed { error } => assert!(!error.is_empty()),
+        other => panic!("expected ExportFailed, got {other:?}"),
+    }
+    assert!(!path.exists(), "a failed export must not leave a file behind");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn fetch_body_decodes_an_rfc2047_encoded_unicode_subject() {
     skip_unless_ca_trusted!();
