@@ -150,7 +150,12 @@ fn bench_fixtures_across_widths() {
 #[test]
 #[ignore = "utility: writes files to $ESMAIL_DUMP_DIR"]
 fn dump_fixtures_as_html() {
-    let dir = PathBuf::from(std::env::var_os("ESMAIL_DUMP_DIR").expect("set ESMAIL_DUMP_DIR to an existing directory"));
+    // CI runs `cargo test -- --include-ignored`, which runs this too: with no
+    // directory given it must do nothing rather than fail.
+    let Some(dir) = std::env::var_os("ESMAIL_DUMP_DIR").map(PathBuf::from) else {
+        eprintln!("skipping: set ESMAIL_DUMP_DIR to an existing directory to write the fixtures' HTML there");
+        return;
+    };
     for (name, raw) in fixtures() {
         let out = dir.join(format!("{}.html", name.trim_end_matches(".eml")));
         std::fs::write(&out, esmail::render::render_message(&raw)).unwrap();
