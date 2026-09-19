@@ -1373,9 +1373,11 @@ mod tests {
             ..Default::default()
         };
         loop {
-            let _ = ctx.run_ui(input(), |ui| {
+            // Nothing uploads the textures headless; egui asserts that an
+            // unapplied `TexturesDelta` is cleared rather than dropped.
+            ctx.run_ui(input(), |ui| {
                 view.show(ui);
-            });
+            }).textures_delta.clear();
             if !view.is_rendering() {
                 break;
             }
@@ -1419,17 +1421,17 @@ mod tests {
             ..Default::default()
         };
         // The first `show()` must return without having rendered anything.
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             view.show(ui);
-        });
+        }).textures_delta.clear();
         assert!(view.is_rendering());
         assert!(view.textures.is_empty());
         while view.is_rendering() {
             assert!(Instant::now() < deadline, "render never finished");
             std::thread::sleep(Duration::from_millis(10));
-            let _ = ctx.run_ui(input(), |ui| {
+            ctx.run_ui(input(), |ui| {
                 view.show(ui);
-            });
+            }).textures_delta.clear();
         }
         assert!(!view.textures.is_empty());
         assert!(!view.failed);

@@ -45,7 +45,7 @@ impl eframe::App for TwoViewsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let _ = &self.host; // no per-frame driving needed; see the struct doc.
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.columns(2, |columns| {
                 columns[0].heading("Left view");
                 for event in self.left.show(&mut columns[0]) {
