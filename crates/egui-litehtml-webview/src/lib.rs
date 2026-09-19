@@ -63,7 +63,11 @@
 //!    turns up more URLs, up to a small limit.
 //!
 //! The frame sent to the UI is flattened onto opaque white and cropped to
-//! the content height, so the texture is exactly what should be displayed.
+//! the content height, so it is exactly what should be displayed. It is cut
+//! into a grid of tiles no larger than the GPU's maximum texture side (a
+//! newsletter at high DPI is easily taller than 8192px; one texture per
+//! message would fail to upload), each its own egui texture, painted edge to
+//! edge.
 //!
 //! # Sanitization stays the host's job
 //!
@@ -281,7 +285,7 @@ impl WebViewHost {
             rx: out_rx,
             latest_id,
             submitted_id: 0,
-            texture: None,
+            textures: Vec::new(),
             texture_name: format!("egui_litehtml_webview_{view_id}"),
             frame_size: egui::Vec2::ZERO,
             frame_layout_width: 1.0,
@@ -338,11 +342,13 @@ pub struct WebView {
     /// Id of the newest render job this view submitted; frames with any
     /// other id are stale and ignored.
     submitted_id: u64,
-    /// Reused across frames; reallocating one per frame would be wasteful.
-    texture: Option<egui::TextureHandle>,
+    /// The current frame, one texture per tile (see [`Tile`]). Reused across
+    /// frames when the tile count is unchanged; reallocating per frame would
+    /// be wasteful. Empty until the first frame arrives.
+    textures: Vec<TileTexture>,
     /// Unique per view, so two views cannot collide on one egui texture.
     texture_name: String,
-    /// What the current texture should be displayed as, in egui points.
+    /// What the current frame should be displayed as, in egui points.
     frame_size: egui::Vec2,
     /// The layout width the current texture was rendered at, in points --
     /// hit tests must be laid out at the same width to line up.
@@ -378,7 +384,7 @@ impl WebView {
     pub fn load(&mut self, source: WebViewSource) {
         let WebViewSource::Html(html) = source;
         self.html = Arc::new(html);
-        self.texture = None;
+        self.textures.clear();
         self.failed = false;
         // Invalidate whatever the worker is (or has just finished) rendering
         // for the *previous* page right now, not when `show()` next submits
@@ -419,7 +425,7 @@ impl WebView {
     /// until the first frame has arrived. Its height is the document's
     /// content height at the width it was laid out at.
     pub fn content_size(&self) -> Option<egui::Vec2> {
-        self.texture.as_ref().map(|_| self.frame_size)
+        (!self.textures.is_empty()).then_some(self.frame_size)
     }
 
     /// Draw the view into `ui` (inside its own scroll area) and return any
@@ -441,15 +447,17 @@ impl WebView {
         }
 
         // The whole document is rendered up front at its full content
-        // height into one texture -- unlike the Servo-backed predecessor,
-        // which had to poll a JS bridge and paint a hand-rolled overlay
-        // scrollbar (issue #15) because Servo exposed no scroll-position
-        // getter/setter at all. A plain `ScrollArea` around a normally-sized
-        // `Image` gets a native scrollbar and native wheel-scroll for free.
+        // height -- unlike the Servo-backed predecessor, which had to poll a
+        // JS bridge and paint a hand-rolled overlay scrollbar (issue #15)
+        // because Servo exposed no scroll-position getter/setter at all. A
+        // plain `ScrollArea` around a normally-sized allocation gets a native
+        // scrollbar and native wheel-scroll for free. The picture is a grid
+        // of tiles (a GPU texture has a maximum side length, and a long
+        // message is taller than that), painted edge to edge.
         egui::ScrollArea::vertical()
             .id_salt(&self.texture_name)
             .show(ui, |ui| {
-                let Some(texture) = &self.texture else {
+                if self.textures.is_empty() {
                     if self.failed {
                         ui.label("Could not render this message.");
                     } else if self.rendering {
@@ -459,9 +467,25 @@ impl WebView {
                         });
                     }
                     return;
-                };
-                let sized = egui::load::SizedTexture::new(texture.id(), self.frame_size);
-                let resp = ui.add(egui::Image::from_texture(sized).sense(egui::Sense::click()));
+                }
+                let (rect, resp) = ui.allocate_exact_size(self.frame_size, egui::Sense::click());
+                let clip = ui.clip_rect();
+                let scale = self.frame_scale;
+                for tile in &self.textures {
+                    let [w, h] = tile.handle.size();
+                    let min = rect.min + egui::vec2(tile.x_px as f32, tile.y_px as f32) / scale;
+                    let tile_rect = egui::Rect::from_min_size(min, egui::vec2(w as f32, h as f32) / scale);
+                    // A long message is many screens of tiles; only paint
+                    // the ones that can be seen.
+                    if tile_rect.intersects(clip) {
+                        ui.painter().image(
+                            tile.handle.id(),
+                            tile_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
 
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -469,8 +493,8 @@ impl WebView {
                             html: self.html.clone(),
                             width: self.frame_layout_width,
                             scale: self.frame_scale,
-                            x: pos.x - resp.rect.left(),
-                            y: pos.y - resp.rect.top(),
+                            x: pos.x - rect.left(),
+                            y: pos.y - rect.top(),
                         }));
                     }
                 }
@@ -516,20 +540,29 @@ impl WebView {
                     self.frame_size = frame.size_points;
                     self.frame_layout_width = frame.layout_width;
                     self.frame_scale = frame.scale;
-                    match &mut self.texture {
-                        Some(handle) => handle.set(frame.image, egui::TextureOptions::LINEAR),
-                        slot => {
-                            let _ = slot.insert(ctx.load_texture(
-                                &self.texture_name,
-                                frame.image,
-                                egui::TextureOptions::LINEAR,
-                            ));
+                    self.textures.truncate(frame.tiles.len());
+                    for (i, tile) in frame.tiles.into_iter().enumerate() {
+                        match self.textures.get_mut(i) {
+                            Some(existing) => {
+                                existing.handle.set(tile.image, egui::TextureOptions::LINEAR);
+                                existing.x_px = tile.x_px;
+                                existing.y_px = tile.y_px;
+                            }
+                            None => self.textures.push(TileTexture {
+                                handle: ctx.load_texture(
+                                    format!("{}_{i}", self.texture_name),
+                                    tile.image,
+                                    egui::TextureOptions::LINEAR,
+                                ),
+                                x_px: tile.x_px,
+                                y_px: tile.y_px,
+                            }),
                         }
                     }
                 }
                 Ok(Output::Done { id, ok }) if id == self.submitted_id => {
                     self.rendering = false;
-                    self.failed = !ok && self.texture.is_none();
+                    self.failed = !ok && self.textures.is_empty();
                 }
                 Ok(Output::Link(url)) => events.push(WebViewEvent::LinkClicked(url)),
                 // A frame/completion for a superseded job.
@@ -539,7 +572,7 @@ impl WebView {
                     if self.rendering {
                         log::error!("egui-litehtml-webview: the render thread died mid-render");
                         self.rendering = false;
-                        self.failed = self.texture.is_none();
+                        self.failed = self.textures.is_empty();
                     }
                     break;
                 }
@@ -591,12 +624,65 @@ enum Output {
 
 struct Frame {
     id: u64,
-    /// Opaque RGBA, cropped to the content height.
-    image: egui::ColorImage,
-    /// What to display `image` as, in egui points.
+    /// Row-major grid of tiles that together make up the picture: opaque
+    /// RGBA, cropped to the content height.
+    tiles: Vec<Tile>,
+    /// What to display the whole picture as, in egui points.
     size_points: egui::Vec2,
     layout_width: f32,
     scale: f32,
+}
+
+/// One rectangle of a [`Frame`]. A GPU texture has a maximum side length
+/// (`egui::InputState::max_texture_side`: 2048 headless, 8192-16384 on
+/// typical GL), and a long newsletter at high DPI is taller than that, so
+/// the picture is cut into tiles that each fit.
+struct Tile {
+    /// Top-left of the tile within the picture, in device pixels.
+    x_px: usize,
+    y_px: usize,
+    image: egui::ColorImage,
+}
+
+/// A [`Tile`] uploaded to the GPU.
+struct TileTexture {
+    handle: egui::TextureHandle,
+    x_px: usize,
+    y_px: usize,
+}
+
+/// Cut `0..total` into consecutive `(start, len)` runs of at most `max`.
+fn tile_ranges(total: usize, max: usize) -> Vec<(usize, usize)> {
+    let max = max.max(1);
+    (0..total).step_by(max).map(|start| (start, max.min(total - start))).collect()
+}
+
+/// Composite premultiplied-alpha RGBA in place onto opaque white. See
+/// [`Worker::emit_frame`] for why: `out = src_channel + (255 - alpha)`.
+fn flatten_onto_white(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let alpha = px[3];
+        if alpha == 255 {
+            continue;
+        }
+        let carry = 255 - alpha;
+        px[0] = px[0].saturating_add(carry);
+        px[1] = px[1].saturating_add(carry);
+        px[2] = px[2].saturating_add(carry);
+        px[3] = 255;
+    }
+}
+
+/// Copy the `w` x `h` block at `(x, y)` out of `pixels` (rows of
+/// `stride_px` pixels, 4 bytes each) as a flattened, ready-to-upload tile.
+fn extract_tile(pixels: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: usize) -> egui::ColorImage {
+    let mut buf = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        let start = (row * stride_px + x) * 4;
+        buf.extend_from_slice(&pixels[start..start + w * 4]);
+    }
+    flatten_onto_white(&mut buf);
+    egui::ColorImage::from_rgba_premultiplied([w, h], &buf)
 }
 
 // ─── Worker ──────────────────────────────────────────────────────────────────
@@ -869,7 +955,10 @@ impl Worker {
     ///
     /// Only the rows up to `content_height` are sent: the canvas is usually
     /// taller than the content (see `container_height`), and the UI wants a
-    /// texture that is exactly what should be displayed.
+    /// picture that is exactly what should be displayed. The picture is cut
+    /// into tiles no larger than the GPU's maximum texture side (read from
+    /// the context, which eframe keeps in step with the GL limit), and each
+    /// tile is flattened separately, so no full-size intermediate copy is made.
     fn emit_frame(&self, id: u64, width: f32, scale: f32, content_height: f32) {
         let w = self.container.width() as usize;
         let canvas_rows = self.container.height() as usize;
@@ -877,21 +966,17 @@ impl Worker {
             return;
         }
         let rows = ((content_height * scale).ceil() as usize).clamp(1, canvas_rows);
-        let mut flattened = self.container.pixels()[..w * rows * 4].to_vec();
-        for px in flattened.chunks_exact_mut(4) {
-            let alpha = px[3];
-            if alpha == 255 {
-                continue;
+        let max_side = self.ctx.input(|i| i.max_texture_side);
+        let pixels = self.container.pixels();
+        let mut tiles = Vec::new();
+        for (y, h) in tile_ranges(rows, max_side) {
+            for (x, tile_w) in tile_ranges(w, max_side) {
+                tiles.push(Tile { x_px: x, y_px: y, image: extract_tile(pixels, w, x, y, tile_w, h) });
             }
-            let carry = 255 - alpha;
-            px[0] = px[0].saturating_add(carry);
-            px[1] = px[1].saturating_add(carry);
-            px[2] = px[2].saturating_add(carry);
-            px[3] = 255;
         }
         self.send(Output::Frame(Frame {
             id,
-            image: egui::ColorImage::from_rgba_premultiplied([w, rows], &flattened),
+            tiles,
             size_points: egui::vec2(w as f32 / scale, rows as f32 / scale),
             layout_width: width,
             scale,
@@ -1103,7 +1188,22 @@ mod tests {
     }
 
     fn pixel(frame: &Frame, x: usize, y: usize) -> [u8; 4] {
-        frame.image.pixels[y * frame.image.size[0] + x].to_array()
+        let tile = frame
+            .tiles
+            .iter()
+            .find(|t| {
+                (t.x_px..t.x_px + t.image.size[0]).contains(&x) && (t.y_px..t.y_px + t.image.size[1]).contains(&y)
+            })
+            .expect("pixel is inside the frame");
+        tile.image.pixels[(y - tile.y_px) * tile.image.size[0] + (x - tile.x_px)].to_array()
+    }
+
+    /// Total size of the picture, in device pixels.
+    fn size_px(frame: &Frame) -> [usize; 2] {
+        [
+            frame.tiles.iter().map(|t| t.x_px + t.image.size[0]).max().unwrap(),
+            frame.tiles.iter().map(|t| t.y_px + t.image.size[1]).max().unwrap(),
+        ]
     }
 
     #[test]
@@ -1116,9 +1216,9 @@ mod tests {
         let outputs = render_in_process(&html, 300.0, Arc::new(DefaultHandler));
         assert!(matches!(outputs.last(), Some(Output::Done { id: 1, ok: true })));
         let frame = last_frame(&outputs);
-        assert_eq!(frame.image.size[0], 300);
+        assert_eq!(size_px(frame)[0], 300);
         // Cropped to the content: 100px of image, not the 800px seed canvas.
-        assert!((100..110).contains(&frame.image.size[1]), "height was {}", frame.image.size[1]);
+        assert!((100..110).contains(&size_px(frame)[1]), "height was {}", size_px(frame)[1]);
         for (x, y) in [(2, 2), (50, 50), (97, 97)] {
             assert_eq!(pixel(frame, x, y), [255, 0, 0, 255], "inside the image at ({x},{y})");
         }
@@ -1137,7 +1237,7 @@ mod tests {
         let frame = last_frame(&outputs);
         // Exactly one black rule line in the final frame: at y = 100 (below
         // the 100px image), and not also where pass 1 would have put it.
-        let black_rows: Vec<usize> = (0..frame.image.size[1])
+        let black_rows: Vec<usize> = (0..size_px(frame)[1])
             .filter(|&y| pixel(frame, 150, y) == [0, 0, 0, 255])
             .collect();
         assert_eq!(black_rows, vec![100], "rule drawn at the wrong place(s): {black_rows:?}");
@@ -1219,6 +1319,74 @@ mod tests {
     }
 
     #[test]
+    fn tile_ranges_cover_the_whole_extent_in_order() {
+        assert_eq!(tile_ranges(10, 4), vec![(0, 4), (4, 4), (8, 2)]);
+        assert_eq!(tile_ranges(8, 4), vec![(0, 4), (4, 4)]);
+        assert_eq!(tile_ranges(3, 4), vec![(0, 3)]);
+        assert_eq!(tile_ranges(5, 0), vec![(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)], "a zero limit must not hang");
+        assert!(tile_ranges(0, 4).is_empty());
+    }
+
+    #[test]
+    fn extract_tile_copies_the_right_block() {
+        // A 5x4 picture whose red channel encodes the pixel index.
+        let pixels: Vec<u8> = (0..20u8).flat_map(|i| [i, 0, 0, 255]).collect();
+        let tile = extract_tile(&pixels, 5, 3, 1, 2, 2);
+        assert_eq!(tile.size, [2, 2]);
+        let reds: Vec<u8> = tile.pixels.iter().map(|p| p.r()).collect();
+        assert_eq!(reds, vec![8, 9, 13, 14]);
+    }
+
+    #[test]
+    fn a_frame_taller_than_the_texture_limit_is_split_into_tiles_that_fit() {
+        // Headless egui reports a 2048px texture limit; this page is far taller.
+        let ctx = egui::Context::default();
+        let max = ctx.input(|i| i.max_texture_side);
+        let (out_tx, out_rx) = mpsc::channel();
+        let mut worker = Worker::new(ctx, Arc::new(DefaultHandler), out_tx, Arc::new(AtomicU64::new(1)));
+        let html = r#"<body style="margin:0"><div style="height:5000px;background:#f00"></div><div style="height:10px;background:#00f"></div></body>"#;
+        worker.render(&RenderJob { id: 1, html: Arc::new(html.to_string()), width: 100.0, scale: 1.0, reset_images: true });
+        let outputs: Vec<Output> = out_rx.try_iter().collect();
+        let frame = last_frame(&outputs);
+
+        assert!(frame.tiles.len() >= 3, "5010px at {max}px per tile needs at least 3 tiles, got {}", frame.tiles.len());
+        assert!(frame.tiles.iter().all(|t| t.image.size[0] <= max && t.image.size[1] <= max));
+        assert_eq!(size_px(frame), [100, 5010], "tiles must add up to the whole picture");
+        // Content is intact across every seam.
+        for y in [0, max - 1, max, 2 * max - 1, 2 * max, 4999] {
+            assert_eq!(pixel(frame, 50, y), [255, 0, 0, 255], "red band at y={y}");
+        }
+        assert_eq!(pixel(frame, 50, 5005), [0, 0, 255, 255], "blue strip in the last tile");
+    }
+
+    #[test]
+    fn show_paints_a_message_taller_than_the_texture_limit_without_error() {
+        // egui debug-asserts on an oversize texture upload, so merely
+        // getting through `show` is the check.
+        let ctx = egui::Context::default();
+        let host = WebViewHost::new();
+        let html = r#"<body style="margin:0"><div style="height:5000px;background:#eee">tall</div></body>"#;
+        let mut view = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html.to_string())));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 300.0))),
+            ..Default::default()
+        };
+        loop {
+            let _ = ctx.run_ui(input(), |ui| {
+                view.show(ui);
+            });
+            if !view.is_rendering() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "render never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(view.textures.len() >= 3);
+        assert!(view.content_size().unwrap().y >= 5000.0);
+    }
+
+    #[test]
     fn a_click_on_a_link_reports_its_url_via_the_worker() {
         let (out_tx, out_rx) = mpsc::channel();
         let mut worker = Worker::new(
@@ -1255,7 +1423,7 @@ mod tests {
             view.show(ui);
         });
         assert!(view.is_rendering());
-        assert!(view.texture.is_none());
+        assert!(view.textures.is_empty());
         while view.is_rendering() {
             assert!(Instant::now() < deadline, "render never finished");
             std::thread::sleep(Duration::from_millis(10));
@@ -1263,7 +1431,7 @@ mod tests {
                 view.show(ui);
             });
         }
-        assert!(view.texture.is_some());
+        assert!(!view.textures.is_empty());
         assert!(!view.failed);
     }
 }

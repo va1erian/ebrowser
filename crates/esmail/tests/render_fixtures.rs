@@ -45,9 +45,9 @@ fn render_headless(html: String, width: f32, limit: Duration) -> (Duration, egui
     let mut view: WebView = host.new_view(&ctx, WebViewConfig::new(WebViewSource::Html(html)));
     let input = || egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
-        // Headless egui defaults to a 2048px texture limit; a real GL context
-        // reports 8192-16384 and a whole message is one texture.
-        max_texture_side: Some(16384),
+        // Left at headless egui's 2048px texture limit on purpose: this
+        // message is taller than that, so it only renders because frames are
+        // split into tiles that fit.
         ..Default::default()
     };
     let started = Instant::now();
